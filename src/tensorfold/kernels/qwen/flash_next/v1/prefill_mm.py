@@ -266,6 +266,13 @@ def _mlx_splits_k(m: int, n: int, k: int) -> bool:
     return split > 1
 
 
+def _affine(layer: Any) -> bool:
+    """An affine-quantized layer of any width without a bias (MLX's gathers read it; ``qmm`` only at 4 bits)."""
+
+    return (getattr(layer, "mode", "affine") == "affine" and "scales" in layer and "biases" in layer
+            and "bias" not in layer and layer.weight.dtype == mx.uint32)
+
+
 def _q4(layer: Any) -> bool:
     """A 4-bit, group-32 affine-quantized layer without a bias (what these kernels read)."""
 
@@ -287,13 +294,14 @@ def qmm(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array) -> mx.arra
                 output_shapes=[(m, n)], output_dtypes=[mx.bfloat16])[0]
 
 
-def matmul(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array) -> mx.array:
-    """mx.quantized_matmul(x, w, scales, biases) for 4-bit group-32 weights: ``qmm`` where it gives the same bits."""
+def matmul(x: mx.array, w: mx.array, scales: mx.array, biases: mx.array, *, bits: int = 4, group: int = 32
+           ) -> mx.array:
+    """mx.quantized_matmul(x, w, scales, biases): ``qmm`` where it gives the same bits (4-bit group-32 weights)."""
 
     m, k = x.shape
-    if active(m) and not _mlx_splits_k(m, int(w.shape[0]), k) and tiles():
+    if (bits, group) == (4, 32) and active(m) and not _mlx_splits_k(m, int(w.shape[0]), k) and tiles():
         return qmm(x, w, scales, biases)
-    return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=32, bits=4)
+    return mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size=group, bits=bits)
 
 
 def linear(layer: Any, x: mx.array) -> mx.array:
@@ -354,7 +362,7 @@ def _experts(x: mx.array, layer: Any, idx: mx.array) -> mx.array:
     """A QuantizedSwitchLinear on rows sorted by expert: ``gather_sorted``, or MLX's sorted gather_qmm."""
 
     # MLX's sorted gather_qmm runs QMV below 4 routes an expert, and QMV sums in another order: keep its dispatch
-    if x.shape[0] // int(layer.weight.shape[0]) >= 4 and tiles():
+    if x.shape[0] // int(layer.weight.shape[0]) >= 4 and _q4(layer) and tiles():
         return gather_sorted(x, layer.weight, layer.scales, layer.biases, idx)
     return _mlx_experts(x, layer, idx)
 
@@ -367,7 +375,8 @@ def _mlx_experts(x: mx.array, layer: Any, idx: mx.array) -> mx.array:
         size = -(-rows // -(-rows // MAX_SORTED_ROWS))
         return mx.concatenate([_mlx_experts(x[a:a + size], layer, idx[a:a + size]) for a in range(0, rows, size)])
     return mx.gather_qmm(x[:, None], layer.weight, layer.scales, layer.biases, rhs_indices=idx, transpose=True,
-                         group_size=32, bits=4, sorted_indices=True)[:, 0]
+                         group_size=getattr(layer, "group_size", 32), bits=getattr(layer, "bits", 4),
+                         sorted_indices=True)[:, 0]
 
 
 def deltanet_in(g: Any, x: mx.array) -> tuple[mx.array, mx.array, mx.array, mx.array]:
@@ -388,7 +397,7 @@ def moe_applies(module: Any, x: mx.array) -> bool:
 
     sw = module.switch_mlp
     return (x.ndim == 3 and x.shape[0] == 1 and x.dtype == mx.bfloat16 and active(int(x.shape[1]))
-            and all(_q4(p) for p in (sw.gate_proj, sw.up_proj, sw.down_proj)))
+            and all(_affine(p) for p in (sw.gate_proj, sw.up_proj, sw.down_proj)))
 
 
 def moe(module: Any, x: mx.array, *, route: Any = None, switch: Any = None) -> mx.array:

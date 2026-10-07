@@ -109,6 +109,27 @@ inline float qdot16w(const thread uint16_t* ws, const thread float* xt, float sc
              xt[4 * i + 2] * float(ws[i] & 0x0f00) + xt[4 * i + 3] * float(ws[i] & 0xf000);
   return scale * accum + sum * bias;
 }
+// 8-bit: a lane's 16 inputs as they are (no nibble pre-scaling), the same bf16 runs of 4 for their sum
+inline float load16_8(const device bfloat* x, thread float* xt) {
+  float sum = 0.0f;
+  for (int i = 0; i < 16; i += 4) {
+    const bfloat a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
+    sum += float(bfloat(float(bfloat(float(bfloat(float(a) + float(b))) + float(c))) + float(d)));
+    xt[i] = float(a); xt[i + 1] = float(b); xt[i + 2] = float(c); xt[i + 3] = float(d);
+  }
+  return sum;
+}
+// 8-bit: one lane's 16 inputs times its 16 bytes of one weight row (one group of 64 holds 4 lanes' runs)
+inline float qdot16_8(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
+  const uint4 q = *((const device uint4*)w);
+  float accum = 0.0f;
+  for (int i = 0; i < 4; i++) {
+    const uint word = q[i];
+    accum += xt[4 * i] * float(word & 0xFFu) + xt[4 * i + 1] * float((word >> 8) & 0xFFu) +
+             xt[4 * i + 2] * float((word >> 16) & 0xFFu) + xt[4 * i + 3] * float(word >> 24);
+  }
+  return scale * accum + sum * bias;
+}
 inline float qdot16(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
   const device uint16_t* ws = (const device uint16_t*)w;
   float accum = 0.0f;
@@ -220,25 +241,29 @@ def log2(base: float) -> mx.array:
 
 
 class QWeights:
-    """A 4-bit group-32 quantized matrix [N, K] as three arrays (words, scales, biases)."""
+    """A quantized matrix [N, K] as three arrays (words, scales, biases): 4-bit in groups of 32 (the fused kernels'),
+    or 8-bit in groups of 64 (an 8-bit conversion's, which the hyper-connections read through the lane matmul)."""
 
-    def __init__(self, weight: mx.array, scales: mx.array, biases: mx.array) -> None:
+    def __init__(self, weight: mx.array, scales: mx.array, biases: mx.array, bits: int = 4, group_size: int = 32
+                 ) -> None:
         self.weight, self.scales, self.biases = weight, scales, biases
+        self.bits, self.group_size = int(bits), int(group_size)
         self.rows = int(weight.shape[0])
-        self.cols = int(weight.shape[1]) * 8
+        self.cols = int(weight.shape[1]) * 32 // self.bits
 
     @classmethod
     def of(cls, *linears: Any) -> "QWeights":
         """One matrix from quantized linears' rows, stacked in order."""
 
-        for linear in linears:
-            if getattr(linear, "bits", 4) != 4 or getattr(linear, "group_size", 32) != 32:
-                raise ValueError("expected 4-bit weights in groups of 32")
+        spec = {(getattr(l, "bits", 4), getattr(l, "group_size", 32)) for l in linears}
+        if len(spec) != 1 or next(iter(spec)) not in ((4, 32), (8, 64)):
+            raise ValueError(f"expected 4-bit weights in groups of 32 or 8-bit in groups of 64, got {sorted(spec)}")
+        bits, group = next(iter(spec))
         if len(linears) == 1:
             one = linears[0]
-            return cls(one.weight, one.scales, one.biases)
+            return cls(one.weight, one.scales, one.biases, bits, group)
         return cls(mx.concatenate([l.weight for l in linears]), mx.concatenate([l.scales for l in linears]),
-                   mx.concatenate([l.biases for l in linears]))
+                   mx.concatenate([l.biases for l in linears]), bits, group)
 
 
 def pick(name: str, count: int, index: str) -> str:

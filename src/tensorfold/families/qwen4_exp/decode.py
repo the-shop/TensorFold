@@ -47,6 +47,8 @@ _checked: set[tuple[int, int, int]] = set()
 # "lane": lane_qmm; "rows": per-row kernels; "simd": simd_qmm, selected by TF_FLASH_DENSE.
 DENSE = os.environ.get("TF_FLASH_DENSE") or ("lane" if tensor_units() else "rows")
 _lane: dict[int, tuple[mx.array, mx.array, mx.array, int]] = {}   # id(linear) -> weight, tiled copy, scales, tile
+# whether lane matmuls of weights wider than 4 bits keep a tiled copy (faster reads, twice the dense weights' memory)
+TILE_WIDE = os.environ.get("TF_FLASH_TILE_WIDE", "0") == "1"
 
 
 def _lane_project(x: mx.array, linear: Any) -> mx.array:
@@ -57,6 +59,8 @@ def _lane_project(x: mx.array, linear: Any) -> mx.array:
     if hit is None or hit[0] is not weight:
         n = int(weight.shape[0])
         nt = 64 if (linear.bits == 4 and n % 64 == 0) else 32 if n % 32 == 0 else 0   # other widths: 32 wide
+        if linear.bits != 4 and not TILE_WIDE:
+            nt = 0            # 8-bit: read the checkpoint's layout in place (a tiled copy would double the dense weights)
         tiled = lane_qmm.tile_weight(weight, nt, linear.group_size, bits=linear.bits) if nt else weight
         sbt = lane_qmm.pack_scales(linear.scales, linear.biases)
         mx.eval(tiled, sbt)
@@ -107,9 +111,40 @@ def project(x: mx.array, linear: Any) -> mx.array:
 
 
 def hc_project(*args: Any, **kwargs: Any) -> tuple[mx.array, mx.array]:
-    """hc.hc_project, or with DENSE "rows" its per-row form (each row in its own threadgroups)."""
+    """hc.hc_project, or with DENSE "rows" its per-row form (each row in its own threadgroups); 8-bit weights
+    through the lane matmul (``_hc_lane``)."""
 
+    if args[2].bits != 4:
+        return _hc_lane(*args, **kwargs)
     return (rows.hc_project if DENSE == "rows" else hc.hc_project)(*args, **kwargs)
+
+
+def _qw_linear(weights: Any) -> nn.QuantizedLinear:
+    """A QWeights matrix as a QuantizedLinear (kept on it), so ``project`` caches its lane tiles once."""
+
+    linear = weights.__dict__.get("linear")
+    if linear is None:
+        linear = nn.QuantizedLinear(weights.cols, weights.rows, bias=False, group_size=weights.group_size,
+                                    bits=weights.bits)
+        linear.weight, linear.scales, linear.biases = weights.weight, weights.scales, weights.biases
+        weights.__dict__["linear"] = linear
+    return linear
+
+
+def _hc_lane(h_new: mx.array, ssp: mx.array, down: Any, up: Any, norm_scale: mx.array, *, eps: mx.array,
+             streams: int, low: int) -> tuple[mx.array, mx.array]:
+    """hc_project for 8-bit hyper-connections: the prompt path's normed / act / mix kernels around two row-exact
+    lane matmuls (each row's bits independent of the row count, as the 4-bit kernels' are)."""
+
+    from tensorfold.kernels.qwen.flash_next.v1 import prefill_hc
+
+    if DENSE != "lane":
+        raise ValueError("8-bit Flash Next weights decode through the lane matmul (M5 GPUs; TF_FLASH_DENSE=lane)")
+    mixed, inject = prefill_hc.project(h_new, ssp, down, up, norm_scale, low, streams=streams, eps=eps,
+                                       matmul=lambda x, w: project(x, _qw_linear(w)))
+    if inject is None:                                    # the final mixer: no inject rows (the caller drops them)
+        inject = mx.zeros((max(int(h_new.shape[0]), 2), streams), dtype=mx.bfloat16)
+    return mixed, inject
 
 
 class _HC:

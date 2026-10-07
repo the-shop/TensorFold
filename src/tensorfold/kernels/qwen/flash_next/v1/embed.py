@@ -81,6 +81,27 @@ _RMS_ROWS = r"""
 """
 
 
+def _q8(source: str, group: int) -> str:
+    """A 4-bit group-32 row kernel for 8-bit rows in groups of ``group``: 4 values a word, one scale a group."""
+
+    edits = (("(DIMS / 8) + d / 8]", "(DIMS / 4) + d / 4]"),
+             ("(word >> (4 * (d % 8))) & 0xFu", "(word >> (8 * (d % 4))) & 0xFFu"),
+             ("(DIMS / 32) + d / 32]", f"(DIMS / {group}) + d / {group}]"))
+    for old, new in edits:
+        if old not in source:
+            raise RuntimeError(f"embed._q8: {old!r} not in the kernel source")
+        source = source.replace(old, new)
+    return source
+
+
+def _row_kernel(name: str, source: str, bits: int, group: int, inputs: list[str]) -> Any:
+    if (bits, group) == (4, 32):
+        return kernel(f"q4_{name}", source, inputs, ["OUT"])
+    if bits != 8 or group not in (32, 64):
+        raise ValueError(f"{name}: rows of {bits}-bit weights in groups of {group} are not read here")
+    return kernel(f"q8g{group}_{name}", lambda: _q8(source, group), inputs, ["OUT"])
+
+
 class PleTables:
     """Keep n-gram shards as views into eight GPU groups, or use the host table with its checkpoint memory-mapped."""
 
@@ -90,8 +111,10 @@ class PleTables:
         self.dims = int(emb.dims)
         self.host = getattr(emb, "host", None)
         if self.host is not None:
+            self.bits, self.group = int(getattr(emb, "quant_bits", 4)), int(getattr(emb, "quant_group", 32))
             return
         shards = emb.shards
+        self.bits, self.group = int(getattr(shards[0], "bits", 4)), int(getattr(shards[0], "group_size", 32))
         per = -(-len(shards) // self.groups)
         self.weights, self.scales, self.biases, starts = [], [], [], [0]
         for g in range(self.groups):
@@ -123,13 +146,13 @@ def ple_lookup(ids: Any, tables: PleTables) -> mx.array:
     rows, heads = ids.shape
     if tables.host is not None:
         words, scales, biases = tables.host.gather(ids)
-        run = kernel("q4_ple_rows", _PLE_ROWS, ["W", "SC", "BI"], ["OUT"])
+        run = _row_kernel("ple_rows", _PLE_ROWS, tables.bits, tables.group, ["W", "SC", "BI"])
         return run(inputs=[mx.array(words), mx.array(scales).view(mx.bfloat16), mx.array(biases).view(mx.bfloat16)],
                    template=[("DIMS", tables.dims)], grid=(tables.dims, rows * heads, 1),
                    threadgroup=(tables.dims, 1, 1), output_shapes=[(rows, heads * tables.dims)],
                    output_dtypes=[mx.bfloat16])[0]
     names = ["IDS", "GSTART"] + [f"{k}{g}" for g in range(8) for k in ("W", "S", "B")]
-    run = kernel("q4_ple_lookup", _PLE_LOOKUP, names, ["OUT"])
+    run = _row_kernel("ple_lookup", _PLE_LOOKUP, tables.bits, tables.group, names)
     arrays = [mx.array(ids.astype(np.uint32)), tables.starts]
     for g in range(8):
         arrays += [tables.weights[g], tables.scales[g], tables.biases[g]]
@@ -145,8 +168,9 @@ def embed_rows(ids: Any, embedding: Any, *, tile: int = 1) -> mx.array:
     if not isinstance(ids, mx.array):
         ids = mx.array(np.asarray(ids, dtype=np.uint32).reshape(-1))
     rows = int(ids.size)
-    dims = int(embedding.weight.shape[1]) * 8
-    run = kernel("q4_embed_rows", _EMBED_ROWS, ["IDS", "W", "SC", "BI"], ["OUT"])
+    bits, group = int(getattr(embedding, "bits", 4)), int(getattr(embedding, "group_size", 32))
+    dims = int(embedding.weight.shape[1]) * 32 // bits
+    run = _row_kernel("embed_rows", _EMBED_ROWS, bits, group, ["IDS", "W", "SC", "BI"])
     return run(inputs=[padded(ids.reshape(-1).astype(mx.uint32)), embedding.weight, embedding.scales, embedding.biases],
                   template=[("DIMS", dims), ("TILE", tile)], grid=(dims, rows, 1), threadgroup=(min(dims, 256), 1, 1),
                   output_shapes=[(rows, tile * dims)], output_dtypes=[mx.bfloat16])[0]

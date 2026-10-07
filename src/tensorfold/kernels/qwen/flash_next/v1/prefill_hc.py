@@ -47,36 +47,43 @@ _HEADER = base.QDOT_HEADER + RINV
 def _qmm(x: mx.array, w: Any) -> mx.array:
     from tensorfold.kernels.qwen.flash_next.v1 import prefill_mm
 
-    return prefill_mm.matmul(x, w.weight, w.scales, w.biases)
+    return prefill_mm.matmul(x, w.weight, w.scales, w.biases, bits=w.bits, group=w.group_size)
 
 
 def hyper_connection(hc: Any, h: mx.array, pending: tuple[mx.array, mx.array] | None, *, streams: int,
                      eps: mx.array) -> tuple[mx.array, mx.array, mx.array | None]:
     """h [R, S*D] and the pending (branch, inject gates) or None -> (h written back, block input, inject gates)."""
 
-    rows, wide = h.shape
-    dims = wide // streams
     if pending is None:
         h_new, ssp = hc_norm(h, streams=streams)
     else:
         h_new, ssp = hc_norm(h, streams=streams, write_back="plain", branch=(pending[0],), inject=pending[1])
+    mixed, inj = project(h_new, ssp, hc.down, hc.up, hc.scale, hc.low, streams=streams, eps=eps, matmul=_qmm)
+    return h_new, mixed, inj
+
+
+def project(h_new: mx.array, ssp: mx.array, down: Any, up: Any, norm_scale: mx.array, low: int, *, streams: int,
+            eps: mx.array, matmul: Any) -> tuple[mx.array, mx.array | None]:
+    """hc_project through ``matmul(x, weights)`` for the down and up products: (block input, inject gates or None)."""
+
+    rows, wide = h_new.shape
+    dims = wide // streams
     normed_k = base.kernel("tf_hc_normed", _HC_NORMED, ["HN", "SSP", "NW", "eps"], ["NORMED"], header=_HEADER)
-    normed = normed_k(inputs=[h_new, ssp, hc.scale, eps], template=[("S", streams), ("D", dims)],
+    normed = normed_k(inputs=[h_new, ssp, norm_scale, eps], template=[("S", streams), ("D", dims)],
                       grid=(wide, rows, 1), threadgroup=(256, 1, 1), output_shapes=[(rows, wide)],
                       output_dtypes=[mx.bfloat16])[0]
-    dn = _qmm(normed, hc.down)                                          # [R, LOW (+ S inject rows)]
+    dn = matmul(normed, down)                                           # [R, LOW (+ S inject rows)]
     nd = int(dn.shape[1])
-    low = hc.low
     act_k = base.kernel("tf_hc_act", _HC_ACT, ["DN"], ["ACT", "INJ"], header=_HEADER)
     act, inj = act_k(inputs=[dn], template=[("S", streams), ("LOW", low), ("ND", nd)],
                      grid=(nd, rows, 1), threadgroup=(min(nd, 256), 1, 1),
                      output_shapes=[(rows, low), (rows, streams)], output_dtypes=[mx.bfloat16, mx.bfloat16])
-    up = _qmm(act, hc.up)                                               # [R, S*D]
+    up = matmul(act, up)                                                # [R, S*D]
     mix_k = base.kernel("tf_hc_mix", _HC_MIX, ["UP", "NORMED"], ["MIXED"], header=_HEADER)
     mixed = mix_k(inputs=[up, normed], template=[("S", streams), ("D", dims)],
                   grid=(dims, rows, 1), threadgroup=(256, 1, 1), output_shapes=[(rows, dims)],
                   output_dtypes=[mx.bfloat16])[0]
-    return h_new, mixed, (inj if nd > low else None)
+    return mixed, (inj if nd > low else None)
 
 
 QUEUE_LAYERS = 2                    # layers a slice; MLX holds a queued slice's buffers, so this bounds memory

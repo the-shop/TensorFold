@@ -95,8 +95,8 @@ class SSDTable:
             index, data, size = opened[path]
             (rows, wrow, w0), (srows, grow, s0), (brows, brow, b0) = (
                 _span(entry, kind, data, size, path.name) for entry, kind in zip(entries, _KINDS))
-            if not rows == srows == brows or wrow != 8 * grow or brow != grow:
-                raise ValueError(f"{path.name}: an n-gram shard is not 4-bit rows with a scale and bias every 32")
+            if not rows == srows == brows or wrow not in (8 * grow, 16 * grow) or brow != grow:
+                raise ValueError(f"{path.name}: an n-gram shard is not 4- or 8-bit rows with a scale and bias every 32")
             if widths not in (None, (wrow, grow)):
                 raise ValueError(f"{path.name}: the n-gram shards differ in row width")
             widths = (wrow, grow)

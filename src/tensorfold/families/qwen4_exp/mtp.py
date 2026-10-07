@@ -68,8 +68,11 @@ def load(model_dir, cfg: Config) -> FlashMTP:
     weights = sanitize(weights)
     mx.eval(list(weights.values()))          # read before any GPU work uses them (see model.load)
     head = FlashMTP(cfg)
+    from tensorfold.families.qwen4_exp.model import quant_predicate, quant_specs
+
+    paths = {k[:-len(".scales")] for k in weights if k.endswith(".scales")}
     nn.quantize(head, group_size=cfg.group_size, bits=cfg.bits,
-                class_predicate=lambda p, m: hasattr(m, "to_quantized") and f"{p}.scales" in weights)
+                class_predicate=quant_predicate(paths, quant_specs(head, weights, paths)))
     # the same storage convention as the main model's centred norms (checked on its hc_norm anchors)
     main = {}
     for path in sorted(Path(model_dir).glob("model*.safetensors")):

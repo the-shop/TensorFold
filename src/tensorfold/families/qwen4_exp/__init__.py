@@ -57,8 +57,9 @@ def check(model_dir: Path) -> None:
             print("[tensorfold] this NVFP4 checkpoint has no MTP head: decoding without MTP drafts", flush=True)
         return
     bits, group = quantization(config)
-    if (bits, group) != (4, 32):
-        raise ValueError(f"TensorFold's Flash Next kernels read 4-bit weights in groups of 32; this checkpoint has "
+    if (bits, group) not in MLX_QUANTIZATION:
+        raise ValueError(f"TensorFold's Flash Next kernels read 4-bit weights in groups of 32 or 8-bit weights in "
+                         f"groups of 64 (n-gram tables 8-bit in groups of 32); this checkpoint has "
                          f"{bits}-bit weights in groups of {group}. Use {MODELS[0]}.")
     # Config-only preflight cannot establish whether the MTP head is missing; wait for weights or their index.
     if ((Path(model_dir) / "model.safetensors.index.json").is_file()
@@ -66,6 +67,10 @@ def check(model_dir: Path) -> None:
         print(f"[tensorfold] this checkpoint has no MTP head: decoding without MTP drafts ({MODELS[0]} has one)",
               flush=True)
 
+
+# (bits, group size) the Metal path reads: the published 4-bit checkpoint, or an 8-bit conversion
+# (tools/convert_flash_next_q8.py) whose n-gram tables, 160 values a row, are 8-bit in groups of 32
+MLX_QUANTIZATION = ((4, 32), (8, 64))
 
 # a table's tensors in the checkpoint: weights, scales and biases of each shard, the only bytes read on the host
 _TABLE = r"language_model\.model\.layers\.\d+\.ple\.ple_embedding\.ngram_embedding\.shard_\d+\.(weight|scales|biases)"

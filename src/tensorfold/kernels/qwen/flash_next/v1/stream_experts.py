@@ -48,6 +48,12 @@ def _down_source() -> str:
         _DOWN_PICK, "const size_t e = shared ? 0 : size_t(SLOTOF[LAYER[0] * NE + int(PICK[r * TOPK + k])]);")
 
 
+def _pool_bits(slots: Any, inputs: int) -> int:
+    """The bit width of a pool projection's packed rows for ``inputs`` values a row."""
+
+    return int(slots.weight.shape[-1]) * 32 // int(inputs)
+
+
 def route(logits: mx.array, top_k: int, box: mx.array) -> mx.array:
     """Write each row's top-k expert ids into ``box`` (the host reads it after the GPU's signal); returns a token."""
 
@@ -71,9 +77,13 @@ def gateup(x: mx.array, logits: mx.array, top_k: int, n_experts: int, pool: Any,
     rows, dims = x.shape
     width = int(pool.gate.weight.shape[1])
     sg, su = shared
-    run = kernel("q4_stream_gateup", _gateup_source,
-                 ["X", "LOGITS", "GW", "GS", "GB", "UW", "US", "UB", "SGW", "SGS", "SGB", "SUW", "SUS", "SUB",
-                  "SLOTOF", "LAYER"], ["ACT", "PICK", "WTS"])
+    names = ["X", "LOGITS", "GW", "GS", "GB", "UW", "US", "UB", "SGW", "SGS", "SGB", "SUW", "SUS", "SUB", "SLOTOF",
+             "LAYER"]
+    if _pool_bits(pool.gate, dims) != experts.spec(sg, su):
+        raise ValueError("stream_experts: the pool's experts and the shared expert differ in width")
+    run = (kernel("q4_stream_gateup", _gateup_source, names, ["ACT", "PICK", "WTS"]) if experts.spec(sg, su) == 4 else
+           kernel("q8_stream_gateup", lambda: experts.q8(_gateup_source(), experts._Q8_GATEUP), names,
+                  ["ACT", "PICK", "WTS"]))
     return tuple(run(inputs=[x, logits, pool.gate.weight, pool.gate.scales, pool.gate.biases, pool.up.weight,
                              pool.up.scales, pool.up.biases, sg.weight, sg.scales, sg.biases, su.weight, su.scales,
                              su.biases, slot_of, layer],
@@ -92,8 +102,11 @@ def down(act: mx.array, picks: mx.array, n_experts: int, pool: Any, slot_of: mx.
     rows, slots, width = act.shape
     top_k = int(picks.shape[-1])
     dims = int(pool.down.weight.shape[1])
-    run = kernel("q4_stream_down_y", _down_source,
-                 ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows", "SLOTOF", "LAYER"], ["Y"])
+    names = ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows", "SLOTOF", "LAYER"]
+    if _pool_bits(pool.down, width) != experts.spec(shared):
+        raise ValueError("stream_experts: the pool's experts and the shared expert differ in width")
+    run = (kernel("q4_stream_down_y", _down_source, names, ["Y"]) if experts.spec(shared) == 4 else
+           kernel("q8_stream_down_y", lambda: experts.q8(_down_source(), experts._Q8_DOWN), names, ["Y"]))
     return run(inputs=[act, picks, pool.down.weight, pool.down.scales, pool.down.biases, shared.weight,
                        shared.scales, shared.biases, count(rows), slot_of, layer],
                template=[("NI", width), ("D", dims), ("TOPK", top_k), ("SG", simdgroups), ("NE", n_experts)],

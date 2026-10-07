@@ -129,6 +129,46 @@ _EXPERT_DOWN_Y = r"""
 """
 
 
+_Q8_GATEUP = (("constexpr int KB = K / 2;", "constexpr int KB = K;"),
+              ("constexpr int KG = K / 32;", "constexpr int KG = K / 64;"),
+              ("(e * N + row0) * KB + lane * 8;", "(e * N + row0) * KB + lane * 16;"),
+              ("(e * N + row0) * KG + lane / 2;", "(e * N + row0) * KG + lane / 4;"),
+              ("load16(x, xt)", "load16_8(x, xt)"),
+              ("qdot16(", "qdot16_8("),
+              ("gw += 256; uw += 256; gs += 16; gb += 16; us += 16; ub += 16;",
+               "gw += 512; uw += 512; gs += 8; gb += 8; us += 8; ub += 8;"))
+_Q8_DOWN = (("constexpr int KB = NI / 2;", "constexpr int KB = NI;"),
+            ("constexpr int KG = NI / 32;", "constexpr int KG = NI / 64;"),
+            ("load16(", "load16_8("),
+            ("qdot16(", "qdot16_8("),
+            ("w + lane * 8,", "w + lane * 16,"),
+            ("w + (32 + lane) * 8,", "w + (32 + lane) * 16,"),
+            ("DSp[at * KG + lane / 2]", "DSp[at * KG + lane / 4]"),
+            ("DBp[at * KG + lane / 2]", "DBp[at * KG + lane / 4]"),
+            ("DSp[at * KG + (32 + lane) / 2]", "DSp[at * KG + (32 + lane) / 4]"),
+            ("DBp[at * KG + (32 + lane) / 2]", "DBp[at * KG + (32 + lane) / 4]"))
+
+
+def q8(source: str, edits: tuple[tuple[str, str], ...]) -> str:
+    """A 4-bit group-32 expert kernel's source for 8-bit weights in groups of 64: a lane's 16 inputs take 16 bytes
+    of a row (not 8) and share a scale with 3 other lanes (not 1); the loop, picks and sums are unchanged."""
+
+    for old, new in edits:
+        if old not in source:
+            raise RuntimeError(f"experts.q8: {old!r} not in the kernel source")
+        source = source.replace(old, new)
+    return source
+
+
+def spec(*linears: Any) -> int:
+    """The bits of expert weights the kernels take: 4 (groups of 32) or 8 (groups of 64), the same for all."""
+
+    found = {(int(getattr(l, "bits", 4)), int(getattr(l, "group_size", 32))) for l in linears}
+    if len(found) != 1 or next(iter(found)) not in ((4, 32), (8, 64)):
+        raise ValueError(f"expert kernels take 4-bit weights in groups of 32 or 8-bit in groups of 64, got {found}")
+    return next(iter(found))[0]
+
+
 def router(x: mx.array, gate_weight: mx.array, *, threads: int = 256, dtype: Any = mx.float32) -> mx.array:
     """x [R, D] @ gate_weight.T -> logits [R, E], fp32 (bf16 ties at the top-10 cut), a row's bits the same at any R."""
 
@@ -152,9 +192,13 @@ def expert_gateup(x: mx.array, logits: mx.array, top_k: int, experts: int, gate:
         raise ValueError("expert_gateup: needs K % 512 == 0 and N % 8 == 0")
     extra = 1 if shared is not None else 0
     sg, su = shared if shared is not None else (gate, up)
+    bits = spec(gate, up, sg, su)
     run = kernel("q4_expert_gateup", _EXPERT_GATEUP,
                      ["X", "LOGITS", "GW", "GS", "GB", "UW", "US", "UB", "SGW", "SGS", "SGB", "SUW", "SUS", "SUB"],
-                     ["ACT", "PICK", "WTS"])
+                     ["ACT", "PICK", "WTS"]) if bits == 4 else kernel(
+        "q8_expert_gateup", lambda: q8(_EXPERT_GATEUP, _Q8_GATEUP),
+        ["X", "LOGITS", "GW", "GS", "GB", "UW", "US", "UB", "SGW", "SGS", "SGB", "SUW", "SUS", "SUB"],
+        ["ACT", "PICK", "WTS"])
     return tuple(run(inputs=[x, logits, gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,
                                 sg.weight, sg.scales, sg.biases, su.weight, su.scales, su.biases],
                         template=[("K", dims), ("N", width), ("TOPK", top_k), ("SHARED", extra), ("NE", experts),
@@ -170,8 +214,9 @@ def expert_down_y(act: mx.array, picks: mx.array, down: Any, shared: Any, *, sim
     rows, slots, width = act.shape
     top_k = int(picks.shape[-1])
     dims = int(down.weight.shape[1])
-    run = kernel("q4_expert_down_y", _EXPERT_DOWN_Y,
-                     ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows"], ["Y"])
+    names = ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows"]
+    run = (kernel("q4_expert_down_y", _EXPERT_DOWN_Y, names, ["Y"]) if spec(down, shared) == 4 else
+           kernel("q8_expert_down_y", lambda: q8(_EXPERT_DOWN_Y, _Q8_DOWN), names, ["Y"]))
     return run(inputs=[act, picks, down.weight, down.scales, down.biases, shared.weight, shared.scales,
                           shared.biases, count(rows)],
                   template=[("NI", width), ("D", dims), ("TOPK", top_k), ("SG", simdgroups)],

@@ -314,6 +314,37 @@ def sanitize(weights: dict[str, mx.array]) -> tuple[dict[str, mx.array], dict[st
     return out, extras
 
 
+def quant_specs(model: nn.Module, weights: dict[str, mx.array], paths: set[str]) -> dict[str, tuple[int, int]]:
+    """(bits, group size) of each quantized module from its packed weight and scales (4-bit/32 or 8-bit/64 ...)."""
+
+    modules = dict(model.named_modules())
+    specs = {}
+    for path in paths:
+        module = modules.get(path)
+        if module is None or not hasattr(module, "weight"):
+            continue
+        dims = int(module.weight.shape[-1])
+        words, groups = int(weights[f"{path}.weight"].shape[-1]), int(weights[f"{path}.scales"].shape[-1])
+        if (words * 32) % dims or dims % groups:
+            raise ValueError(f"{path}: packed {words} words / {groups} groups do not fit {dims} inputs")
+        specs[path] = (words * 32 // dims, dims // groups)
+    return specs
+
+
+def quant_predicate(paths: set[str], specs: dict[str, tuple[int, int]]) -> Any:
+    """nn.quantize's predicate: the checkpoint's modules, each at its own width and group."""
+
+    def predicate(path: str, module: nn.Module) -> bool | dict:
+        if not (hasattr(module, "to_quantized") and path in paths):
+            return False
+        if path not in specs:
+            return True
+        bits, group = specs[path]
+        return {"group_size": group, "bits": bits, "mode": "affine"}
+
+    return predicate
+
+
 def norms_stored_around_one(weights: dict[str, mx.array]) -> bool:
     """Detect whether the checkpoint stores gamma or gamma - 1 from attention hyper-connection norm means."""
 
@@ -351,6 +382,7 @@ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
         weights.update(mx.load(str(path), stream=mx.cpu))
     weights, extras = sanitize(weights)
     quantized_paths = {k[:-len(".scales")] for k in weights if k.endswith(".scales")}
+    specs = quant_specs(model, weights, quantized_paths)      # (bits, group) a module, read off its shapes
     if ssd_experts:
         from tensorfold.families.qwen4_exp import stream
 
@@ -362,16 +394,16 @@ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
             emb.shards = []
             emb.host = host_table.ReadAhead(host_table.from_checkpoint(
                 model_dir, f"language_model.{path}.ngram_embedding", len(emb.shard_starts) - 1, ssd=ple_on_ssd))
+            emb.quant_bits = emb.host.wrow * 8 // emb.dims            # the tables' own width and group
+            emb.quant_group = emb.dims * 2 // emb.host.grow
             if emb.host.rows != emb.shard_starts[-1]:
                 raise ValueError(f"{path}: n-gram tables hold {emb.host.rows} rows, expected {emb.shard_starts[-1]}")
         weights = {k: v for k, v in weights.items() if ".ple_embedding.shards." not in k}
     if not lazy:
         mx.eval(list(weights.values()))
 
-    def quantized(path: str, module: nn.Module) -> bool:
-        return hasattr(module, "to_quantized") and path in quantized_paths
-
-    nn.quantize(model, group_size=cfg.group_size, bits=cfg.bits, class_predicate=quantized)
+    nn.quantize(model, group_size=cfg.group_size, bits=cfg.bits,
+                class_predicate=quant_predicate(quantized_paths, specs))
     if norms_stored_around_one(weights):
         # Convert stored gamma to the gamma - 1 expected by centered norms.
         for path, module in model.named_modules():
