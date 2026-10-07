@@ -54,6 +54,21 @@ path, resolved matmul route and GPU identity; changing arithmetic requires a fre
 Load-time shared-forward checks compare each stream with its own call. A failed check limits forwards
 to one stream, while successful checks allow the lane engine to combine requests.
 
+### 8-bit checkpoints (M5, experimental)
+
+`tools/convert_flash_next_q8.py SRC DST` streams a BF16 Hugging Face checkpoint (with its `mtp.*` head)
+into an MLX affine 8-bit one, a tensor (or row chunk) at a time under an MLX memory cap: every linear,
+embedding and expert stack 8-bit in groups of 64, the n-gram tables (160 values a row) 8-bit in groups of
+32, the routers bf16, the vision tower dropped. The result is 194 GB (experts 119.5 GiB, n-gram tables
+53.6 GiB, the rest 7.5 GiB), so serve it with `--ple-on-ssd --ssd-experts GIB`.
+
+The loader reads each module's width and group off its packed shapes. 8-bit experts run the 4-bit expert
+kernels' loops with 16 bytes a lane (resident and slot pool alike); token and n-gram rows dequantize 4
+values a word; the hyper-connections run their down and up products through the lane matmul (M5 only)
+between the prompt path's normed / act / mix kernels. 8-bit lane weights are read in place: set
+`TF_FLASH_TILE_WIDE=1` to keep tiled copies (faster reads, about 4 GiB more). Each pool size gives the
+same tokens, and drafted replies equal `"draft": false` ones.
+
 ## CUDA
 
 Use the [container setup](../../RUNBOOK.md#nvidia-gpus). For two ranks, pull the checkpoint on both and
