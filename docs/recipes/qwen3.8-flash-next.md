@@ -93,6 +93,9 @@ hf download Qwen/Qwen3.8-Flash-Next --local-dir flashnext-bf16
 python tools/convert_flash_next_q8.py flashnext-bf16 flashnext-q8 --limit-gb 14
 ```
 
+To skip the download and conversion, the decensored derivative measured below is published already converted:
+`hf download the-shop/MLXFW-Qwen3.8-Flash-Next-Heretic-MLX-8bit --local-dir flashnext-q8` (194 GB).
+
 The converter opens the source and output files with `F_NOCACHE` and reads with `pread`, so it doesn't fill the
 page cache. It also caps MLX at `--limit-gb`, so it can run alongside other work. `--dry-run` prints the
 shard plan and writes nothing.
