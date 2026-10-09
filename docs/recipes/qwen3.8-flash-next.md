@@ -69,6 +69,105 @@ between the prompt path's normed / act / mix kernels. 8-bit lane weights are rea
 `TF_FLASH_TILE_WIDE=1` to keep tiled copies (faster reads, about 4 GiB more). Each pool size gives the
 same tokens, and drafted replies equal `"draft": false` ones.
 
+#### Running it on a 128 GB M5 Mac
+
+You need:
+- an M5 Mac with 128 GB of RAM;
+- Xcode Command Line Tools (`xcode-select --install`);
+- about 560 GB of free SSD: the 360 GB BF16 download plus the 194 GB 8-bit output.
+
+The converter and the SSD streaming changes live on the `q8-flash-next` branch of the-shop's fork until they
+are merged:
+
+```bash
+git clone -b q8-flash-next https://github.com/the-shop/TensorFold.git && cd TensorFold
+```
+
+Run everything below from that directory, in a Python 3.11+ virtual environment. The SSD extras build the expert pool's host side, a small
+MLX extension, with cmake and nanobind the first time it is used. The `hf` command comes from
+`huggingface_hub` 0.34 or later.
+
+```bash
+python -m pip install -e ".[ssd]" "huggingface_hub>=0.34"
+hf download Qwen/Qwen3.8-Flash-Next --local-dir flashnext-bf16
+python tools/convert_flash_next_q8.py flashnext-bf16 flashnext-q8 --limit-gb 14
+```
+
+The converter opens the source and output files with `F_NOCACHE` and reads with `pread`, so it doesn't fill the
+page cache. It also caps MLX at `--limit-gb`, so it can run alongside other work. `--dry-run` prints the
+shard plan and writes nothing.
+
+Serve with a 40 GiB expert pool and thinking off, the configuration measured below:
+
+```bash
+TENSORFOLD_MEMORY_LIMIT_GB=56 tensorfold serve flashnext-q8 --name bench \
+  --ssd-experts 40 --ple-on-ssd --context 16384 --no-thinking
+```
+
+The pool and the context window share the memory budget:
+
+| `--ssd-experts` | `TENSORFOLD_MEMORY_LIMIT_GB` | `--context` | Peak (MLX, `/health`) | Left on a 128 GiB Mac |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 56 | 16,384 | 52 GiB | about 75 GiB |
+| 40 | 62 | 65,536 | not measured | |
+| 60 | 76 | 16,384 | 72 GiB | about 55 GiB |
+
+- **Process size:** in `top`, the server process ran 1-5 GiB above the MLX peak.
+- **62 GiB limit:** prompts above about 55,000 tokens are served, but they are re-prefilled on the next turn.
+- **Context:** with the 40 GiB pool, use a 16K context at a 56 GiB limit; a 32K context fits at a 60 GiB limit.
+- **Largest pool:** with an 80 GiB pool on a 96 GiB limit, macOS started swapping during load, and a 32K context
+  did not fit. 60 GiB is the practical maximum on a 128 GB Mac.
+
+To check that drafting changes nothing, compare the token hash the server returns with drafts on and off:
+
+```bash
+for d in true false; do
+  curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{"model":"bench",
+    "messages":[{"role":"user","content":"Write a merge_intervals function in Python."}],
+    "max_tokens":128,"temperature":0,"draft":'$d'}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["tensorfold"]["token_sha"])'
+done   # the two lines must match
+```
+
+The numbers below come from two independent private harnesses, not `tools/bench_openai.py`. That tool uses
+64-token replies, two prompts and client-side timing, so its numbers aren't comparable to these. They were measured
+on an M5 Max (40-core GPU, 128 GB) running a decensored derivative of Qwen/Qwen3.8-Flash-Next. The derivative has
+the same tensor names, shapes and quantization, and it was converted with this tool. The machine's other model
+servers and background jobs were stopped during the runs.
+
+Both harnesses ran with thinking off, at temperature 0, with replies of up to 128 tokens and a 16K context. Each
+value is a median of server-side decode tok/s. The validator harness's values are medians over its seven short
+prompts; its 2.5K-token prompt is used only for prefill.
+
+| Pool | First request of a prompt, drafts on | `"draft": false`, second visit to the prompt (7 others in between) | Same prompt rerun back to back, drafts on | Prefill, 2.5-3.4K tokens | Load |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 GiB | 15.6-18.8 | 12.4-12.5 | 21.3-21.7 | 168-241 tok/s | 74-92 s |
+| 60 GiB | 18.9-24.3 | 13.7 | 58.8 | 160-238 tok/s | 92-93 s |
+
+Serial replies of a prompt that had just run five times back to back reached 14.4-15.3 tok/s at 40 GiB and
+30.2 at 60 GiB.
+
+- **Pool size and decode:** a bigger pool helps most when consecutive requests route to the same experts. At
+  60 GiB, nearly all of a 128-token reply's experts stay resident: 98% of decode reads hit the pool, so a rerun
+  rarely reads the SSD. With seven other prompts in between, 60 GiB gained little: 13.7 tok/s against 12.4.
+- **Prefill:** prefill reads experts in bulk, so pool size barely changes it.
+- **Hit rate:** in a run that sent each prompt five times in a row, the 40 GiB pool served about 90% of expert reads.
+  Expert and n-gram reads use `F_NOCACHE`, so the page cache does not raise these rates.
+- **Output:** across every configuration, drafted and serial replies had identical token hashes on every prompt,
+  and those hashes matched across pool sizes and flags.
+
+Two opt-in flags stream experts ahead of time. Both default to off.
+- **`TENSORFOLD_POOL_DECODE_PREFETCH=K`** (0 to 16): runs the next layer's router on this layer's MoE input and
+  reads its top-K experts while the GPU works.
+  - **Prefetches used:** 76% at K=4, 61% at K=8.
+  - **Drafted decode:** -3% in one harness, +8% to +16% in the other.
+  - **Prefill:** fell from 168 to 127 tok/s in the first harness, and from 198-241 to 160-192 in the second.
+- **`TENSORFOLD_POOL_PROMPT_SEED=1`**: loads each layer's most-used prompt experts at the first decode step. The
+  number per layer is `TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER`, default 32. Together with K=4 prefetch, it slowed
+  decode by about 14% against prefetch alone (one harness, one run).
+
+Both flags change only which experts are resident, never the tokens.
+
 ## CUDA
 
 Use the [container setup](../../RUNBOOK.md#nvidia-gpus). For two ranks, pull the checkpoint on both and
