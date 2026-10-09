@@ -24,14 +24,15 @@ _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
 
 
 def _expert_stats(app: Any) -> dict | None:
-    """The --ssd-experts pool's slot hits, misses and bytes read since start, or None without a pool."""
+    """The --ssd-experts pool's slot hits, misses and bytes read since start (with decode prefetch or prompt seeding
+    on, their counters too), or None without a pool."""
 
     model = getattr(app, "_model", None)
     inner = getattr(model, "model", model)
     streamer = getattr(inner, "__dict__", {}).get("streamer")
     if streamer is None:
         return None
-    return {"hits": int(streamer.hits), "misses": int(streamer.misses), "bytes_read": int(streamer.bytes_read)}
+    return streamer.stats()
 
 
 def _memory(reset_peak: bool, *, admission: Any = None) -> dict[str, int]:

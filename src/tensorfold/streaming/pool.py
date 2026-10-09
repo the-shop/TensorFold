@@ -8,7 +8,8 @@ import struct
 import sys
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_all
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,15 @@ class Source:
     path: Path
     offset: int
     nbytes: int
+
+
+@dataclass
+class Pending:
+    """A speculative read in flight: the slot it fills and its part reads (a decode guess, or a prompt seed)."""
+
+    slot: int
+    reads: list[Future]
+    seed: bool
 
 
 @dataclass
@@ -84,7 +94,8 @@ class Streamer:
     """Slots [0, E): one layer's window (expert e in slot e) for prompt chunks; [E, S): an LRU for decode rows."""
 
     def __init__(self, found: dict, shapes: dict, *, layers: int, experts: int, top_k: int, slots: int,
-                 box_rows: int, hostsync: Any, workers: int = 8) -> None:
+                 box_rows: int, hostsync: Any, workers: int = 8, decode_prefetch: int = 0,
+                 prompt_seed: int = 0) -> None:
         if slots < 2 * experts:
             raise ValueError(f"the expert pool needs a layer's {experts} window slots plus as many for decode, "
                              f"got {slots}")
@@ -107,26 +118,42 @@ class Streamer:
         self.lru: OrderedDict[tuple[int, int], int] = OrderedDict()     # (layer, expert) -> slot, oldest first
         self.free = list(range(slots - 1, experts - 1, -1))
         self.hits = self.misses = self.bytes_read = 0
+        self._bytes_lock = threading.Lock()                             # reader threads add to bytes_read
         self.error: BaseException | None = None
         self._readers = ThreadPoolExecutor(workers, thread_name_prefix="expert-read")
+        # decode_prefetch=k: each decode row's k guesses for the next layer (GPU-written) are read behind the call;
+        # prompt_seed=n: after a prompt, each layer's n most-routed experts are read into the LRU, warmest last
+        self.decode_prefetch, self.prompt_seed = int(decode_prefetch), int(prompt_seed)
+        self.pending: dict[tuple[int, int], Pending] = {}
+        self.speculative: dict[tuple[int, int], str] = {}               # loaded ahead of demand, not yet routed
+        self.prefetch_issued = self.prefetch_hits = self.prefetch_misses = self.prefetch_cancelled = 0
+        self.seeded = self.seed_hits = 0
+        self.guess_box = None
+        if self.decode_prefetch:
+            self.guess_box = mx.zeros((max(box_rows * self.decode_prefetch, 8),), dtype=mx.uint32)
+            mx.eval(self.guess_box)
+        self.prompt_counts = np.zeros((layers, experts), dtype=np.int64) if self.prompt_seed else None
+        self._prompted = False                                          # window calls since the last seed
+        self._seeders = ThreadPoolExecutor(2, thread_name_prefix="expert-seed") if self.prompt_seed else None
         self._jobs: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
 
-    def marks(self, kind: str, layer: int, rows: int) -> tuple[int, int]:
-        """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags."""
+    def marks(self, kind: str, layer: int, rows: int, guess: int = 0) -> tuple[int, int]:
+        """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags
+        (or counts); ``guess`` > 0: rows x guess ids for layer + 1 wait in the guess box."""
 
         if self.error is not None:
             raise RuntimeError("expert streaming stopped") from self.error
         signal, ready = self.value + 1, self.value + 2
         self.value = ready
-        self._jobs.put((kind, layer, rows, signal, ready))
+        self._jobs.put((kind, layer, rows, signal, ready, guess))
         return signal, ready
 
-    def hold(self, token: mx.array, kind: str, layer: int, rows: int) -> mx.array:
+    def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0) -> mx.array:
         """``token`` once the GPU has signalled this call to the host and the host has answered it (graph marks)."""
 
-        signal, ready = self.marks(kind, layer, rows)
+        signal, ready = self.marks(kind, layer, rows, guess)
         return self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
 
     def window_views(self) -> dict[str, Slots]:
@@ -134,24 +161,162 @@ class Streamer:
 
         return {proj: Slots(*(getattr(s, p)[:self.experts] for p in PARTS)) for proj, s in self.pool.items()}
 
+    def stats(self) -> dict[str, int]:
+        """Hits, misses and bytes read; with decode prefetch or prompt seeding on, their counters too."""
+
+        out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read)}
+        if self.decode_prefetch:
+            out.update(prefetch_issued=self.prefetch_issued, prefetch_hits=self.prefetch_hits,
+                       prefetch_misses=self.prefetch_misses, prefetch_cancelled=self.prefetch_cancelled)
+        if self.prompt_seed:
+            out.update(seeded=self.seeded, seed_hits=self.seed_hits)
+        return out
+
     def _serve(self) -> None:
         while True:
             job = self._jobs.get()
             if job is None:
                 return
-            kind, layer, rows, signal, ready = job
+            kind, layer, rows, signal, ready, guess = job
+            after: list = []
             try:
                 if not self.channel.wait(signal, TIMEOUT_MS):
                     raise TimeoutError(f"no routing from the GPU for layer {layer}")
                 if kind == "rows":
                     ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
-                    self._load(layer, sorted({int(e) for e in ids}))
+                    routed = sorted({int(e) for e in ids})
+                    routed_reads = self._resolve(layer, routed)
+                    self._load(layer, routed)
+                    for read in routed_reads:              # a guess this call routed to: its bytes before release
+                        read.result()
+                    keep = {(layer, e) for e in routed}
+                    if guess and layer + 1 < self.layers:  # read before release: the next layer rewrites the box
+                        guesses = np.frombuffer(self.hs.peek(self.guess_box, 0, 4 * rows * guess), dtype=np.uint32)
+                        after.append((self._prefetch, layer + 1, list(dict.fromkeys(int(e) for e in guesses)), keep))
+                    if self._prompted:
+                        after.append((self._seed, self.prompt_counts.copy(), keep))
+                        self.prompt_counts[:] = 0
+                        self._prompted = False
                 else:
+                    self._resolve(layer, [])
                     flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
+                    if self.prompt_counts is not None:
+                        self.prompt_counts[layer] += flags
+                        self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
             except BaseException as error:        # the GPU still gets its release; the next call then raises
                 self.error = error
             self.channel.signal(ready)
+            for step, *args in after:             # speculative reads start once the GPU runs on
+                if self.error is not None:
+                    break
+                try:
+                    step(*args)
+                except BaseException as error:
+                    self.error = error
+
+    def _resolve(self, layer: int, routed: list[int]) -> list[Future]:
+        """Before a call: the reads of speculative loads it routed to (to wait for), stale guesses cancelled.
+
+        A guess the call did not route to is cancelled if its reads have not all started; once they end, a
+        partly read slot goes back to the free list (reused first), a fully read one stays in the LRU. Seeds
+        still in flight keep reading, except a routed seed still queued behind other seeds: its queued reads are
+        cancelled and the call reads it on demand instead."""
+
+        if not self.pending:
+            return []
+        wanted = {(layer, e) for e in routed}
+        waits: list[Future] = []
+        stale = []
+        for key, entry in list(self.pending.items()):
+            if key in wanted and entry.seed and any([read.cancel() for read in entry.reads]):
+                stale.append((key, entry))        # dropped below, then a demand miss on the readers
+            elif key in wanted:
+                waits += entry.reads
+                del self.pending[key]
+            elif not entry.seed or all(read.done() for read in entry.reads):
+                stale.append((key, entry))
+        for _, entry in stale:                    # every stale read cancelled before waiting on any
+            if not entry.seed:
+                for read in entry.reads:
+                    read.cancel()
+        for key, entry in stale:              # a cancelled read never runs; wait() would wait for a worker to see it
+            wait_all([read for read in entry.reads if not read.cancelled()])
+            del self.pending[key]
+            if any(read.cancelled() or read.exception() is not None for read in entry.reads):
+                if self.lru.get(key) == entry.slot:
+                    del self.lru[key]
+                self.speculative.pop(key, None)
+                self.free.append(entry.slot)
+                if not entry.seed:
+                    self.prefetch_cancelled += 1
+                    self.prefetch_misses += 1
+        return waits
+
+    def _speculate(self, layer: int, e: int, slot: int, seed: bool) -> None:
+        """Start reading expert ``e`` of ``layer`` into ``slot``, already the newest entry of the LRU."""
+
+        pool = self._seeders if seed else self._readers
+        reads = [pool.submit(self._read, layer, proj, part, e, slot) for proj in self.pool for part in PARTS]
+        self.pending[(layer, e)] = Pending(slot, reads, seed)
+        self.speculative[(layer, e)] = "seed" if seed else "prefetch"
+
+    def _prefetch(self, layer: int, guesses: list[int], keep: set) -> None:
+        """Read the guessed experts of ``layer`` into free or least-recent slots, never evicting an expert of the
+        current call, another guess of this call or a read in flight; stop when only those are left."""
+
+        guesses = [e for e in guesses if 0 <= e < self.experts]
+        keep = keep | {(layer, e) for e in guesses if (layer, e) in self.lru}   # one guess never evicts another
+        for e in guesses:
+            key = (layer, e)
+            if key in self.lru:
+                continue
+            if self.free:
+                slot = self.free.pop()
+            else:
+                victim = next((k for k in self.lru if k not in keep and k not in self.pending), None)
+                if victim is None:
+                    return
+                slot = self._drop(victim)
+            self.lru[key] = slot
+            self._speculate(layer, e, slot, seed=False)
+            self.prefetch_issued += 1
+
+    def _seed(self, counts: np.ndarray, keep: set) -> None:
+        """Each layer's ``prompt_seed`` most-routed experts of the prompt resident, the most-routed newest in the
+        LRU; resident ones are only moved. Never evicts the current call's experts or reads in flight."""
+
+        picks = []
+        for layer in range(self.layers):
+            order = np.argsort(-counts[layer], kind="stable")[:self.prompt_seed]
+            picks += [(int(counts[layer, e]), layer, int(e)) for e in order if counts[layer, e] > 0]
+        room = len(self.lru) + len(self.free) - len(keep) - len(self.pending)
+        picks = sorted(picks, key=lambda p: (-p[0], p[1], p[2]))[:max(room, 0)]
+        placed: set = set()
+        for _, layer, e in reversed(picks):       # least routed first: the most routed end up newest
+            key = (layer, e)
+            placed.add(key)
+            if key in self.lru:
+                self.lru.move_to_end(key)
+                continue
+            if self.free:
+                slot = self.free.pop()
+            else:
+                victim = next((k for k in self.lru if k not in keep and k not in self.pending and k not in placed),
+                              None)
+                if victim is None:
+                    return
+                slot = self._drop(victim)
+            self.lru[key] = slot
+            self._speculate(layer, e, slot, seed=True)
+            self.seeded += 1
+
+    def _drop(self, key: tuple[int, int]) -> int:
+        """Evict ``key`` from the LRU: its slot, a speculative load that was never routed counted as wasted."""
+
+        if self.speculative.pop(key, None) == "prefetch":
+            self.prefetch_misses += 1
+        return self.lru.pop(key)
 
     def _load(self, layer: int, ids: list[int]) -> None:
         """Every id resident in the LRU for ``layer``, then its slot written into the table."""
@@ -161,6 +326,11 @@ class Streamer:
             if not 0 <= e < self.experts:
                 raise ValueError(f"routed expert {e} is outside the model")
             slot = self.lru.pop((layer, e), None)
+            used = self.speculative.pop((layer, e), None) if self.speculative else None
+            if used == "prefetch":
+                self.prefetch_hits += 1
+            elif used == "seed":
+                self.seed_hits += 1
             if slot is None:
                 slot = self.free.pop() if self.free else self._evict({(layer, i) for i in ids})
                 need.append((e, slot))
@@ -181,8 +351,8 @@ class Streamer:
 
     def _evict(self, keep: set) -> int:
         for key in self.lru:
-            if key not in keep:
-                return self.lru.pop(key)
+            if key not in keep and key not in self.pending:
+                return self._drop(key)
         raise MemoryError("the expert pool is smaller than one call's experts")
 
     def _read_all(self, layer: int, need: list[tuple[int, int]]) -> None:
@@ -202,15 +372,21 @@ class Streamer:
     def _read(self, layer: int, proj: str, part: str, expert: int, slot: int) -> None:
         src, offset = self.source(self.found, layer, proj, part, expert)
         self.hs.pread_into(getattr(self.pool[proj], part), slot * src.nbytes, self.fds[src.path], offset, src.nbytes)
-        self.bytes_read += src.nbytes
+        with self._bytes_lock:
+            self.bytes_read += src.nbytes
 
     def close(self) -> None:
         self._jobs.put(None)
         self._thread.join(timeout=5)
+        for entry in self.pending.values():
+            for read in entry.reads:
+                read.cancel()
+        if self._seeders is not None:
+            self._seeders.shutdown(wait=True)
         self._readers.shutdown(wait=True)
         for fd in self.fds.values():
             os.close(fd)
         self.fds.clear()
 
 
-__all__ = ["PARTS", "Slots", "Source", "Streamer", "expert_nbytes", "sources"]
+__all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "sources"]
