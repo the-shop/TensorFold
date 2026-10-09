@@ -171,6 +171,27 @@ class FlashNext:
         self._streams = self.fused.last_streams if fused else self.model.__dict__["last_streams"]
         return out
 
+    def prefill(self, inputs: Any, cache: list[Any]) -> mx.array:
+        """A prompt chunk (FamilyPrefill's feed): ``hidden``, then for a chunk the fused kernels took, the cache's own
+        recurrent states. Those kernels keep every row's state (rounded up to eight rows) for rolling drafts back and
+        leave 1-row views of those buffers in the cache, which pin the whole buffers past what a cache's size counts;
+        a prompt never rolls back, so its states are copied out and the rows dropped."""
+
+        out = self.hidden(inputs, cache)
+        tokens = np.asarray(inputs)
+        if tokens.ndim == 1:
+            tokens = tokens[None]
+        if self.fused is not None and tokens.shape[0] == 1 and tokens.shape[1] <= self.fused_rows:
+            for c in cache[: self.layer_count]:
+                if getattr(c, "ssm", None) is not None:
+                    # x * 1 is exact and gets a fresh buffer: MLX donates an input's buffer only when it is at most
+                    # 16 KiB past the output, and a row view's base is the whole held buffer
+                    c.ssm = c.ssm * 1
+                    if c.conv is not None:
+                        c.conv = c.conv * 1
+            self.fused.row_states.clear()
+        return out
+
     def head(self, hidden: mx.array) -> mx.array:
         from tensorfold.families.qwen4_exp.decode import project
 

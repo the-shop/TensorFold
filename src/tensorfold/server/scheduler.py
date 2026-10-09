@@ -437,6 +437,11 @@ class Scheduler(PromptFill):
             job.cancellation.check()
             memory = self.prompt_memory
             if memory is not None:
+                # with no stream live, the last round's rollback rows (a failed prefill's too) are garbage that no
+                # reclaim frees: left in place, every later admission counts them as resident
+                release = getattr(self.engine, "release_rounds", None)
+                if release is not None:
+                    release()
                 memory.begin(len(job.prompt_ids), int(job.max_tokens), admit=self.checkpoints is None or job.vision is not None)
                 if job.vision is not None:
                     memory.require_workspace(self.engine.model.vision.estimate_workspace_bytes(job.vision))
