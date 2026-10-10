@@ -46,7 +46,7 @@ def read_header(path: Path) -> tuple[int, dict]:
 
 
 def map_name(name: str) -> str | None:
-    if name.startswith("model.visual") or name.startswith("model.language_model.visual"):
+    if name.startswith(("model.visual", "model.language_model.visual")):
         return None
     if name.startswith("model.language_model."):
         return "language_model.model." + name[len("model.language_model."):]
@@ -59,8 +59,6 @@ def map_name(name: str) -> str | None:
 
 def quantized_modules(config: dict) -> set[str]:
     """Checkpoint module paths TensorFold quantizes (from its own module tree), routers excluded."""
-
-    import mlx.nn as nn
 
     from tensorfold.families.qwen4_exp.model import Qwen4Exp
     from tensorfold.families.qwen4_exp.model_layers import Config

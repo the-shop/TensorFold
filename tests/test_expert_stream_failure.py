@@ -8,9 +8,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from tensorfold.engine.family_common import check_expert_stream  # noqa: E402
-from tensorfold.engine.lane_engine import LaneStream  # noqa: E402
-from tests.lane_fakes import FakeEngine, FakeFamily  # noqa: E402
+from tensorfold.engine.family_common import check_expert_stream
+from tensorfold.engine.lane_engine import LaneStream
+from tests.lane_fakes import FakeEngine, FakeFamily
 
 
 class FailingPool:

@@ -257,11 +257,11 @@ def test_headers_the_reader_cannot_use_are_refused(tmp_path, part, fields, match
         SSDTable(_edited(files, 0, part, **fields))
 
 
-def test_shards_that_are_not_4_bit_group_32_rows_or_differ_in_width_are_refused(tmp_path):
+def test_shards_that_are_not_4_or_8_bit_group_32_rows_or_differ_in_width_are_refused(tmp_path):
     w, s, b = _shards((7,))[0]
     for name, tensors in (("words", (w[:, :19], s, b)), ("rows", (w, s[:6], b[:6])), ("biases", (w, s, b[:, :4]))):
         header = _write(tmp_path / f"{name}.safetensors", dict(zip(PARTS, tensors)))
-        with pytest.raises(ValueError, match="not 4-bit rows"):
+        with pytest.raises(ValueError, match="not 4- or 8-bit rows"):
             SSDTable([(tmp_path / f"{name}.safetensors", *(header[p] for p in PARTS))])
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()

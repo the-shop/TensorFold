@@ -13,8 +13,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from tensorfold.streaming import pool  # noqa: E402
-from test_pool import EXPERTS, LAYERS, TOPK, FakeSync, checkpoint, slot_bytes  # noqa: E402
+from test_pool import EXPERTS, LAYERS, TOPK, FakeSync, checkpoint, slot_bytes
+
+from tensorfold.streaming import pool
 
 
 def make(tmp_path, slots, workers=8, **flags):

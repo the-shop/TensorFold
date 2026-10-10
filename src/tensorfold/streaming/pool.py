@@ -342,7 +342,7 @@ class Streamer:
                         self.prompt_counts[layer] += flags
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
-            except BaseException as error:        # the GPU still gets its release; the next call then raises
+            except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
                 self.error = error
             self.channel.signal(ready)
             for step, *args in after:             # speculative reads start once the GPU runs on
@@ -350,7 +350,7 @@ class Streamer:
                     break
                 try:
                     step(*args)
-                except BaseException as error:
+                except BaseException as error:  # noqa: BLE001  # recorded; the next call raises it
                     self.error = error
 
     def _check(self, layer: int, routed: list[int]) -> None:
@@ -376,7 +376,7 @@ class Streamer:
         waits: list[Future] = []
         stale = []
         for key, entry in list(self.pending.items()):
-            if key in wanted and entry.seed and any([read.cancel() for read in entry.reads]):
+            if key in wanted and entry.seed and any([read.cancel() for read in entry.reads]):  # noqa: C419  # cancel all
                 stale.append((key, entry))        # dropped below, then a demand miss on the readers
             elif key in wanted:
                 waits += entry.reads

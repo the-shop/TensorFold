@@ -15,8 +15,8 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from tensorfold.streaming import pack as packs  # noqa: E402
-from tensorfold.streaming import pool  # noqa: E402
+from tensorfold.streaming import pack as packs
+from tensorfold.streaming import pool
 
 LAYERS, EXPERTS, TOPK, BOX_ROWS = 3, 8, 2, 4
 # odd part sizes, unlike one another and far from the 16 KiB record alignment

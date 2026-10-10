@@ -8,7 +8,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-from tensorfold.kernels.qwen.flash_next.v1 import embed, experts, stream_experts  # noqa: E402
+from tensorfold.kernels.qwen.flash_next.v1 import embed, experts, stream_experts
 
 
 def _q(shape, key, bits=8, group=64):
@@ -81,7 +81,7 @@ def test_expert_kernels_q8(rows):
 
 @pytest.mark.parametrize("bits,group", [(4, 32), (8, 64)])
 def test_embed_rows(bits, group):
-    table, q = _q((100, 256), mx.random.key(3), bits, group)
+    _, q = _q((100, 256), mx.random.key(3), bits, group)
     emb = _Lin(q, bits, group)
     ids = mx.array([5, 99, 0], dtype=mx.uint32)
     out = embed.embed_rows(ids, emb, tile=2)
