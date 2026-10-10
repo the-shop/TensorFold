@@ -1,6 +1,7 @@
 # TensorFold
 
-> Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at 0.3.6.3 (MIT). Adds Qwen3.8 Flash Next MLX
+> Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at release [v0.3.6.3](https://github.com/ashhart/TensorFold/tree/v0.3.6.3)
+> (commit 1911880, 29 Sep 2026, MIT). Adds Qwen3.8 Flash Next MLX
 > 8-bit checkpoints on M5 with SSD expert streaming and a native expert-pool server; see
 > [docs/recipes/qwen3.8-flash-next.md](docs/recipes/qwen3.8-flash-next.md). Upstream's current engine is Zig
 > (Apache-2.0); this fork is the Python engine.

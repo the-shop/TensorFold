@@ -6,7 +6,8 @@ GitHub has the full notes and the measurements behind them.
 ## v0.1.0 (the-shop fork)
 
 First release of [the-shop/TensorFold](https://github.com/the-shop/TensorFold), a fork of
-[ashhart/TensorFold](https://github.com/ashhart/TensorFold) at 0.3.6.3 (MIT). The fork versions itself with git
+[ashhart/TensorFold](https://github.com/ashhart/TensorFold) at release [v0.3.6.3](https://github.com/ashhart/TensorFold/tree/v0.3.6.3) (commit 1911880,
+29 Sep 2026, MIT). The fork versions itself with git
 tags from here on; the package still reports 0.3.6.3, the upstream base. Install with
 `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"`.
 
