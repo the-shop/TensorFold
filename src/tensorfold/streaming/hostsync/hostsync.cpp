@@ -235,11 +235,17 @@ class PoolServer {
     std::memcpy(fds_.data(), fds.c_str(), fds.size());
     std::memcpy(offsets_.data(), offsets.c_str(), offsets.size());
     for (size_t p = 0; p < parts; ++p) {
-      if (!dsts_[p].is_available() || dsts_[p].nbytes() < static_cast<size_t>(slots) * part_nbytes_[p]) {
-        throw std::invalid_argument("PoolServer: a pool array is not evaluated or smaller than slots x part bytes");
+      const auto& d = dsts_[p];
+      if (!d.is_available() || d.ndim() < 1 || d.shape(0) < slots || d.shape(0) == 0 ||
+          d.nbytes() / d.shape(0) != part_nbytes_[p] || d.nbytes() % d.shape(0) != 0) {
+        throw std::invalid_argument("PoolServer: a pool array is not evaluated, has fewer rows than slots, or its rows "
+                                    "are not one part of an expert");
       }
       dst_ptrs_.push_back(dsts_[p].data<uint8_t>());
       expert_nbytes_ += part_nbytes_[p];
+    }
+    if (box_.dtype() != mx::uint32 || slot_of_.dtype() != mx::int32) {
+      throw std::invalid_argument("PoolServer: the box must be uint32 and the slot table int32");
     }
     if (!box_.is_available() || !slot_of_.is_available() ||
         slot_of_.nbytes() < static_cast<size_t>(layers) * experts * sizeof(int32_t) ||
@@ -253,7 +259,14 @@ class PoolServer {
     thread_ = std::thread([this] { serve(); });
   }
 
-  ~PoolServer() { close(); }
+  ~PoolServer() {
+    if (PyGILState_Check()) {             // garbage collection: other Python threads run while the threads stop
+      nb::gil_scoped_release release;
+      close();
+    } else {
+      close();
+    }
+  }
 
   // Reads each missing expert with one pread of the pack's record, then copies its parts into their slots.
   void set_pack(int fd, nb::bytes offsets, size_t read_nbytes, std::vector<size_t> part_offsets, size_t alignment) {
@@ -317,21 +330,22 @@ class PoolServer {
   bool packed() const { return pack_fd_ >= 0; }
   int workers() const { return readers_ ? readers_->size() : 0; }
 
-  // Serves the jobs already queued (a GPU signal pending past 5 s is abandoned), then stops every thread.
+  // Serves every queued job whose GPU signal arrives within kCloseGraceMs, releases (without loading) the ones whose
+  // signal has not, then stops every thread. A concurrent second close() returns once the first has joined.
   void close() {
+    std::lock_guard<std::mutex> once(close_mu_);
+    if (stopped_) return;
     {
       std::lock_guard<std::mutex> lk(jobs_mu_);
-      if (closed_) return;
       closed_ = true;
+      close_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCloseGraceMs);
+      closing_ = true;
       jobs_.push_back(Job{0, 0, 0, 0, 0, true});
     }
     jobs_cv_.notify_all();
-    {
-      std::unique_lock<std::mutex> lk(jobs_mu_);
-      if (!jobs_cv_.wait_for(lk, std::chrono::seconds(5), [&] { return exited_; })) abort_ = true;
-    }
     if (thread_.joinable()) thread_.join();
     readers_.reset();
+    stopped_ = true;
     for (auto& buf : staging_) {
       std::free(buf);
       buf = nullptr;
@@ -356,7 +370,10 @@ class PoolServer {
       }
       if (job.stop) break;
       try {
-        wait_signal(job);
+        if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing
+          channel_->signal(job.ready);
+          continue;
+        }
         std::lock_guard<std::mutex> lk(state_mu_);
         if (job.kind == 0) {
           size_t n = static_cast<size_t>(job.rows) * top_k_;
@@ -385,17 +402,21 @@ class PoolServer {
       }
       channel_->signal(job.ready);   // the GPU always gets its release; the next Python call raises
     }
-    std::lock_guard<std::mutex> lk(jobs_mu_);
-    exited_ = true;
-    jobs_cv_.notify_all();
   }
 
-  void wait_signal(const Job& job) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+  // True once the GPU signalled the job; false when closing and its signal did not come within the close grace.
+  bool wait_signal(const Job& job) {
+    using clock = std::chrono::steady_clock;
+    auto deadline = clock::now() + std::chrono::milliseconds(timeout_ms_);
     while (true) {
-      if (channel_->event->waitUntilSignaledValue(job.signal, 100)) return;
-      if (abort_.load()) throw PoolError("RuntimeError", "expert streaming closed while a call waited for the GPU");
-      if (std::chrono::steady_clock::now() >= deadline) {
+      uint64_t slice = 100;
+      if (closing_.load()) {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(close_deadline_ - clock::now()).count();
+        if (left <= 0) return channel_->event->signaledValue() >= job.signal;
+        slice = std::min<uint64_t>(slice, static_cast<uint64_t>(left));
+      }
+      if (channel_->event->waitUntilSignaledValue(job.signal, slice)) return true;
+      if (clock::now() >= deadline) {
         throw PoolError("TimeoutError", "no routing from the GPU for layer " + std::to_string(job.layer));
       }
     }
@@ -441,13 +462,15 @@ class PoolServer {
   // Python's Streamer._load: every id resident in the LRU for ``layer``, then its slot written into the table.
   void load(int layer, const std::vector<int64_t>& ids) {
     check_layer(layer);
+    for (int64_t e : ids) {                 // sorted: the first bad id is the one Python names; nothing changed yet
+      if (e < 0 || e >= experts_) {
+        throw PoolError("ValueError", "routed expert " + std::to_string(e) + " is outside the model");
+      }
+    }
     std::unordered_set<int64_t> keep;
     for (int64_t e : ids) keep.insert(key(layer, e));
     std::vector<std::pair<int, int>> need, table;
     for (int64_t e : ids) {
-      if (e < 0 || e >= experts_) {
-        throw PoolError("ValueError", "routed expert " + std::to_string(e) + " is outside the model");
-      }
       auto slot = lru_pop(key(layer, e));
       if (!slot) {
         if (!free_.empty()) {
@@ -546,8 +569,12 @@ class PoolServer {
   std::mutex jobs_mu_;
   std::condition_variable jobs_cv_;
   std::deque<Job> jobs_;
-  bool closed_ = false, exited_ = false;
-  std::atomic<bool> abort_{false};
+  static constexpr int kCloseGraceMs = 1000;
+  bool closed_ = false;
+  std::mutex close_mu_;
+  bool stopped_ = false;
+  std::atomic<bool> closing_{false};
+  std::chrono::steady_clock::time_point close_deadline_{};
   std::thread thread_;
 };
 

@@ -111,8 +111,9 @@ class Streamer:
     """Slots [0, E): one layer's window (expert e in slot e) for prompt chunks; [E, S): an LRU for decode rows.
 
     With decode prefetch and prompt seeding off and an extension that has one, the extension's PoolServer serves
-    the calls (no Python per call; it reads a valid expert pack with one pread an expert); otherwise the Python
-    thread below does. Both keep the same LRU, slots and counters for the same calls."""
+    the calls (no Python per call); otherwise the Python thread below does. Both keep the same LRU, slots and
+    counters for the same calls. ``pack`` (opt-in, native only): None follows TENSORFOLD_EXPERT_PACK, False is
+    off, True is MODEL_DIR/experts.pack, a path is that pack; a pack in use must validate or the pool refuses it."""
 
     def __init__(self, found: dict, shapes: dict, *, layers: int, experts: int, top_k: int, slots: int,
                  box_rows: int, hostsync: Any, workers: int | None = None, decode_prefetch: int = 0,
@@ -193,33 +194,26 @@ class Streamer:
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
                                     workers, TIMEOUT_MS)
-        if pack is False:
-            return server
-        if pack is None or pack is True:
-            model_dir = Path(os.path.commonpath([str(Path(s.path).parent) for s in self.found.values()]))
-            path, asked = packs.choose(model_dir)
-            asked = asked or pack is True
-        else:
-            path, asked = Path(pack), True
+        path = packs.choose(self._model_dir(), pack=pack)
         if path is None:
-            if asked:
-                raise packs.PackError("an expert pack was asked for, but there is none beside the checkpoint")
             return server
-        try:
-            lay = packs.validate(path, self.found, self.experts)
-        except packs.PackError as error:
-            if asked:
-                raise
-            print(f"[pool] ignoring the expert pack: {error}", file=sys.stderr, flush=True)
-            return server
+        lay = packs.validate(path, self.found, self.experts)
+        if lay.order != order or lay.part_nbytes != sizes:
+            raise packs.PackError(f"expert pack {path}: its part order or sizes differ from the pool's")
         records = np.full((self.layers, self.experts), -1, dtype=np.int64)
         for li, layer in enumerate(lay.layers):
             records[layer] = (li * self.experts + np.arange(self.experts, dtype=np.int64)) * lay.stride
         fd = _uncached(path)
         self.fds[path] = fd
-        server.set_pack(fd, records.tobytes(), lay.stride, lay.part_offsets, lay.alignment)
+        try:
+            server.set_pack(fd, records.tobytes(), lay.stride, lay.part_offsets, lay.alignment)
+        except ValueError as error:
+            raise packs.PackError(f"expert pack {path}: {error}") from None
         self.pack_path = path
         return server
+
+    def _model_dir(self) -> Path:
+        return Path(os.path.commonpath([str(Path(s.path).parent) for s in self.found.values()]))
 
     @property
     def native(self) -> bool:
@@ -318,6 +312,7 @@ class Streamer:
                 if kind == "rows":
                     ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
+                    self._check(layer, routed)
                     routed_reads = self._resolve(layer, routed)
                     self._load(layer, routed)
                     for read in routed_reads:              # a guess this call routed to: its bytes before release
@@ -331,6 +326,7 @@ class Streamer:
                         self.prompt_counts[:] = 0
                         self._prompted = False
                 else:
+                    self._check(layer, [])
                     self._resolve(layer, [])
                     flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
                     if self.prompt_counts is not None:
@@ -347,6 +343,15 @@ class Streamer:
                     step(*args)
                 except BaseException as error:
                     self.error = error
+
+    def _check(self, layer: int, routed: list[int]) -> None:
+        """A call's layer and (sorted) routed ids inside the model, before anything changes (the native check too)."""
+
+        if not 0 <= layer < self.layers:
+            raise ValueError(f"layer {layer} is outside the model")
+        bad = [e for e in routed if not 0 <= e < self.experts]
+        if bad:
+            raise ValueError(f"routed expert {bad[0]} is outside the model")
 
     def _resolve(self, layer: int, routed: list[int]) -> list[Future]:
         """Before a call: the reads of speculative loads it routed to (to wait for), stale guesses cancelled.

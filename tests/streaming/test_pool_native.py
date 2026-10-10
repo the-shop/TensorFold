@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +22,12 @@ LAYERS, EXPERTS, TOPK, BOX_ROWS = 3, 8, 2, 4
 # odd part sizes, unlike one another and far from the 16 KiB record alignment
 SPECS = {"weight": ([5, 12], "U32", 4), "scales": ([5, 3], "BF16", 2), "biases": ([5, 3], "F16", 2)}
 PROJS = ("gate", "up", "down")
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for name in ("TENSORFOLD_EXPERT_PACK", "TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(scope="module")
@@ -187,7 +196,7 @@ def test_preads_are_nine_an_expert_unpacked_and_one_packed(hs, tmp_path):
     found, _ = pool.sources(tmp_path, names(False))
     packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
     plain = make(hs, tmp_path, 2 * EXPERTS + 2, native=True, pack=False)
-    packed = make(hs, tmp_path, 2 * EXPERTS + 2, native=True, pack=None)
+    packed = make(hs, tmp_path, 2 * EXPERTS + 2, native=True, pack=True)
     for s in (plain, packed):
         call(hs, s, "rows", 0, [1, 2, 3, 3])
         call(hs, s, "window", 1, [4, 5])
@@ -281,6 +290,89 @@ def test_no_signal_from_the_gpu_times_out_and_still_releases(hs, tmp_path, monke
         s.close()
 
 
+@pytest.mark.parametrize("layer", [LAYERS, -1, 1000])
+@pytest.mark.parametrize("kind", ["rows", "window"])
+def test_a_layer_outside_the_model_changes_nothing_in_both(hs, tmp_path, layer, kind):
+    write_checkpoint(tmp_path)
+    runs = [make(hs, tmp_path, 2 * EXPERTS + 2, native=n) for n in (False, True)]
+    for s in runs:
+        call(hs, s, "rows", 0, [1, 2, 3, 4])
+        call(hs, s, kind, layer, [1, 6], ok=False)
+        assert isinstance(s.error, ValueError) and "layer" in str(s.error)
+    a, b = (snapshot(hs, s) for s in runs)
+    for key in a:
+        assert a[key] == b[key], key
+    assert a["counters"][:2] == (0, 4) and len(a["lru"]) == 4
+    for s in runs:
+        s.close()
+
+
+def test_the_server_refuses_arrays_of_the_wrong_kind(hs, tmp_path):
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS, native=True)
+    order = [(proj, part) for proj in s.pool for part in pool.PARTS]
+    dsts = [getattr(s.pool[proj], part) for proj, part in order]
+    sizes = [d.nbytes // d.shape[0] for d in dsts]
+    table = (np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int32).tobytes(),
+             np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int64).tobytes())
+    args = {"layers": LAYERS, "experts": EXPERTS, "top_k": TOPK, "slots": 2 * EXPERTS, "workers": 1, "timeout_ms": 100}
+    bad_box = mx.zeros(s.box.shape, dtype=mx.int32)
+    bad_table = mx.zeros(s.slot_of.shape, dtype=mx.uint32)
+    mx.eval(bad_box, bad_table)
+    for box, slot_of, part_sizes in ((bad_box, s.slot_of, sizes), (s.box, bad_table, sizes),
+                                     (s.box, s.slot_of, [n + 2 for n in sizes])):
+        with pytest.raises(ValueError):
+            hs.PoolServer(s.channel, box, slot_of, dsts, part_sizes, *table, **args)
+    s.close()
+
+
+# -- close -----------------------------------------------------------------------------------------------------
+
+def test_close_releases_queued_calls_the_gpu_never_signalled(hs, tmp_path):
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
+    readies = [s.marks("rows", 0, 1)[1] for _ in range(20)]             # a graph built and never evaluated
+    start = time.monotonic()
+    s.close()
+    assert time.monotonic() - start < 3
+    assert s.channel.value() >= readies[-1] and s.misses == 0 and s.error is None
+
+
+def test_close_still_loads_a_call_whose_signal_arrived(hs, tmp_path):
+    truth = write_checkpoint(tmp_path, seed=8)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
+    hs.write_into(s.box, 0, struct.pack("<4I", 2, 5, 5, 2))
+    signal, _ = s.marks("rows", 1, 2)
+    _, last = s.marks("rows", 2, 1)                                      # queued behind it, never signalled
+    s.channel.signal(signal)
+    s.close()
+    assert s.channel.value() >= last and s.error is None
+    assert (s.hits, s.misses) == (0, 2)
+    check_resident(hs, s, truth)
+
+
+def test_a_second_close_waits_for_the_first(hs, tmp_path):
+    write_checkpoint(tmp_path)
+    for _ in range(5):
+        s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
+        _, ready = s.marks("rows", 0, 1)                                 # keeps the first close busy ~1 s
+        done: list[float] = []
+
+        def close(server=s._server, done=done):
+            server.close()
+            done.append(time.monotonic())
+
+        closers = [threading.Thread(target=close) for _ in range(2)]
+        for c in closers:
+            c.start()
+        for c in closers:
+            c.join(10)
+            assert not c.is_alive()
+        assert len(done) == 2 and s.channel.value() >= ready
+        s.close()                                                        # the fds after both: nothing left reading
+        assert not s.fds
+
+
 # -- the pack --------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("per_expert", [False, True])
@@ -311,7 +403,7 @@ def test_the_tool_builds_and_checks_a_pack(tmp_path, capsys):
     assert "valid" in capsys.readouterr().out
 
 
-def test_a_stale_pack_is_refused(hs, tmp_path, monkeypatch, capsys):
+def test_a_stale_pack_is_refused(hs, tmp_path, monkeypatch):
     write_checkpoint(tmp_path, seed=6)
     found, _ = pool.sources(tmp_path, names(False))
     packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
@@ -319,14 +411,66 @@ def test_a_stale_pack_is_refused(hs, tmp_path, monkeypatch, capsys):
     found, _ = pool.sources(tmp_path, names(True))
     with pytest.raises(packs.PackError, match="stale|differs"):
         packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
-    s = make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)   # found beside it: ignored
-    assert s.pack_path is None and not s.stats()["packed"] and "ignoring the expert pack" in capsys.readouterr().err
+    s = make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)   # opt-in: not used unasked
+    assert s.pack_path is None and not s.stats()["packed"]
     s.close()
-    with pytest.raises(packs.PackError):                                           # asked for: refused
-        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=tmp_path / packs.PACK_NAME, per_expert=True)
-    monkeypatch.setenv(packs.ENV, str(tmp_path / packs.PACK_NAME))
+    for asked in (True, tmp_path / packs.PACK_NAME):
+        with pytest.raises(packs.PackError):
+            make(hs, tmp_path, 2 * EXPERTS, native=True, pack=asked, per_expert=True)
+    for value in ("1", str(tmp_path / packs.PACK_NAME)):
+        monkeypatch.setenv(packs.ENV, value)
+        with pytest.raises(packs.PackError):
+            make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)
+
+
+def test_same_layout_new_bytes_is_refused(hs, tmp_path):
+    """The checkpoint rewritten with other weights in the same tensor table (a re-download, a new fine-tune)."""
+
+    write_checkpoint(tmp_path, seed=41)
+    found, _ = pool.sources(tmp_path, names(False))
+    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
+    truth = write_checkpoint(tmp_path, seed=42)
+    found, _ = pool.sources(tmp_path, names(False))
     with pytest.raises(packs.PackError):
-        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)
+        packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
+    with pytest.raises(packs.PackError):
+        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=True)
+    s = make(hs, tmp_path, 2 * EXPERTS, native=True)                 # unpacked serves the new bytes
+    call(hs, s, "rows", 0, [1, 2, 3, 4])
+    check_resident(hs, s, truth)
+    s.close()
+
+
+def test_new_bytes_behind_the_same_size_inode_and_mtime_are_caught_by_the_sample(tmp_path):
+    write_checkpoint(tmp_path, seed=43)
+    found, _ = pool.sources(tmp_path, names(False))
+    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
+    shard = min(tmp_path.glob("model-*.safetensors"))
+    before = shard.stat()
+    src, offset = pool.Streamer.source(found, 0, "gate", "weight", 0)      # a sampled part of expert 0
+    assert Path(src.path) == shard
+    with open(shard, "r+b") as f:                                          # in place: same inode and size
+        f.seek(offset)
+        f.write(bytes(255 - b for b in shard.read_bytes()[offset:offset + 16]))
+    os.utime(shard, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = shard.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+    assert packs.source_hash(found) == json.loads(packs.index_path(tmp_path / packs.PACK_NAME).read_text())[
+        "source_hash"]
+    with pytest.raises(packs.PackError, match="differ"):
+        packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
+
+
+def test_a_corrupt_pack_record_is_refused(tmp_path):
+    write_checkpoint(tmp_path, seed=44)
+    found, _ = pool.sources(tmp_path, names(False))
+    out = packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
+    lay = packs.validate(out, found, EXPERTS)
+    with open(out, "r+b") as f:
+        f.seek(lay.record(2, EXPERTS - 1) + lay.part_offsets[4])
+        f.write(b"\xff" * 8)
+    with pytest.raises(packs.PackError, match="corrupt"):
+        packs.validate(out, found, EXPERTS)
 
 
 def test_a_truncated_pack_is_refused(tmp_path):
@@ -339,14 +483,42 @@ def test_a_truncated_pack_is_refused(tmp_path):
         packs.validate(out, found, EXPERTS)
 
 
-def test_the_environment_turns_packs_off_or_points_at_one(tmp_path):
+@pytest.mark.parametrize("alignment", [1000, 2048, 3 * 4096])
+def test_an_odd_alignment_is_refused(hs, tmp_path, alignment, capsys):
     write_checkpoint(tmp_path)
-    assert packs.choose(tmp_path, {}) == (None, False)
+    found, _ = pool.sources(tmp_path, names(False))
+    with pytest.raises(packs.PackError, match="power of two"):
+        packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME, alignment=alignment)
+    out = packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
+    index = json.loads(packs.index_path(out).read_text())
+    index["alignment"] = alignment                                        # an index edited or from another build
+    packs.index_path(out).write_text(json.dumps(index))
+    with pytest.raises(packs.PackError, match="power of two"):
+        packs.validate(out, found, EXPERTS)
+    with pytest.raises(packs.PackError):
+        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=True)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+    try:
+        import pack_experts
+    finally:
+        sys.path.pop(0)
+    with pytest.raises(SystemExit):
+        pack_experts.main([str(tmp_path), "--alignment", str(alignment)])
+    assert "power of two" in capsys.readouterr().err
+
+
+def test_packs_are_opt_in(tmp_path):
+    write_checkpoint(tmp_path)
     found, _ = pool.sources(tmp_path, names(False))
     packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    assert packs.choose(tmp_path, {}) == (tmp_path / packs.PACK_NAME, False)
-    assert packs.choose(tmp_path, {packs.ENV: "0"}) == (None, False)
-    assert packs.choose(tmp_path, {packs.ENV: "/x/y.pack"}) == (Path("/x/y.pack"), True)
+    assert packs.choose(tmp_path, {}) is None                              # a pack beside the checkpoint: unused
+    for off in ("0", "off", ""):
+        assert packs.choose(tmp_path, {packs.ENV: off}) is None
+    for on in ("1", "true"):
+        assert packs.choose(tmp_path, {packs.ENV: on}) == tmp_path / packs.PACK_NAME
+    assert packs.choose(tmp_path, {packs.ENV: "/x/y.pack"}) == Path("/x/y.pack")
+    assert packs.choose(tmp_path, {packs.ENV: "1"}, pack=False) is None
+    assert packs.choose(tmp_path, {}, pack=True) == tmp_path / packs.PACK_NAME
 
 
 @pytest.mark.parametrize("per_expert", [False, True])
@@ -356,7 +528,7 @@ def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, p
     packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
     py = make(hs, tmp_path, 2 * EXPERTS + 1, native=False, per_expert=per_expert)
     plain = make(hs, tmp_path, 2 * EXPERTS + 1, native=True, pack=False, per_expert=per_expert)
-    packed = make(hs, tmp_path, 2 * EXPERTS + 1, native=True, pack=None, per_expert=per_expert, workers=3)
+    packed = make(hs, tmp_path, 2 * EXPERTS + 1, native=True, pack=True, per_expert=per_expert, workers=3)
     assert packed.stats()["packed"] == 1 and packed.pack_path == tmp_path / packs.PACK_NAME
     for kind, layer, ids in SEQUENCE + random_sequence(9, 120):
         for s in (py, plain, packed):

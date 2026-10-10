@@ -148,6 +148,7 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, nativ
 
             names, experts = pack.model_experts(folder)
             pack.build(sources(folder, names)[0], experts, folder / pack.PACK_NAME)
+            monkeypatch.setenv(pack.ENV, "1")                            # packs are opt-in
         streamer = stream.attach(streamed, folder, (2 * 8 + 4) * per / 2**30)     # a layer's window, 12 LRU slots
         prompt = mx.array(np.random.default_rng(5).integers(0, glm5_fakes.VOCAB, 40), dtype=mx.uint32)
         caches = [resident.make_cache(), streamed.make_cache()]

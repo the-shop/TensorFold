@@ -2,9 +2,12 @@
 
     python tools/pack_experts.py MODEL_DIR [--out PATH] [--buffer-mb 256]
 
-Writes MODEL_DIR/experts.pack and experts.pack.json (the index, written last). The pool reads a missing expert
-with one pread of its record when the pack validates against the checkpoint (TENSORFOLD_EXPERT_PACK=path picks
-another location, =0 turns packs off). Needs as much free disk as the experts take."""
+Writes MODEL_DIR/experts.pack and experts.pack.json (the index, written last). Packs are opt-in: the native pool
+reads a missing expert with one pread of its record only with TENSORFOLD_EXPERT_PACK=1 (MODEL_DIR/experts.pack) or
+=PATH, and refuses a pack that does not validate against the checkpoint (layout, file size/inode/mtime, sampled
+bytes). Rebuild after any change to the checkpoint files, including a copy. Needs as much free disk as the experts
+take. On decode-sized calls the pack measured no I/O gain over the unpacked reads; tools/bench_pool_io.py --cold
+compares them on a machine."""
 
 from __future__ import annotations
 
@@ -17,12 +20,20 @@ from tensorfold.streaming import pack
 from tensorfold.streaming.pool import sources
 
 
+def _alignment(text: str) -> int:
+    try:
+        return pack.check_alignment(int(text))
+    except (ValueError, pack.PackError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--out", type=Path, default=None, help="the pack file (default MODEL_DIR/experts.pack)")
     ap.add_argument("--buffer-mb", type=int, default=256, help="read buffer bound (default 256 MiB)")
-    ap.add_argument("--alignment", type=int, default=pack.ALIGNMENT, help="record alignment in bytes (16 KiB)")
+    ap.add_argument("--alignment", type=_alignment, default=pack.ALIGNMENT,
+                    help="record alignment in bytes, a power of two >= 4096 (default 16 KiB)")
     ap.add_argument("--check", action="store_true", help="only validate an existing pack against the checkpoint")
     args = ap.parse_args(argv)
     model_dir = args.model_dir.expanduser().resolve()

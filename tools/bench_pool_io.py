@@ -6,8 +6,10 @@ Each run reads ``--experts`` random (layer, expert) pairs (a fresh sample per ru
 into a small pool, ``--per-call`` experts a call, as decode misses arrive: (a) python: the Streamer's reads (a
 ThreadPoolExecutor mapping hostsync.pread_into over every part of every miss; its LRU and peek costs not counted),
 (b) native: one PoolServer call per batch, signalled and awaited like the GPU does (LRU, reads, slot table),
-(c) packed: the same with the expert pack (one pread an expert). Reads are uncached (F_NOCACHE). Pool memory is
-about 2 x per-call experts plus a record buffer a thread for packed runs."""
+(c) packed: the same with the expert pack (one pread an expert), when MODEL_DIR/experts.pack (or --pack) exists;
+the bench reads it directly, whatever TENSORFOLD_EXPERT_PACK says. Reads are uncached (F_NOCACHE), but pages
+already in the page cache are still served from it: --cold samples only experts with no resident bytes. Pool
+memory is about 2 x per-call experts plus a record buffer a thread for packed runs."""
 
 from __future__ import annotations
 
@@ -49,10 +51,50 @@ class Bench:
             self.lay = packs.validate(pack, self.found, self.experts)
             self.pack_fd = _uncached(pack)
 
-    def sample(self, n: int, seed: int) -> list[tuple[int, int]]:
+    def resident(self) -> None:
+        """Map every source page's page-cache residency (mincore), so ``--cold`` samples only experts none of whose
+        bytes are cached: F_NOCACHE skips caching new reads but still serves pages already resident."""
+
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_longlong]
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+        self.page = os.sysconf("SC_PAGE_SIZE")
+        self.cached = {}
+        for path in {s.path for s in self.found.values()}:
+            n = os.path.getsize(path)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                addr = libc.mmap(None, n, 1, 1, fd, 0)
+                vec = ctypes.create_string_buffer((n + self.page - 1) // self.page)
+                libc.mincore(addr, n, vec)
+                libc.munmap(addr, n)
+            finally:
+                os.close(fd)
+            self.cached[path] = np.frombuffer(vec.raw, dtype=np.uint8) & 1
+
+    def is_cold(self, layer: int, e: int) -> bool:
+        for proj, part in self.order:
+            src, offset = Streamer.source(self.found, layer, proj, part, e)
+            if self.cached[src.path][offset // self.page:(offset + src.nbytes - 1) // self.page + 1].any():
+                return False
+        return True
+
+    def sample(self, n: int, seed: int, cold: bool = False) -> list[tuple[int, int]]:
         rng = np.random.default_rng(seed)
-        picks = rng.choice(len(self.layers) * self.experts, size=n, replace=False)
-        return [(self.layers[int(p) // self.experts], int(p) % self.experts) for p in picks]
+        order = rng.permutation(len(self.layers) * self.experts)
+        picks = []
+        for p in order:
+            pick = (self.layers[int(p) // self.experts], int(p) % self.experts)
+            if not cold or self.is_cold(*pick):
+                picks.append(pick)
+                if len(picks) == n:
+                    return picks
+        raise RuntimeError(f"only {len(picks)} experts have no cached bytes; ask for fewer")
 
     def python(self, picks: list, threads: int) -> float:
         slots = list(range(self.per_call, 2 * self.per_call))
@@ -120,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pack", type=Path, default=None, help="the expert pack (default MODEL_DIR/experts.pack)")
     ap.add_argument("--modes", default="python,native,packed")
     ap.add_argument("--json", type=Path, default=None, help="also write the results here")
+    ap.add_argument("--cold", action="store_true", help="sample only experts with no page-cache-resident bytes")
     args = ap.parse_args(argv)
     from tensorfold.streaming.build import load
 
@@ -130,13 +173,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no expert pack at {pack}: skipping packed runs (build it with tools/pack_experts.py)", file=sys.stderr)
         modes.remove("packed")
     bench = Bench(model_dir, load(), args.per_call, pack if "packed" in modes else None)
+    if args.cold:
+        bench.resident()
     print(f"{bench.expert_bytes / 2**20:.2f} MiB an expert, {args.experts} experts a run "
           f"({args.experts * bench.expert_bytes / 2**30:.2f} GiB), {args.per_call} a call")
     results, seed = [], 0
     for threads in [int(t) for t in args.threads.split(",")]:
         for mode in modes:
             seed += 1
-            picks = bench.sample(args.experts, seed)
+            picks = bench.sample(args.experts, seed, args.cold)
             if mode == "python":
                 took, preads = bench.python(picks, threads), len(picks) * len(bench.order)
             else:

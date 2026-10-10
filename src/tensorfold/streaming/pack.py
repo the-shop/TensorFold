@@ -2,8 +2,11 @@
 
 The pack is ``experts.pack`` (records) beside ``experts.pack.json`` (the index). Record r = (layer position, expert)
 holds every projection's weight, scales and biases, in the pool's order (projections sorted, then PARTS), back to
-back, padded to ``alignment``. The index carries a hash of the source tensor table: a pack built from other bytes
-than the checkpoint's is refused."""
+back, padded to ``alignment``. The index carries a hash of the source tensor table and of each source file's size,
+inode and modification time, and a sample of the experts' bytes (the head and tail 4 KiB of every part of the first
+and last expert of each layer); validate re-reads that sample from the checkpoint and from the pack. A rewritten,
+copied or touched checkpoint is refused; a change that keeps every file's size, inode and mtime and avoids the
+sampled bytes is not detected. Packs are opt-in: TENSORFOLD_EXPERT_PACK=1 (MODEL_DIR/experts.pack) or =PATH."""
 
 from __future__ import annotations
 
@@ -16,11 +19,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = 1
+VERSION = 2
+SAMPLE = 4096                 # bytes from the head and from the tail of each sampled part
 ALIGNMENT = 16384
 PACK_NAME = "experts.pack"
 ENV = "TENSORFOLD_EXPERT_PACK"
-_OFF = {"0", "off", "no", "none", "false"}
+_OFF = {"", "0", "off", "no", "none", "false"}
+_ON = {"1", "on", "yes", "true"}
 
 
 class PackError(ValueError):
@@ -67,6 +72,7 @@ def layout(found: dict, experts: int, alignment: int = ALIGNMENT) -> Layout:
 
     from tensorfold.streaming.pool import PARTS
 
+    check_alignment(alignment)
     projs = sorted({key[1] for key in found})
     layers = sorted({key[0] for key in found})
     order = [(proj, part) for proj in projs for part in PARTS]
@@ -79,15 +85,57 @@ def layout(found: dict, experts: int, alignment: int = ALIGNMENT) -> Layout:
     return Layout(layers, experts, order, sizes, offsets, at, stride, alignment)
 
 
+def check_alignment(alignment: int) -> int:
+    """Record alignment: a power of two of at least 4 KiB (uncached reads into page-aligned buffers)."""
+
+    if not isinstance(alignment, int) or alignment < 4096 or alignment & (alignment - 1):
+        raise PackError(f"pack alignment {alignment!r}: a power of two of at least 4096 bytes is needed")
+    return alignment
+
+
 def source_hash(found: dict) -> str:
-    """A digest of where every expert tensor's bytes live (file name, offset, bytes) and each file's size."""
+    """A digest of where every expert tensor's bytes live (file name, offset, bytes) and each file's size, inode
+    and modification time (a rewritten, replaced or copied checkpoint changes it)."""
 
     digest = hashlib.sha256()
     for key in sorted(found, key=lambda k: tuple(str(x) for x in k)):
         src = found[key]
         digest.update(f"{key}|{Path(src.path).name}|{src.offset}|{src.nbytes}\n".encode())
     for path in sorted({Path(src.path) for src in found.values()}):
-        digest.update(f"{path.name}|{path.stat().st_size}\n".encode())
+        st = path.stat()
+        digest.update(f"{path.name}|{st.st_size}|{st.st_ino}|{st.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def _spans(nbytes: int) -> list[tuple[int, int]]:
+    """(offset, bytes) of a part's sampled head and tail."""
+
+    n = min(SAMPLE, nbytes)
+    return [(0, n), (nbytes - n, n)]
+
+
+def content_sample(found: dict, lay: Layout, read_pack: Callable[[int, int], bytes] | None = None) -> str:
+    """sha256 over the head and tail of every part of each layer's first and last expert, read from the checkpoint
+    (or, with ``read_pack(offset, nbytes)``, from the pack's records)."""
+
+    digest = hashlib.sha256()
+    fds: dict = {}
+    try:
+        for layer in lay.layers:
+            for e in sorted({0, lay.experts - 1}):
+                for (proj, part), nb, off in zip(lay.order, lay.part_nbytes, lay.part_offsets):
+                    for at, n in _spans(nb):
+                        if read_pack is not None:
+                            digest.update(read_pack(lay.record(layer, e) + off + at, n))
+                            continue
+                        src, base = _source(found, layer, proj, part, e)
+                        path = Path(src.path)
+                        if path not in fds:
+                            fds[path] = _uncached(path)
+                        digest.update(_pread(fds[path], n, base + at))
+    finally:
+        for fd in fds.values():
+            os.close(fd)
     return digest.hexdigest()
 
 
@@ -116,6 +164,7 @@ def build(found: dict, experts: int, out: Path, *, alignment: int = ALIGNMENT, b
 
     out = Path(out)
     lay = layout(found, experts, alignment)
+    sample = content_sample(found, lay)                  # before the copy: a checkpoint changing under it is refused
     free = shutil.disk_usage(out.parent).free
     if free < lay.total + (1 << 30):
         raise PackError(f"the pack needs {lay.total / 2**30:.1f} GiB on {out.parent}, {free / 2**30:.1f} GiB is free")
@@ -159,7 +208,8 @@ def build(found: dict, experts: int, out: Path, *, alignment: int = ALIGNMENT, b
     os.replace(partial, out)
     index = {"version": VERSION, "pack": out.name, "alignment": alignment, "layers": lay.layers, "experts": experts,
              "order": [list(o) for o in lay.order], "part_nbytes": lay.part_nbytes, "part_offsets": lay.part_offsets,
-             "payload": lay.payload, "stride": lay.stride, "pack_nbytes": lay.total, "source_hash": source_hash(found)}
+             "payload": lay.payload, "stride": lay.stride, "pack_nbytes": lay.total, "source_hash": source_hash(found),
+             "content_sample": sample}
     tmp = index_path(out).with_name(index_path(out).name + ".partial")
     tmp.write_text(json.dumps(index, indent=1))
     os.replace(tmp, index_path(out))                       # the index last: its presence means the pack is whole
@@ -179,7 +229,10 @@ def validate(pack: Path, found: dict, experts: int) -> Layout:
         raise PackError(f"expert pack {pack}: unreadable index ({error})") from None
     if index.get("version") != VERSION:
         raise PackError(f"expert pack {pack}: index version {index.get('version')}, expected {VERSION}")
-    lay = layout(found, experts, int(index.get("alignment", 0)) or ALIGNMENT)
+    alignment = index.get("alignment")
+    if not isinstance(alignment, int):
+        raise PackError(f"expert pack {pack}: the index has no alignment")
+    lay = layout(found, experts, alignment)
     want = {"layers": lay.layers, "experts": experts, "order": [list(o) for o in lay.order],
             "part_nbytes": lay.part_nbytes, "part_offsets": lay.part_offsets, "stride": lay.stride,
             "pack_nbytes": lay.total}
@@ -190,6 +243,15 @@ def validate(pack: Path, found: dict, experts: int) -> Layout:
         raise PackError(f"expert pack {pack}: built from other checkpoint files (stale, rebuild the pack)")
     if pack.stat().st_size != lay.total:
         raise PackError(f"expert pack {pack}: {pack.stat().st_size} bytes, the index says {lay.total}")
+    sample = index.get("content_sample")
+    if sample != content_sample(found, lay):
+        raise PackError(f"expert pack {pack}: the checkpoint's expert bytes differ from the pack's (stale, rebuild)")
+    fd = _uncached(pack)
+    try:
+        if sample != content_sample(found, lay, lambda at, n: _pread(fd, n, at)):
+            raise PackError(f"expert pack {pack}: its records do not hold the checkpoint's bytes (corrupt, rebuild)")
+    finally:
+        os.close(fd)
     return lay
 
 
@@ -211,19 +273,25 @@ def model_experts(model_dir: Path) -> tuple[dict, int]:
     raise PackError(f"no SSD expert streaming for model_type {kind!r}")
 
 
-def choose(model_dir: Path, env: dict | None = None) -> tuple[Path | None, bool]:
-    """(pack path or None, whether it was asked for): TENSORFOLD_EXPERT_PACK=path asks for one, =0 turns packs
-    off; unset, MODEL_DIR/experts.pack is used when its index exists."""
+def choose(model_dir: Path, env: dict | None = None, pack: str | Path | bool | None = None) -> Path | None:
+    """The pack to use, or None (the default: packs are opt-in). ``pack``: False is off, True is
+    MODEL_DIR/experts.pack, a path is that pack; None follows TENSORFOLD_EXPERT_PACK (unset/0: off, 1:
+    MODEL_DIR/experts.pack, else a path)."""
 
+    if pack is False:
+        return None
+    if pack is True:
+        return Path(model_dir) / PACK_NAME
+    if pack is not None:
+        return Path(pack).expanduser()
     env = os.environ if env is None else env
     value = (env.get(ENV) or "").strip()
     if value.lower() in _OFF:
-        return None, False
-    if value:
-        return Path(value).expanduser(), True
-    default = Path(model_dir) / PACK_NAME
-    return (default, False) if index_path(default).is_file() else (None, False)
+        return None
+    if value.lower() in _ON:
+        return Path(model_dir) / PACK_NAME
+    return Path(value).expanduser()
 
 
-__all__ = ["ALIGNMENT", "ENV", "PACK_NAME", "Layout", "PackError", "build", "choose", "index_path", "layout",
-           "model_experts", "source_hash", "validate"]
+__all__ = ["ALIGNMENT", "ENV", "PACK_NAME", "Layout", "PackError", "build", "check_alignment", "choose",
+           "content_sample", "index_path", "layout", "model_experts", "source_hash", "validate"]

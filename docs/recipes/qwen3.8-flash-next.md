@@ -175,14 +175,16 @@ With both flags off (the default), a native server in the host-sync extension an
 own thread waits for the GPU, keeps the LRU and reads misses on native threads, with no Python per layer call.
 - **`TENSORFOLD_POOL_NATIVE=0`** keeps the Python serve loop. Both loops keep the same experts in the same slots.
 - **`TENSORFOLD_POOL_THREADS=N`** (default 8) sets the reader threads of either loop.
-- **Expert pack:** `python tools/pack_experts.py MODEL_DIR` writes `MODEL_DIR/experts.pack` and its index: each
-  expert's parts back to back in one 16 KiB-aligned record, so the native server reads a miss with one `pread`
-  instead of nine. It takes as much disk as the experts. A pack beside the checkpoint is used when it matches the
-  checkpoint and ignored with a warning when it does not; `TENSORFOLD_EXPERT_PACK=PATH` names one (a pack that
-  does not match is then an error), `TENSORFOLD_EXPERT_PACK=0` turns packs off. `/health` reports `packed`,
-  `preads` and `threads` with the pool's hits and misses.
-- `python tools/bench_pool_io.py MODEL_DIR` times miss reads for the Python loop, the native server and the
-  pack at 4, 8, 16 and 32 threads.
+- **Expert pack (opt-in, experimental):** `python tools/pack_experts.py MODEL_DIR` writes `MODEL_DIR/experts.pack`
+  and its index: each expert's parts back to back in one 16 KiB-aligned record, so the native server reads a miss
+  with one `pread` instead of nine. It takes as much disk as the experts. It is used only with
+  `TENSORFOLD_EXPERT_PACK=1` (`MODEL_DIR/experts.pack`) or `TENSORFOLD_EXPERT_PACK=PATH`, and a pack that does not
+  match the checkpoint (layout, each file's size, inode and modification time, a sample of the expert bytes) is an
+  error: rebuild it after any change to the checkpoint files, a copy included. On decode-sized calls it has not
+  read faster than the unpacked path. `/health` reports `packed`, `preads` and `threads` with the pool's hits and
+  misses.
+- `python tools/bench_pool_io.py MODEL_DIR --cold` times miss reads for the Python loop, the native server and
+  the pack at 4, 8, 16 and 32 threads, on experts none of whose bytes are in the page cache.
 
 ## CUDA
 
