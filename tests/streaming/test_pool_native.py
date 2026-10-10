@@ -335,7 +335,9 @@ def test_close_releases_queued_calls_the_gpu_never_signalled(hs, tmp_path):
     start = time.monotonic()
     s.close()
     assert time.monotonic() - start < 3
-    assert s.channel.value() >= readies[-1] and s.misses == 0 and s.error is None
+    assert s.channel.value() >= readies[-1] and s.misses == 0
+    assert isinstance(s.error, RuntimeError) and "closed before the GPU reached layer 0" in str(s.error)
+    assert "closed before" in s.stats()["error"]                         # a forward on those slots must fail
 
 
 def test_close_still_loads_a_call_whose_signal_arrived(hs, tmp_path):
@@ -346,9 +348,10 @@ def test_close_still_loads_a_call_whose_signal_arrived(hs, tmp_path):
     _, last = s.marks("rows", 2, 1)                                      # queued behind it, never signalled
     s.channel.signal(signal)
     s.close()
-    assert s.channel.value() >= last and s.error is None
+    assert s.channel.value() >= last
     assert (s.hits, s.misses) == (0, 2)
     check_resident(hs, s, truth)
+    assert "layer 2" in str(s.error)                                     # only the unsignalled call failed
 
 
 def test_a_second_close_waits_for_the_first(hs, tmp_path):
@@ -371,6 +374,40 @@ def test_a_second_close_waits_for_the_first(hs, tmp_path):
         assert len(done) == 2 and s.channel.value() >= ready
         s.close()                                                        # the fds after both: nothing left reading
         assert not s.fds
+
+
+def test_concurrent_streamer_closes_close_each_fd_once(hs, tmp_path):
+    write_checkpoint(tmp_path)
+    for native in (True, False):
+        s = make(hs, tmp_path, 2 * EXPERTS, native=native)
+        s.marks("rows", 0, 1)                                            # never signalled: the first close waits
+        errors: list[str] = []
+
+        def close(s=s, errors=errors):
+            try:
+                s.close()
+            except OSError as error:
+                errors.append(repr(error))
+
+        closers = [threading.Thread(target=close) for _ in range(3)]
+        for c in closers:
+            c.start()
+        for c in closers:
+            c.join(10)
+            assert not c.is_alive()
+        assert not errors and not s.fds
+        s.close()
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_stats_show_a_failed_pool(hs, tmp_path, native):
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS, native=native)
+    call(hs, s, "rows", 0, [1, 2, 3, 4])
+    assert "error" not in s.stats()
+    call(hs, s, "rows", 0, [1, 99, 3, 4], ok=False)
+    assert s.stats()["error"] == "ValueError: routed expert 99 is outside the model"
+    s.close()
 
 
 # -- the pack --------------------------------------------------------------------------------------------------
@@ -459,6 +496,21 @@ def test_new_bytes_behind_the_same_size_inode_and_mtime_are_caught_by_the_sample
         "source_hash"]
     with pytest.raises(packs.PackError, match="differ"):
         packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
+
+
+def test_a_checkpoint_changing_while_it_is_packed_leaves_no_pack(tmp_path):
+    write_checkpoint(tmp_path, seed=45)
+    found, _ = pool.sources(tmp_path, names(False))
+    shard = min(tmp_path.glob("model-*.safetensors"))
+
+    def touch(line):
+        if line.startswith("layer 0:"):                                  # mid-build: a file is replaced in place
+            st = shard.stat()
+            os.utime(shard, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(packs.PackError, match="changed while"):
+        packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME, progress=touch)
+    assert not list(tmp_path.glob("experts.pack*"))
 
 
 def test_a_corrupt_pack_record_is_refused(tmp_path):

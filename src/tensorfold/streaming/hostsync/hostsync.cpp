@@ -370,7 +370,8 @@ class PoolServer {
       }
       if (job.stop) break;
       try {
-        if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing
+        if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing, fail it
+          record("RuntimeError", "expert streaming closed before the GPU reached layer " + std::to_string(job.layer));
           channel_->signal(job.ready);
           continue;
         }

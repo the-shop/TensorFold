@@ -164,7 +164,8 @@ def build(found: dict, experts: int, out: Path, *, alignment: int = ALIGNMENT, b
 
     out = Path(out)
     lay = layout(found, experts, alignment)
-    sample = content_sample(found, lay)                  # before the copy: a checkpoint changing under it is refused
+    tables = source_hash(found)                          # before the copy, checked again after it: a checkpoint
+    sample = content_sample(found, lay)                  # changing while it is copied gets no index
     free = shutil.disk_usage(out.parent).free
     if free < lay.total + (1 << 30):
         raise PackError(f"the pack needs {lay.total / 2**30:.1f} GiB on {out.parent}, {free / 2**30:.1f} GiB is free")
@@ -205,10 +206,13 @@ def build(found: dict, experts: int, out: Path, *, alignment: int = ALIGNMENT, b
         os.close(dst)
         for fd in src_fds.values():
             os.close(fd)
+    if source_hash(found) != tables or content_sample(found, lay) != sample:
+        partial.unlink()
+        raise PackError(f"a checkpoint file changed while {out.name} was written: no pack was kept, run it again")
     os.replace(partial, out)
     index = {"version": VERSION, "pack": out.name, "alignment": alignment, "layers": lay.layers, "experts": experts,
              "order": [list(o) for o in lay.order], "part_nbytes": lay.part_nbytes, "part_offsets": lay.part_offsets,
-             "payload": lay.payload, "stride": lay.stride, "pack_nbytes": lay.total, "source_hash": source_hash(found),
+             "payload": lay.payload, "stride": lay.stride, "pack_nbytes": lay.total, "source_hash": tables,
              "content_sample": sample}
     tmp = index_path(out).with_name(index_path(out).name + ".partial")
     tmp.write_text(json.dumps(index, indent=1))

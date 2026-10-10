@@ -140,6 +140,7 @@ class Streamer:
         self.lru: OrderedDict[tuple[int, int], int] = OrderedDict()     # (layer, expert) -> slot, oldest first
         self.free = list(range(slots - 1, experts - 1, -1))
         self._server = None
+        self._close_lock = threading.Lock()
         self.pack_path: Path | None = None                              # the expert pack the native server reads
         self._error: BaseException | None = None
         self.hits = self.misses = self.bytes_read = 0
@@ -284,19 +285,27 @@ class Streamer:
 
         return {proj: Slots(*(getattr(s, p)[:self.experts] for p in PARTS)) for proj, s in self.pool.items()}
 
-    def stats(self) -> dict[str, int]:
-        """Hits, misses and bytes read; with decode prefetch or prompt seeding on, their counters too."""
+    def stats(self) -> dict[str, int | str]:
+        """Hits, misses and bytes read; with decode prefetch or prompt seeding on, their counters too; the native
+        server's read counts; and "error" once a call failed (the pool then refuses every later call)."""
 
         if self._server is not None:
             hits, misses, read, preads = self._server.counters()
-            return {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "native": 1,
-                    "packed": int(self._server.packed()), "preads": int(preads), "threads": int(self._server.workers())}
+            out = {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "native": 1,
+                   "packed": int(self._server.packed()), "preads": int(preads), "threads": int(self._server.workers())}
+            return self._with_error(out)
         out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read)}
         if self.decode_prefetch:
             out.update(prefetch_issued=self.prefetch_issued, prefetch_hits=self.prefetch_hits,
                        prefetch_misses=self.prefetch_misses, prefetch_cancelled=self.prefetch_cancelled)
         if self.prompt_seed:
             out.update(seeded=self.seeded, seed_hits=self.seed_hits)
+        return self._with_error(out)
+
+    def _with_error(self, out: dict) -> dict:
+        error = self.error
+        if error is not None:
+            out["error"] = f"{type(error).__name__}: {error}"
         return out
 
     def _serve(self) -> None:
@@ -514,12 +523,17 @@ class Streamer:
             self.bytes_read += src.nbytes
 
     def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            for fd in self.fds.values():
-                os.close(fd)
-            self.fds.clear()
-            return
+        """Stop serving and close the files; idempotent, and safe from several threads at once."""
+
+        with self._close_lock:
+            if self._server is not None:
+                self._server.close()
+            else:
+                self._close_python()
+            while self.fds:
+                os.close(self.fds.popitem()[1])
+
+    def _close_python(self) -> None:
         self._jobs.put(None)
         self._thread.join(timeout=5)
         for entry in self.pending.values():
@@ -528,9 +542,6 @@ class Streamer:
         if self._seeders is not None:
             self._seeders.shutdown(wait=True)
         self._readers.shutdown(wait=True)
-        for fd in self.fds.values():
-            os.close(fd)
-        self.fds.clear()
 
 
 __all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "native_wanted", "pool_threads",
