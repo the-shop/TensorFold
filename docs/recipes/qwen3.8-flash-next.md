@@ -171,6 +171,19 @@ Two opt-in flags stream experts ahead of time. Both default to off.
 
 Both flags change only which experts are resident, never the tokens.
 
+With both flags off (the default), a native server in the host-sync extension answers each layer's routing: its
+own thread waits for the GPU, keeps the LRU and reads misses on native threads, with no Python per layer call.
+- **`TENSORFOLD_POOL_NATIVE=0`** keeps the Python serve loop. Both loops keep the same experts in the same slots.
+- **`TENSORFOLD_POOL_THREADS=N`** (default 8) sets the reader threads of either loop.
+- **Expert pack:** `python tools/pack_experts.py MODEL_DIR` writes `MODEL_DIR/experts.pack` and its index: each
+  expert's parts back to back in one 16 KiB-aligned record, so the native server reads a miss with one `pread`
+  instead of nine. It takes as much disk as the experts. A pack beside the checkpoint is used when it matches the
+  checkpoint and ignored with a warning when it does not; `TENSORFOLD_EXPERT_PACK=PATH` names one (a pack that
+  does not match is then an error), `TENSORFOLD_EXPERT_PACK=0` turns packs off. `/health` reports `packed`,
+  `preads` and `threads` with the pool's hits and misses.
+- `python tools/bench_pool_io.py MODEL_DIR` times miss reads for the Python loop, the native server and the
+  pack at 4, 8, 16 and 32 threads.
+
 ## CUDA
 
 Use the [container setup](../../RUNBOOK.md#nvidia-gpus). For two ranks, pull the checkpoint on both and
