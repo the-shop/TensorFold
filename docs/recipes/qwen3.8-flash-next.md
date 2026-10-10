@@ -171,7 +171,7 @@ Decode and prefill in tok/s; load time in seconds (harness A / harness B):
   runs +10% / +9%, harness B +11% / +11%) and prefills 6-8% faster; at 70 GiB decode +2-6%, prefill +8-11%.
 - **Pool size:** on new prompts, the native server at 60 GiB decodes 22% (harness B) to 24% (harness A) faster than
   at 40 GiB. A rerun of the same prompt mostly hits the pool at 60 GiB, so harness A repeats reach 58.8 tok/s
-  against 25.0 at 40 GiB. A 70 GiB pool gives no gain over 60 GiB (harness B drafts 22.5 against 23.0), prefills 10-15%
+  against 25.0 at 40 GiB. A 70 GiB pool gives no gain over 60 GiB (harness B drafts 22.5 against 23.0), prefills 9-15%
   slower, and needs 10 GiB more.
 - **Hit rate:** 90% of expert reads at 40 GiB, 98% at 60 and 70 GiB. Expert and n-gram reads use `F_NOCACHE`, so
   the page cache does not raise these rates.
@@ -195,7 +195,7 @@ With both flags off (the default), a native server in the host-sync extension an
 own thread waits for the GPU, keeps the LRU and reads misses on native threads, with no Python per layer call.
 - **`TENSORFOLD_POOL_NATIVE=0`** keeps the Python serve loop. Both loops keep the same experts in the same slots.
 - **`TENSORFOLD_POOL_THREADS=N`** (default 8) sets the reader threads of either loop. 16 threads raised prefill
-  4-9% at 40 and 60 GiB but not at 70, and kept decode within ±3.5%, except harness B serial at 40 GiB (-10%), so
+  4-9% at 40 and 60 GiB but not at 70, and kept decode within ±3% at 40 and 60 GiB and ±4% at 70, except harness B serial at 40 GiB (-10%), so
   the default stays 8.
 - **Expert pack (opt-in, experimental, off by default):** `python tools/pack_experts.py MODEL_DIR` writes
   `MODEL_DIR/experts.pack` and its index: each expert's parts back to back in one 16 KiB-aligned record, so the
