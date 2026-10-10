@@ -124,13 +124,15 @@ def test_the_checkpoints_decoder_experts_are_named_and_counted(tmp_path):
 
 
 @needs_metal
-def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch):
+@pytest.mark.parametrize("native", ["1", "0", "packed"])
+def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, native):
     from tensorfold.streaming import build
 
     try:
         build.load()
     except RuntimeError as error:                                        # no cmake or nanobind here
         pytest.skip(str(error))
+    monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", "0" if native == "0" else "1")
     monkeypatch.setattr(glm5_fakes, "D", 512)
     monkeypatch.setitem(glm5_fakes.TEXT, "hidden_size", 512)
     monkeypatch.setitem(glm5_fakes.TEXT, "moe_intermediate_size", 512)
@@ -141,6 +143,11 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch):
         resident = weights.load_backbone(folder)
         streamed = weights.load_backbone(folder, stream=True)
         per = expert_nbytes(sources(folder, stream.expert_names(folder, 6))[0], 1)
+        if native == "packed":                                           # the pack beside the checkpoint
+            from tensorfold.streaming import pack
+
+            names, experts = pack.model_experts(folder)
+            pack.build(sources(folder, names)[0], experts, folder / pack.PACK_NAME)
         streamer = stream.attach(streamed, folder, (2 * 8 + 4) * per / 2**30)     # a layer's window, 12 LRU slots
         prompt = mx.array(np.random.default_rng(5).integers(0, glm5_fakes.VOCAB, 40), dtype=mx.uint32)
         caches = [resident.make_cache(), streamed.make_cache()]
@@ -150,7 +157,8 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch):
             step = mx.array(np.random.default_rng(rows).integers(0, glm5_fakes.VOCAB, rows), dtype=mx.uint32)
             outs = [m.hidden(step, c) for m, c in zip((resident, streamed), caches)]
             assert same(outs[1], outs[0]), rows
-        assert streamer.misses > 0 and streamer.error is None
+        assert streamer.misses > 0 and streamer.error is None and streamer.native == (native != "0")
+        assert streamer.stats().get("packed", 0) == (native == "packed")
         streamer.close()
     finally:
         mx.set_default_device(previous)

@@ -22,6 +22,23 @@ from tensorfold.streaming.checkpoint import headers
 PARTS = ("weight", "scales", "biases")
 _DTYPES = {"U32": mx.uint32, "BF16": mx.bfloat16, "F16": mx.float16, "F32": mx.float32}
 TIMEOUT_MS = 60_000          # a layer's loads finish long before this; past it the forward fails
+_KINDS = {"rows": 0, "window": 1}
+_ERRORS = {"TimeoutError": TimeoutError, "ValueError": ValueError, "MemoryError": MemoryError,
+           "IndexError": IndexError, "KeyError": KeyError, "RuntimeError": RuntimeError}
+
+
+def pool_threads(env: dict | None = None) -> int:
+    """Reader threads for misses: TENSORFOLD_POOL_THREADS (1..256), 8 by default."""
+
+    env = os.environ if env is None else env
+    return min(256, max(1, int(env.get("TENSORFOLD_POOL_THREADS", "8") or 8)))
+
+
+def native_wanted(env: dict | None = None) -> bool:
+    """TENSORFOLD_POOL_NATIVE=0 keeps the Python serve loop; otherwise the extension's runs when it can."""
+
+    env = os.environ if env is None else env
+    return (env.get("TENSORFOLD_POOL_NATIVE", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
 
 
 @dataclass
@@ -91,11 +108,15 @@ def _uncached(path: Path) -> int:
 
 
 class Streamer:
-    """Slots [0, E): one layer's window (expert e in slot e) for prompt chunks; [E, S): an LRU for decode rows."""
+    """Slots [0, E): one layer's window (expert e in slot e) for prompt chunks; [E, S): an LRU for decode rows.
+
+    With decode prefetch and prompt seeding off and an extension that has one, the extension's PoolServer serves
+    the calls (no Python per call; it reads a valid expert pack with one pread an expert); otherwise the Python
+    thread below does. Both keep the same LRU, slots and counters for the same calls."""
 
     def __init__(self, found: dict, shapes: dict, *, layers: int, experts: int, top_k: int, slots: int,
-                 box_rows: int, hostsync: Any, workers: int = 8, decode_prefetch: int = 0,
-                 prompt_seed: int = 0) -> None:
+                 box_rows: int, hostsync: Any, workers: int | None = None, decode_prefetch: int = 0,
+                 prompt_seed: int = 0, native: bool | None = None, pack: str | Path | bool | None = None) -> None:
         if slots < 2 * experts:
             raise ValueError(f"the expert pool needs a layer's {experts} window slots plus as many for decode, "
                              f"got {slots}")
@@ -117,9 +138,12 @@ class Streamer:
         self.window: list[int] = [-1] * experts                         # the layer whose expert sits in slot e
         self.lru: OrderedDict[tuple[int, int], int] = OrderedDict()     # (layer, expert) -> slot, oldest first
         self.free = list(range(slots - 1, experts - 1, -1))
+        self._server = None
+        self.pack_path: Path | None = None                              # the expert pack the native server reads
+        self._error: BaseException | None = None
         self.hits = self.misses = self.bytes_read = 0
+        workers = pool_threads() if workers is None else int(workers)
         self._bytes_lock = threading.Lock()                             # reader threads add to bytes_read
-        self.error: BaseException | None = None
         self._readers = ThreadPoolExecutor(workers, thread_name_prefix="expert-read")
         # decode_prefetch=k: each decode row's k guesses for the next layer (GPU-written) are read behind the call;
         # prompt_seed=n: after a prompt, each layer's n most-routed experts are read into the LRU, warmest last
@@ -136,8 +160,110 @@ class Streamer:
         self._prompted = False                                          # window calls since the last seed
         self._seeders = ThreadPoolExecutor(2, thread_name_prefix="expert-seed") if self.prompt_seed else None
         self._jobs: queue.Queue = queue.Queue()
+        if native is None:
+            native = native_wanted()
+        if native and not self.decode_prefetch and not self.prompt_seed and hasattr(hostsync, "PoolServer"):
+            self._readers.shutdown(wait=False)
+            try:
+                self._server = self._native(slots, workers, pack)
+            except BaseException:
+                for fd in self.fds.values():
+                    os.close(fd)
+                raise
+            self._thread = None
+            return
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
+
+    def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
+        """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
+
+        from tensorfold.streaming import pack as packs
+
+        order = [(proj, part) for proj in self.pool for part in PARTS]
+        fds = np.full((self.layers, self.experts, len(order)), -1, dtype=np.int32)
+        offsets = np.zeros((self.layers, self.experts, len(order)), dtype=np.int64)
+        sizes = [0] * len(order)
+        for layer in sorted({key[0] for key in self.found}):
+            for p, (proj, part) in enumerate(order):
+                for e in range(self.experts):
+                    src, offset = self.source(self.found, layer, proj, part, e)
+                    fds[layer, e, p], offsets[layer, e, p], sizes[p] = self.fds[src.path], offset, src.nbytes
+        server = self.hs.PoolServer(self.channel, self.box, self.slot_of,
+                                    [getattr(self.pool[proj], part) for proj, part in order], sizes,
+                                    fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
+                                    workers, TIMEOUT_MS)
+        if pack is False:
+            return server
+        if pack is None or pack is True:
+            model_dir = Path(os.path.commonpath([str(Path(s.path).parent) for s in self.found.values()]))
+            path, asked = packs.choose(model_dir)
+            asked = asked or pack is True
+        else:
+            path, asked = Path(pack), True
+        if path is None:
+            if asked:
+                raise packs.PackError("an expert pack was asked for, but there is none beside the checkpoint")
+            return server
+        try:
+            lay = packs.validate(path, self.found, self.experts)
+        except packs.PackError as error:
+            if asked:
+                raise
+            print(f"[pool] ignoring the expert pack: {error}", file=sys.stderr, flush=True)
+            return server
+        records = np.full((self.layers, self.experts), -1, dtype=np.int64)
+        for li, layer in enumerate(lay.layers):
+            records[layer] = (li * self.experts + np.arange(self.experts, dtype=np.int64)) * lay.stride
+        fd = _uncached(path)
+        self.fds[path] = fd
+        server.set_pack(fd, records.tobytes(), lay.stride, lay.part_offsets, lay.alignment)
+        self.pack_path = path
+        return server
+
+    @property
+    def native(self) -> bool:
+        return self._server is not None
+
+    @property
+    def error(self) -> BaseException | None:
+        if self._error is None and self._server is not None:
+            found = self._server.error()
+            if found is not None:
+                kind, message = found
+                self._error = _ERRORS.get(kind, RuntimeError)(message)
+        return self._error
+
+    @error.setter
+    def error(self, value: BaseException | None) -> None:
+        self._error = value
+
+    def _counter(index: int, name: str) -> property:   # a property factory, run in the class body
+        def get(self) -> int:
+            return int(self._server.counters()[index]) if self._server is not None else self.__dict__[name]
+
+        def put(self, value: int) -> None:
+            self.__dict__[name] = value
+
+        return property(get, put)
+
+    hits = _counter(0, "_hits")
+    misses = _counter(1, "_misses")
+    bytes_read = _counter(2, "_bytes_read")
+    del _counter
+
+    def lru_items(self) -> list[tuple[tuple[int, int], int]]:
+        """The decode LRU as ((layer, expert), slot), oldest first."""
+
+        if self._server is not None:
+            return [((layer, e), slot) for layer, e, slot in self._server.lru_items()]
+        return list(self.lru.items())
+
+    def free_slots(self) -> list[int]:
+        return list(self._server.free_slots()) if self._server is not None else list(self.free)
+
+    def window_layers(self) -> list[int]:
+        return list(self._server.window()) if self._server is not None else list(self.window)
 
     def marks(self, kind: str, layer: int, rows: int, guess: int = 0) -> tuple[int, int]:
         """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags
@@ -147,6 +273,9 @@ class Streamer:
             raise RuntimeError("expert streaming stopped") from self.error
         signal, ready = self.value + 1, self.value + 2
         self.value = ready
+        if self._server is not None:
+            self._server.submit(_KINDS[kind], layer, rows, signal, ready)
+            return signal, ready
         self._jobs.put((kind, layer, rows, signal, ready, guess))
         return signal, ready
 
@@ -164,6 +293,10 @@ class Streamer:
     def stats(self) -> dict[str, int]:
         """Hits, misses and bytes read; with decode prefetch or prompt seeding on, their counters too."""
 
+        if self._server is not None:
+            hits, misses, read, preads = self._server.counters()
+            return {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "native": 1,
+                    "packed": int(self._server.packed()), "preads": int(preads), "threads": int(self._server.workers())}
         out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read)}
         if self.decode_prefetch:
             out.update(prefetch_issued=self.prefetch_issued, prefetch_hits=self.prefetch_hits,
@@ -376,6 +509,12 @@ class Streamer:
             self.bytes_read += src.nbytes
 
     def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            for fd in self.fds.values():
+                os.close(fd)
+            self.fds.clear()
+            return
         self._jobs.put(None)
         self._thread.join(timeout=5)
         for entry in self.pending.values():
@@ -389,4 +528,5 @@ class Streamer:
         self.fds.clear()
 
 
-__all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "sources"]
+__all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "native_wanted", "pool_threads",
+           "sources"]

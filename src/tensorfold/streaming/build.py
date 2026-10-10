@@ -12,6 +12,7 @@ from typing import Any
 
 SOURCE = Path(__file__).resolve().parent / "hostsync"
 NANOBIND = "2.15.0"          # MLX's own nanobind: another version cannot take mlx.core.array
+_LOADED: dict[Path, Any] = {}  # a second load would register the extension's types in MLX's domain again
 
 
 def _key() -> str:
@@ -28,6 +29,8 @@ def load(cache: Path | None = None) -> Any:
     """The compiled ``_hostsync`` module, building it with cmake and nanobind when this MLX has none yet."""
 
     folder = (cache or Path.home() / ".cache" / "tensorfold" / "ext") / f"hostsync-{_key()}"
+    if folder in _LOADED:
+        return _LOADED[folder]
     built = next(iter(folder.glob("_hostsync*.so")), None) if folder.is_dir() else None
     if built is None:
         _build(folder)
@@ -35,6 +38,7 @@ def load(cache: Path | None = None) -> Any:
     spec = importlib.util.spec_from_file_location("_hostsync", built)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _LOADED[folder] = module
     return module
 
 
