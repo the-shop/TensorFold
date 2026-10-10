@@ -11,7 +11,7 @@ TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an Op
 Each model family supplies its own kernels and draft verification.
 
 ```bash
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.2.0"
 tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
 ```
 
@@ -127,6 +127,10 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--spill-gib N` | Write evicted conversation prefixes to disk (up to N GiB) and read them back instead of prefilling again; zero disables | MLX |
 | `--mlx-cache-gib N` | Reusable freed-buffer cache, default 8 GiB | MLX |
 | `--snapshot-dir DIR` | Persistent prefix snapshots; `none` disables them | MLX |
+| `--session-dir DIR` | Where saved conversations go; default `session-snapshots` beside `--snapshot-dir`, so servers with sibling snapshot directories share it unless each names its own | MLX |
+| `--persist-turns` | After each turn, write its conversation checkpoint to the session directory from a background thread, so a crash keeps it | MLX |
+| `--checkpoint-last-user` | Also keep a checkpoint where the last user message starts (clients that replace a trailing user message) | MLX |
+| `--background-warm` | After a key change, recompute the newest saved system block in the background (slows foreground turns meanwhile) | MLX |
 | `--no-update-check` | Disable the startup release check | Both |
 
 The default sampling settings come from `generation_config.json`. Requests can override sampling and reply
@@ -226,7 +230,7 @@ Use NVIDIA's PyTorch container for CUDA, PyTorch, Triton and the extension compi
 
 ```bash
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.2.0"
 tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
 ```

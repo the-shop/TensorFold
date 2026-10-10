@@ -23,6 +23,15 @@ from tensorfold.server.stacks import Rearming
 _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
 
 
+def _write_failures(app: Any) -> dict[str, int]:
+    """Snapshot writes that failed since start: spills, shutdown saves, and --persist-turns writes."""
+
+    from tensorfold.server.checkpoints import WRITE_FAILURES
+
+    persist = getattr(app, "persist", None)
+    return {**WRITE_FAILURES, "turn": int(persist.stats()["failed"]) if persist is not None else 0}
+
+
 def _expert_stats(app: Any) -> dict | None:
     """The --ssd-experts pool's slot hits, misses and bytes read since start (with decode prefetch or prompt seeding
     on, their counters too), or None without a pool."""
@@ -33,6 +42,18 @@ def _expert_stats(app: Any) -> dict | None:
     if streamer is None:
         return None
     return streamer.stats()
+
+
+def _ple_cache_stats(app: Any) -> dict | None:
+    """The --ple-cache-mib row caches' hits, misses, evictions, re-indexes, rows and bytes, or None without them."""
+
+    model = getattr(app, "_model", None)
+    caches = getattr(getattr(model, "model", model), "__dict__", {}).get("ple_caches")
+    if not caches:
+        return None
+    from tensorfold.families.qwen4_exp.ssd_table import cache_stats
+
+    return cache_stats(caches)
 
 
 def _memory(reset_peak: bool, *, admission: Any = None) -> dict[str, int]:
@@ -109,8 +130,11 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                         "model_ids": app.model_ids,
                         "max_batch_size": app.max_batch_size,
                         "warming": bool(getattr(app, "warming", False)),
+                        **({"persist": app.persist.stats()} if getattr(app, "persist", None) is not None else {}),
+                        "snapshot_write_failures": _write_failures(app),
                         "memory": _memory("reset_peak=1" in self.path, admission=getattr(app, "prompt_memory", None)),
                         "experts": _expert_stats(app),
+                        **({"ple_cache": stats} if (stats := _ple_cache_stats(app)) is not None else {}),
                     }
                 )
                 return

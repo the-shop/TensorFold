@@ -81,7 +81,24 @@ def build_parser() -> argparse.ArgumentParser:
                             "demand instead of prefilling again (0: off; needs --snapshot-dir)")
     speed.add_argument("--snapshot-dir", default=str(Path.home() / ".cache" / "tensorfold" / "prefix-snapshots"),
                        help="where system-block and conversation snapshots are kept ('none': in memory only)")
+    speed.add_argument("--session-dir", default=None,
+                       help="where saved conversations (spilled, persisted turns, saved at shutdown) are kept "
+                            "(default: session-snapshots beside --snapshot-dir, so servers whose snapshot "
+                            "directories are siblings share it: give each its own)")
     speed.add_argument("--max-snapshots", type=int, default=3, help="system-block snapshots loaded at start")
+    speed.add_argument("--persist-turns", action="store_true",
+                       help="after each turn, write its longest conversation checkpoint to the session directory "
+                            "beside --snapshot-dir from a background thread (the host copy is made between turns), "
+                            "so a crash or kill keeps it; bounded by --spill-gib, else 10 GiB (default: off, "
+                            "conversations reach disk at a graceful stop or when spilled)")
+    speed.add_argument("--checkpoint-last-user", action="store_true",
+                       help="also keep a prompt checkpoint at the chunk start of the last user message when it lies "
+                            "before the history end's: a client that replaces a trailing user message on its next "
+                            "request (Pi) resumes there; costs one more checkpoint copy a turn (default: off)")
+    speed.add_argument("--background-warm", action="store_true",
+                       help="when no saved system block matches these kernels (after an upgrade), recompute the "
+                            "newest one saved by others in the background; on a large model this runs for minutes "
+                            "and slows foreground turns meanwhile (default: off, the first turn prefills it)")
     speed.add_argument("--parallel", default="auto",
                        help="requests decoded together, their windows sharing each round's forward: a number, or "
                             "auto (Mac: up to 8, each started only while the projected memory fits the budget; "
@@ -97,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Flash Next: read the n-gram (PLE) tables from the checkpoint on SSD at each lookup "
                             "instead of holding them in memory. A trade: a few percent of decode speed for about "
                             "40 GiB less at peak (the tables are 29.8 GiB); a 128 GB Mac needs it")
+    speed.add_argument("--ple-cache-mib", type=int, default=0, metavar="MIB",
+                       help="with --ple-on-ssd on a Mac: keep n-gram rows read recently in this many MiB of RAM "
+                            "(rows and their index, all counted in the memory budget; 0: off) and read only the "
+                            "others from SSD. The rows are the checkpoint's own bytes, so output is the same")
 
     speed.add_argument("--no-update-check", action="store_true",
                        help="don't ask GitHub whether a newer release exists (also TENSORFOLD_NO_UPDATE_CHECK=1)")
@@ -392,6 +413,15 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
 MIN_CHUNK = 256
 
 
+def _host_reserve(args: argparse.Namespace) -> int:
+    """The process's bytes outside MLX's buffers: PROCESS_BYTES, and the n-gram row cache's arena."""
+
+    from tensorfold.server.memory_budget import PROCESS_BYTES
+
+    held = getattr(args, "ple_cache_bytes", None)       # the caches' bytes on this checkpoint, set by cmd_serve
+    return PROCESS_BYTES + (int(held) if held is not None else int(getattr(args, "ple_cache_mib", 0) or 0) * 1024**2)
+
+
 def _parallel(value: Any) -> int:
     """``--parallel``: "auto" is up to 8 requests at once; a number caps it."""
 
@@ -420,7 +450,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                          f"{family.title} does not")
     if args.ple_on_ssd and not hasattr(family.package, "ple_bytes"):
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
+    if args.ple_cache_mib < 0 or (args.ple_cache_mib and not args.ple_on_ssd):
+        raise ValueError("--ple-cache-mib takes 0 or a positive MiB count, and caches rows only with --ple-on-ssd")
     backend = _backend(args.backend, family)
+    if args.ple_cache_mib and backend == "cuda":
+        raise ValueError("--ple-cache-mib caches the n-gram rows of the Mac (MLX) loader only; drop it on CUDA")
     _check_serve_options(args, family, backend, config_dir)
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)
@@ -440,6 +474,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if needs_full_snapshot and check is not None:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
 
+    sizer = getattr(family.package, "ple_cache_bytes", None)
+    if args.ple_cache_mib and sizer is not None:           # refused or capped before any weights load
+        args.ple_cache_bytes = sizer(model_dir, args.ple_cache_mib)
+        if args.ple_cache_bytes < args.ple_cache_mib * 1024**2 - 1024:      # less than shares rounded down: capped
+            print(f"[tensorfold] --ple-cache-mib {args.ple_cache_mib:,}: the n-gram tables and their index take "
+                  f"{args.ple_cache_bytes / 1024**2:,.1f} MiB, so the cache holds them whole and reserves only that",
+                  flush=True)
+
     stacks.start()          # `kill -USR1 <pid>` prints every thread's Python stack: where a silent server waits
     if backend == "cuda":
         return _serve_cuda(args, family, model_dir, context)
@@ -450,14 +492,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from tensorfold.server.memory_budget import PROCESS_BYTES, budget_ceiling, configure_mlx, model_fraction, raise_hint
 
     fraction = model_fraction(family.package)
-    memory_limit = configure_mlx(mx, int(float(args.mlx_cache_gib) * 1024**3), fraction=fraction)
+    reserve = _host_reserve(args)
+    memory_limit = configure_mlx(mx, int(float(args.mlx_cache_gib) * 1024**3), fraction=fraction,
+                                 reserve_bytes=reserve)
     gib = 1024**3
+    rows = f" and {(reserve - PROCESS_BYTES) / 1024**2:,.1f} MiB of cached n-gram rows" if args.ple_cache_mib else ""
     note = f" ({fraction:.0%} of RAM, this model's allowance)" if fraction > MEMORY_FRACTION else ""
     ceiling = budget_ceiling(mx)
     more = f"; TENSORFOLD_MEMORY_LIMIT_GB can raise it to {ceiling / gib:.1f}" if ceiling > memory_limit + gib else ""
     print(f"[tensorfold] memory budget {memory_limit / gib:.1f} GiB{note}: MLX's buffers up to "
-          f"{(memory_limit - PROCESS_BYTES) / gib:.1f} GiB, {PROCESS_BYTES / gib:.0f} GiB for the rest of the process"
-          f"{more}", flush=True)
+          f"{(memory_limit - reserve) / gib:.1f} GiB, {PROCESS_BYTES / gib:.0f} GiB for the rest of the process"
+          f"{rows}{more}", flush=True)
     checkpoint = sum(path.stat().st_size for path in Path(model_dir).glob("*.safetensors"))
     estimate = getattr(family.package, "weight_bytes", None)
     weights = checkpoint if estimate is None else estimate(model_dir, ple_on_ssd=args.ple_on_ssd)
@@ -466,10 +511,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if weights < checkpoint:
         print(f"[tensorfold] weights: {weights / gib:.1f} GiB resident, "
               f"{(checkpoint - weights) / gib:.1f} GiB file-backed", flush=True)
-    if weights >= memory_limit - PROCESS_BYTES:
+    if weights >= memory_limit - reserve:
         stream = ("stream its routed experts from SSD with --ssd-experts GIB (slower), "
                   if args.ssd_experts is None and hasattr(family.package, "expert_bytes") else "")
-        hint = raise_hint(weights + PROCESS_BYTES, ceiling)
+        hint = raise_hint(weights + reserve, ceiling)
         raise ValueError(f"{family.title}'s weights ({weights / gib:.1f} GiB) do not fit this server's "
                          f"{memory_limit / gib:.1f} GiB memory budget. {hint or 'Serve it'} on a Mac with more memory, "
                          f"{stream}or use a smaller or more quantized checkpoint")
@@ -493,6 +538,8 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         options["mtp_drafts"] = int(args.mtp_drafts)
     if args.ple_on_ssd:
         options["ple_on_ssd"] = True
+    if args.ple_cache_mib:
+        options["ple_cache_mib"] = int(args.ple_cache_mib)
     if args.ssd_experts is not None:
         options["ssd_experts"] = float(args.ssd_experts)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
@@ -504,18 +551,18 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
               f"{'active' if not args.no_drafts and getattr(model, 'mtp', None) is not None else 'inactive'}",
               flush=True)
     from tensorfold.engine import prefill_step
-    from tensorfold.server.memory_budget import PROCESS_BYTES
     from tensorfold.server.prompt_memory import probe_tokens
     from tensorfold.server.residency import unwire, wire_resident
 
     getattr(model, "release_rounds", lambda: None)()       # load-time checks' rows go before the weights are wired
-    wired = wire_resident(mx, memory_limit - PROCESS_BYTES)
+    reserve = _host_reserve(args)
+    wired = wire_resident(mx, memory_limit - reserve)
     print(f"[tensorfold] {wired / 1024**3:.1f} GiB of weights kept resident", flush=True)
     # prompt chunks start where replies begin too, so a follow-up resumes where its latest reply began
     openers, assistant = message_markers(tokenizer)
     steps = engine_kwargs.pop("prefill_steps", None) or (LaneEngine.prefill_step,)
     step = prefill_step.choose(lambda grid: LaneEngine(model, prefill_plan=PrefillPlan(grid)), steps,
-                               memory_limit - PROCESS_BYTES, probe_tokens(tokenizer), context)
+                               memory_limit - reserve, probe_tokens(tokenizer), context)
     plan = PrefillPlan(step, openers, MIN_CHUNK, assistant)
     print(f"[tensorfold] prompt chunks of up to {step:,} tokens, cut at replies {plan.min_chunk:,}+ tokens apart",
           flush=True)
@@ -534,10 +581,12 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     resolve_prefill = getattr(model, "resolve_prefill_identity", None)
     if resolve_prefill is not None:
         resolve_prefill()  # the prefill mode's self-check runs at startup, before any snapshot key
-    # Both libraries, the active prompt kernels and how prompts are cut determine a snapshot's bits.
+    from tensorfold.engine.prefix_snapshots import weights_fingerprint
+
+    # Both libraries, the active prompt kernels, how prompts are cut and the weights' bytes determine a snapshot's bits.
     model_id = (f"{model_dir.resolve()}|mlx={mx.__version__}|mlx_lm={version('mlx-lm')}"
                 f"|kernels={families.kernel_version(family, model)}"
-                f"|prefill={plan.name}|tensorfold={__version__}")
+                f"|prefill={plan.name}|tensorfold={__version__}|weights={weights_fingerprint(model_dir)}")
     gib = args.prompt_cache_gib
     if gib is None:
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -560,11 +609,15 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         checkpoint_slots=0 if budget <= 0 else args.checkpoint_slots,
         checkpoint_budget_bytes=budget if budget > 0 else None,
         spill_bytes=int(float(args.spill_gib) * 1024**3),
-        memory_budget_bytes=memory_limit,
+        memory_budget_bytes=memory_limit, memory_overhead_bytes=reserve,
         fit_context=args.context is None,
         use_proposer=not args.no_drafts,
         snapshot_dir=snapshot_dir, model_id=model_id,
+        session_dir=None if args.session_dir is None else Path(args.session_dir).expanduser(),
         decode_share=0.25 if args.decode_share is None else float(args.decode_share),
+        background_warm=bool(args.background_warm),
+        persist_turns=bool(args.persist_turns),
+        checkpoint_last_user=bool(args.checkpoint_last_user),
     )
     if app.context_fitted:
         print(f"[tensorfold] context window {app.context_window:,} tokens: the most one request can use in the "

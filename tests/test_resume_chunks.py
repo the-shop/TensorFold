@@ -52,7 +52,8 @@ def test_a_saved_block_ending_at_a_message_is_warmed_to_its_end(tmp_path) -> Non
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Scheduler, "submit", submit)
-        app = make_app(engine_factory=MessageEngine, snapshot_dir=tmp_path, model_id="/models/fake|kernels=new")
+        app = make_app(engine_factory=MessageEngine, snapshot_dir=tmp_path, model_id="/models/fake|kernels=new",
+                       background_warm=True)
         try:
             deadline = time.time() + 10
             while time.time() < deadline and not any(e.pinned for e in app.checkpoints._entries):
@@ -115,3 +116,57 @@ def test_a_shared_system_block_is_kept_at_the_first_message_after_it() -> None:
     other = [*system, OPEN, 7, 8, 9, OPEN, ASSIST]           # another session with the same system block
     scheduler._start_job(ChatJob(job_id="b", prompt_ids=other, max_tokens=2, temperature=0.0))
     assert engine.prefill_calls[-1] == ("b", 11)
+
+
+def test_the_last_user_message_start_is_kept_at_its_chunk_start_when_asked() -> None:
+    from tensorfold.engine.prefill_plan import PrefillPlan
+    from tensorfold.server.scheduler import ChatJob, Scheduler
+
+    class GridEngine(FakeEngine):
+        prefill_plan = PrefillPlan(4)
+
+    kept = {}
+    for last_user in (0, 5):
+        store = CheckpointStore(4, copier=lambda c: c)
+        scheduler = Scheduler(GridEngine(), lanes=1, eos_ids=frozenset(), checkpoints=store)
+        job = ChatJob(job_id=f"j{last_user}", prompt_ids=list(range(1, 11)), max_tokens=2, temperature=0.0,
+                      history_len=9, last_user_len=last_user)
+        scheduler._start_job(job)
+        kept[last_user] = sorted(len(e.tokens) for e in store._entries)
+    assert kept == {0: [8], 5: [4, 8]}          # 5 is kept at 4, the history end 9 at 8 as before
+
+
+def test_a_last_user_start_in_the_history_ends_chunk_adds_nothing() -> None:
+    from tensorfold.engine.prefill_plan import PrefillPlan
+    from tensorfold.server.scheduler import ChatJob, Scheduler
+
+    class GridEngine(FakeEngine):
+        prefill_plan = PrefillPlan(4)
+
+    store = CheckpointStore(4, copier=lambda c: c)
+    scheduler = Scheduler(GridEngine(), lanes=1, eos_ids=frozenset(), checkpoints=store)
+    scheduler._start_job(ChatJob(job_id="j", prompt_ids=list(range(1, 11)), max_tokens=2, temperature=0.0,
+                                 history_len=9, last_user_len=8))
+    assert [len(e.tokens) for e in store._entries] == [8]
+
+
+def test_a_displaced_tail_user_message_resumes_at_its_start_with_identical_tokens() -> None:
+    system = {"role": "system", "content": "Be brief and exact in every answer you give."}
+    talk = [system, {"role": "user", "content": "first question"}, {"role": "assistant", "content": "an answer"}]
+    tail = {"role": "user", "content": "temporary goal reminder"}           # replaced on the next request
+    turn1 = [*talk, {"role": "user", "content": "follow-up"}, tail]
+    turn2 = [*talk, {"role": "user", "content": "follow-up"}, {"role": "assistant", "content": "ok"},
+             {"role": "user", "content": "next"}]
+    results = {}
+    for on in (False, True):
+        app = make_app(lanes=1, checkpoint_slots=4, checkpoint_last_user=on)
+        try:
+            first = app.chat(turn1, max_tokens=4)
+            second = app.chat(turn2, max_tokens=6)
+            start = app.last_user_start(turn1, None, app.render(turn1)[0], app.render(turn1)[1])
+        finally:
+            app.scheduler.stop(timeout=5.0)
+        results[on] = (first["runtime"]["token_sha"], second["runtime"]["token_sha"], second["cached_tokens"], start)
+    assert results[False][:2] == results[True][:2]                          # the same tokens either way
+    start = results[True][3]
+    assert start > 0 and results[True][2] == start > results[False][2]       # resumed at the tail's start

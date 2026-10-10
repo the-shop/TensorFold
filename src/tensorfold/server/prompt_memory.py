@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from tensorfold.server.errors import RequestError
 from tensorfold.server.memory_budget import (PROCESS_BYTES, CacheMemory, GIB, budget_ceiling, cache_nbytes,
@@ -87,6 +87,11 @@ class PromptMemory:
         self.workspace_profiled = False
         self.prompt = self.reply = 0
         self._memory_lock = RLock()
+        # host bytes outside MLX's counters that no reclaim frees (snapshot copies queued for disk, --persist-turns)
+        self.pending_bytes: Callable[[], int] = lambda: 0
+        # waits (at most its argument, seconds) until those bytes are written and freed; True once none are left
+        self.wait_pending: Callable[[float], bool] | None = None
+        self.pending_wait_s = 30.0
 
     def memory_snapshot(self, reset_peak: bool = False) -> dict[str, int]:
         with self._memory_lock:
@@ -107,12 +112,14 @@ class PromptMemory:
             self.runtime.clear_cache()
 
     def _used(self) -> int:
-        return int(self.runtime.get_active_memory() + self.runtime.get_cache_memory())
+        return int(self.runtime.get_active_memory() + self.runtime.get_cache_memory()) + int(self.pending_bytes())
 
     def held(self) -> int:
-        """MLX memory no admission can take back: live buffers less retained prefixes (freed buffers count as free)."""
+        """Memory no admission can take back: live buffers less retained prefixes (freed buffers count as free), plus
+        snapshot copies on their way to disk."""
 
-        return max(0, int(self.runtime.get_active_memory()) - (self.store.nbytes if self.store is not None else 0))
+        return max(0, int(self.runtime.get_active_memory()) - (self.store.nbytes if self.store is not None else 0)) \
+            + int(self.pending_bytes())
 
     def _reclaim(self, keep: Any = None) -> bool:
         before = self._used()
@@ -172,8 +179,12 @@ class PromptMemory:
 
     def fits(self, current_cache: Any = None, *, keep: Any = None) -> bool:
         while self.projected(self.prompt, current_cache=current_cache) > self.budget:
-            if not self._reclaim(keep=keep):
-                return False
+            if self._reclaim(keep=keep):
+                continue
+            # the last turn's copy on its way to disk is all that is left to free: wait for it, bounded, then retry
+            if self.wait_pending is not None and self.pending_bytes() > 0 and self.wait_pending(self.pending_wait_s):
+                continue
+            return False
         return True
 
     def would_fit(self, prompt: int, reply: int) -> bool:
@@ -319,7 +330,7 @@ class PromptMemory:
             if self.profile is None:
                 return None
             retained = self.store.nbytes if self.store is not None else 0
-            floor = max(0, int(self.runtime.get_active_memory()) - retained) + self.carry
+            floor = max(0, int(self.runtime.get_active_memory()) - retained) + self.carry + int(self.pending_bytes())
             kept = 2 if resumable else 1
             beyond = max(0, self.stream_per_token - self.profile.bytes_per_token)   # the live stream's, not kept
 
@@ -360,6 +371,18 @@ class PromptMemory:
         if self.store is None or self._over_store_budget(size):
             return False
         return self._make_room(size, cache)
+
+    def room_for(self, size: int, *, tokens: int = 0, reply: int = 0, current_cache: Any = None) -> bool:
+        """Whether ``size`` more bytes (a host copy for disk) fit, evicting nothing, beside what is resident and a
+        request of ``tokens`` prompt and ``reply`` reply tokens resuming from ``current_cache`` (the next turn)."""
+
+        with self._memory_lock:
+            saved = self.prompt, self.reply
+            self.prompt, self.reply = int(tokens), int(reply)
+            try:
+                return self.projected(self.prompt, current_cache=current_cache, extra_bytes=size) <= self.budget
+            finally:
+                self.prompt, self.reply = saved
 
     def allow_load(self, size: int) -> bool:
         return not self._over_store_budget(size) and self._make_room(size)

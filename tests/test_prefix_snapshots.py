@@ -53,3 +53,82 @@ def test_a_drafter_slot_is_left_out_of_a_saved_snapshot(tmp_path):
     tokens, cache = ps.load_snapshot(path, "model")
     assert tokens == [1, 2, 3, 4] and [type(item) for item in cache] == [KVCache]
     assert bool(mx.array_equal(cache[0].state[0], kv.state[0]).item())
+
+
+def test_a_snapshot_is_synced_before_its_rename_and_the_directory_after(tmp_path, monkeypatch):
+    import os
+
+    events = []
+    real_fsync, real_rename = os.fsync, type(tmp_path).rename
+
+    def fsync(fd):
+        import stat
+
+        mode = os.fstat(fd).st_mode
+        events.append(("fsync", "dir" if stat.S_ISDIR(mode) else "file"))
+        real_fsync(fd)
+
+    def rename(self, target):
+        events.append(("rename", "file"))
+        return real_rename(self, target)
+
+    monkeypatch.setattr(ps.os, "fsync", fsync)
+    monkeypatch.setattr(ps, "full_sync", fsync)
+    monkeypatch.setattr(type(tmp_path), "rename", rename)
+    ps.save_snapshot(tmp_path, "model-a|mlx=1", [1, 2, 3], [Layer()])
+    assert events == [("fsync", "file"), ("rename", "file"), ("fsync", "dir")]
+
+
+def test_a_writer_killed_mid_write_leaves_only_a_partial_that_readers_skip_and_startup_removes(tmp_path):
+    import subprocess
+    import sys
+
+    script = (
+        "import os, signal, sys\n"
+        "import mlx.core as mx\n"
+        "from tensorfold.engine import prefix_snapshots as ps\n"
+        "def killed(path, arrays, metadata=None):\n"
+        "    with open(path, 'wb') as handle:\n"
+        "        handle.write(b'\\0' * 4096)\n"
+        "        handle.flush()\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        "from mlx_lm.models.cache import KVCache\n"
+        "kv = KVCache()\n"
+        "kv.update_and_fetch(mx.ones((1, 2, 4, 4)), mx.ones((1, 2, 4, 4)))\n"
+        "ps.save_snapshot(ps.Path(sys.argv[1]), 'model-a|mlx=1', [1, 2, 3], [kv])\n"
+        "ps.mx.save_safetensors = killed\n"
+        "ps.save_snapshot(ps.Path(sys.argv[1]), 'model-a|mlx=1', [1, 2, 3, 4], [kv])\n"
+    )
+    import os
+
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    done = subprocess.run([sys.executable, "-c", script, str(tmp_path)], env=env)
+    assert done.returncode == -9
+    partials = list(tmp_path.glob("*.partial.safetensors"))
+    assert len(partials) == 1
+    assert [tokens for tokens, _ in ps.load_snapshots(tmp_path, "model-a|mlx=1")] == [[1, 2, 3]]
+    assert [tokens for _, tokens in ps.DiskBlocks(tmp_path, "model-a|mlx=1").blocks()] == [[1, 2, 3]]
+    assert ps.remove_stale_partials(tmp_path) == 4096 and not partials[0].exists()
+
+
+def test_a_file_is_flushed_with_f_fullfsync_where_the_platform_has_it(tmp_path, monkeypatch):
+    import fcntl
+    import os
+
+    calls = []
+    real = fcntl.fcntl
+    monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)
+    monkeypatch.setattr(fcntl, "fcntl", lambda fd, op, *a: calls.append(op) or (0 if op == 51 else real(fd, op, *a)))
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append("fsync"))
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    ps.sync_file(path)
+    assert calls == [51]
+
+    def unsupported(fd, op, *a):
+        raise OSError(45, "Operation not supported")
+
+    calls.clear()
+    monkeypatch.setattr(fcntl, "fcntl", unsupported)
+    ps.sync_file(path)
+    assert calls == ["fsync"]

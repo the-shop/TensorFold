@@ -231,6 +231,17 @@ when N exceeds one. The single-request engine retains prompt and reply states fo
 concurrent decoder retains prompt snapshots per stream. Cache capacity is allocated at startup; inspect
 the reported capacity rather than assuming an older fixed token limit.
 
+Saved prompt states survive restarts. System blocks go to `--snapshot-dir` and conversations to `--session-dir`
+(default `session-snapshots` beside it). Each file carries a checksum and the weights' fingerprint and is refused
+and removed when either does not match. A graceful stop saves the open conversations; `--persist-turns` also
+writes each turn's conversation behind the reply (streamed in pieces when RAM is tight), so a crash keeps it.
+`--checkpoint-last-user` keeps one more state where the last user message starts, for clients such as agent
+harnesses that replace a trailing reminder message on every turn. On the 8-bit checkpoint (`--ssd-experts 60
+--ple-on-ssd`, 84 GiB budget) with ~25K-token agent prompts, two independent harnesses measured: after a graceful
+restart the next turn's first token came in 6.0-7.0 s against 284-332 s cold; with `--checkpoint-last-user` a
+follow-up whose reminder message changed came in 14-23 s against 54-64 s; replies were the same tokens in every
+case, including after a kill -9 with `--persist-turns`.
+
 N-gram tables are file-backed host data. On unified-memory GPUs they compete with weights and cache
 allocations for RAM, so a checkpoint's GPU allocation alone does not describe its memory requirement.
 
@@ -238,6 +249,18 @@ allocations for RAM, so a checkpoint's GPU allocation alone does not describe it
 so a 128 GB Mac can hold Flash Next. It is an opt-in trade. On an M3 Ultra, replies were the same tokens,
 decode was 3.5-8% slower across the four cells, prefill was unchanged, the peak footprint fell by 40 GiB
 (135.1 to 95.4 GiB) and start-up halved (35.7 s to 17.8 s).
+
+`--ple-cache-mib MIB` (with `--ple-on-ssd`, Metal only; default 0, off) keeps n-gram rows read recently, from
+prompts and replies, in that many MiB of RAM and reads only the other rows of a lookup from SSD; a lookup whose
+rows are all cached reads nothing. Rows are evicted in CLOCK order. The cached bytes are the checkpoint's own, so
+replies are the same tokens. The rows (about 82% of the MiB) and their index are fixed arrays allocated at load,
+all counted in the memory budget beside the 3 GiB process reserve. Each PLE layer's table gets an even share,
+capped at the whole table and its index; a share too small for one row is refused at start-up. A full re-index of
+the cache (when evictions have left too many tombstones) holds its lock for about 0.37 s at 512 MiB.
+`tools/bench_ple_cache.py` times lookups with and without it on a synthetic table. On the 8-bit checkpoint with
+`--ssd-experts 60` at an 84 GiB budget, 512 MiB of cache served about 99% of decode lookups and the replies were the
+same tokens, but decode was not faster in either of two independent harnesses (one measured no difference, the
+other 17.1 vs 15.4 tok/s over three runs), so leave it off unless the SSD is the bottleneck.
 
 `--ssd-experts GIB` also leaves the routed experts (70.3 GiB) in the checkpoint and streams them into a GPU pool
 of that many GiB; with `--ple-on-ssd` as well, a 64 GB Mac can hold Flash Next (`python -m pip install

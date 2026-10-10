@@ -86,11 +86,15 @@ class ChatApp(RequestOptions):
         model_aliases: list[str] | None = None,
         use_proposer: bool = True,
         snapshot_dir: Path | None = None,
+        session_dir: Path | None = None,
         model_id: str = "",
         memory_fraction: float | None = None,
         memory_overhead_bytes: int | None = None,
         fit_context: bool = False,
         decode_share: float = 0.25,
+        background_warm: bool = False,
+        persist_turns: bool = False,
+        checkpoint_last_user: bool = False,
     ) -> None:
         # three candidate entries per conversation (history boundary, stable prefix, reply end)
         if checkpoint_slots is None:
@@ -114,6 +118,7 @@ class ChatApp(RequestOptions):
         # ``exact_sampling.Sampling`` fields used when a request names none (None: greedy)
         self.default_sampling = dict(default_sampling) if default_sampling else None
         self.max_snapshots = int(max_snapshots)
+        self.checkpoint_last_user = bool(checkpoint_last_user)
         factory = engine_factory or LaneEngine
         self.exact_mode = {
             "mode": "exact",
@@ -168,7 +173,10 @@ class ChatApp(RequestOptions):
             checkpoints=self.checkpoints,
             proposer_factory=(lambda: SuffixLookupProposer(min_match=self.min_match)) if use_proposer else None,
             snapshot_dir=snapshot_dir,
-            session_dir=None if snapshot_dir is None else Path(snapshot_dir).parent / "session-snapshots",
+            # saved conversations: beside the system blocks unless named (two servers whose snapshot directories
+            # are siblings would otherwise share one)
+            session_dir=(Path(session_dir) if session_dir is not None
+                         else None if snapshot_dir is None else Path(snapshot_dir).parent / "session-snapshots"),
             model_id=model_id,
             prompt_memory=self.prompt_memory,
             decode_share=decode_share,
@@ -179,6 +187,26 @@ class ChatApp(RequestOptions):
             session_dir, spill_limit = Path(self.scheduler.session_dir), self.spill_bytes
             self.checkpoints.on_evict = lambda entry: spill_conversation(entry, session_dir, model_id,
                                                                          limit_bytes=spill_limit)
+        # each finished turn's longest conversation checkpoint goes to disk behind the reply: a crash or kill -9 then
+        # loses at most the turn being written, not every conversation since the last graceful stop
+        self.persist: Any = None
+        if persist_turns and self.checkpoints is not None and self.scheduler.session_dir and model_id:
+            from tensorfold.server.persist import TurnWriter
+
+            self.persist = TurnWriter(Path(self.scheduler.session_dir), model_id,
+                                      limit_bytes=self.spill_bytes or 10 * 1024**3)
+            self.scheduler.persist = self.persist
+            if self.prompt_memory is not None:
+                writer = self.persist
+                self.prompt_memory.pending_bytes = lambda: writer.inflight_bytes
+                self.prompt_memory.wait_pending = writer.wait_idle
+        elif persist_turns:
+            why = ("the prompt cache is off" if self.checkpoints is None
+                   else "snapshots are off (--snapshot-dir none)" if not self.scheduler.session_dir
+                   else "no snapshot key")
+            print(f"[tensorfold] warning: --persist-turns does nothing here: {why}", flush=True)
+        if checkpoint_last_user and self.checkpoints is None:
+            print("[tensorfold] warning: --checkpoint-last-user does nothing here: the prompt cache is off", flush=True)
         loaded_count = 0
         if snapshot_dir is not None and self.checkpoints is not None:
             from tensorfold.engine.prefix_snapshots import load_snapshots
@@ -194,8 +222,9 @@ class ChatApp(RequestOptions):
             del loaded
         self.warming = False
         self.scheduler.start()
-        if snapshot_dir is not None and self.checkpoints is not None and not loaded_count:
-            # only when these kernels have no block yet: a warmed block is pinned after the loaded ones
+        if background_warm and snapshot_dir is not None and self.checkpoints is not None and not loaded_count:
+            # only when these kernels have no block yet: a warmed block is pinned after the loaded ones. Opt-in: on
+            # a large model it runs for minutes and every foreground turn meanwhile waits for one of its chunks
             self._warm_known_blocks(snapshot_dir, model_id)
 
     def render(
@@ -236,6 +265,27 @@ class ChatApp(RequestOptions):
             return 0
         shared = longest_common_prefix(prompt_ids, other)
         return shared if shared >= 512 else 0
+
+    def last_user_start(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        prompt_ids: list[int], history_len: int, thinking: bool | None = None,
+    ) -> int:
+        """Where the last user message starts in ``prompt_ids`` (0: first message, no user, or not a clean prefix)."""
+
+        last = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=0)
+        if last <= 0:
+            return 0
+        effort = (getattr(_REQUEST, "sampling", None) or {}).get("reasoning_effort", self.reasoning_effort)
+        try:
+            with self.tokenizer_lock:
+                before = render_prompt_ids(self.tokenizer, messages[:last], tools=tools,
+                                           enable_thinking=self.enable_thinking if thinking is None else bool(thinking),
+                                           reasoning_effort=effort, add_generation_prompt=False,
+                                           late_system=self.late_system)
+        except Exception:  # noqa: BLE001 - a template quirk must not fail the request
+            return 0
+        n = len(before)
+        return n if 0 < n < history_len and prompt_ids[:n] == before else 0
 
     def _warm_known_blocks(self, snapshot_dir: Path, model_id: str) -> None:
         """Compute the newest system block saved by other kernels in the background, a prompt chunk a job."""
@@ -374,6 +424,9 @@ class ChatApp(RequestOptions):
                 )
             limit = min(limit, room)
         system_len = 0 if prompt is not None or rendered.vision is not None else self.system_prefix_len(messages, tools, prompt_ids, thinking=thinking)
+        last_user_len = (self.last_user_start(messages, tools, prompt_ids, history_len, thinking=thinking)
+                         if self.checkpoint_last_user and history_len and prompt is None and rendered.vision is None
+                         else 0)
         spec = self._resolve_sampling(fields, temperature, prompt_ids)
         drafts = self.use_proposer and fields.get("draft", True) is not False
 
@@ -384,6 +437,7 @@ class ChatApp(RequestOptions):
                 max_tokens=limit,
                 temperature=float(temperature),
                 history_len=history_len,
+                last_user_len=last_user_len,
                 # Snapshot before the system block ends to retain reusable prefixes when session-specific tails differ.
                 shared_prefix_lens=tuple(n for n in (system_len - 2048, system_len - 512, system_len)
                                          if n >= 512) if system_len else (),
@@ -579,15 +633,23 @@ class ChatApp(RequestOptions):
     def close(self) -> None:
         self.scheduler.on_stop = self.save_sessions    # saved by the scheduler thread, which owns the arrays
         self.scheduler.stop(timeout=120.0)
+        if self.persist is not None:
+            self.persist.stop(timeout=60.0)            # drained in save_sessions already; a no-op then
 
     def save_sessions(self) -> int:
         """At shutdown, the most recent conversations' checkpoints to disk (read back on demand)."""
 
+        if self.persist is not None:
+            started = time.perf_counter()
+            drained = self.persist.stop(timeout=60.0)          # the queued turns first; the saves below skip them
+            print(f"[tensorfold] turn checkpoint writer {'drained' if drained else 'still writing'} in "
+                  f"{time.perf_counter() - started:.1f}s", flush=True)
         if self.scheduler.session_dir is None or self.checkpoints is None:
             return 0
         directory, model = Path(self.scheduler.session_dir), self.scheduler.model_id
-        if self.spill_bytes > 0:        # with spilling, the directory holds every conversation that fits its budget
-            saved = save_conversations(self.checkpoints, directory, model, keep=1 << 30, limit_bytes=self.spill_bytes)
-            prune_conversations(directory, model, self.spill_bytes)
+        limit = self.spill_bytes or (self.persist.limit_bytes if self.persist is not None else 0)
+        if limit > 0:        # spilled or persisted: the directory holds every conversation that fits its budget
+            saved = save_conversations(self.checkpoints, directory, model, keep=1 << 30, limit_bytes=limit)
+            prune_conversations(directory, model, limit)
             return saved
         return save_conversations(self.checkpoints, directory, model)

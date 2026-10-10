@@ -583,7 +583,8 @@ def test_a_saved_block_is_warmed_in_background_jobs_one_grid_chunk_each(tmp_path
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Scheduler, "submit", submit)
-        app = make_app(engine_factory=GridEngine, snapshot_dir=tmp_path, model_id="/models/fake|kernels=new")
+        app = make_app(engine_factory=GridEngine, snapshot_dir=tmp_path, model_id="/models/fake|kernels=new",
+                       background_warm=True)
         try:
             deadline = time.time() + 10
             while time.time() < deadline and not any(e.pinned for e in app.checkpoints._entries):
@@ -593,6 +594,44 @@ def test_a_saved_block_is_warmed_in_background_jobs_one_grid_chunk_each(tmp_path
     # grid points 4 and 8 of the 10-token block, each with one padding token, in background jobs; 8 is pinned
     assert seen == [(5, True), (9, True)]
     assert [len(e.tokens) for e in app.checkpoints._entries if e.pinned] == [8]
+
+
+def test_saved_blocks_of_other_kernels_are_not_warmed_unless_asked(tmp_path) -> None:
+    mx = pytest.importorskip("mlx.core")
+    from mlx_lm.models.cache import KVCache
+
+    from tensorfold.engine.prefill_plan import PrefillPlan
+    from tensorfold.engine.prefix_snapshots import save_snapshot
+    from tensorfold.server.scheduler import Scheduler
+
+    class GridEngine(FakeEngine):
+        prefill_plan = PrefillPlan(4)
+
+    kv = KVCache()
+    kv.update_and_fetch(mx.ones((1, 2, 10, 4)), mx.ones((1, 2, 10, 4)))
+    save_snapshot(tmp_path, "/models/fake|kernels=old", list(range(5, 15)), [kv])
+    seen: list[int] = []
+    real = Scheduler.submit
+
+    def submit(self: Any, job: Any) -> None:
+        seen.append(len(job.prompt_ids))
+        real(self, job)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Scheduler, "submit", submit)
+        app = make_app(engine_factory=GridEngine, snapshot_dir=tmp_path, model_id="/models/fake|kernels=new")
+        try:
+            time.sleep(0.2)
+            assert app.warming is False and seen == [] and len(app.checkpoints) == 0
+        finally:
+            app.scheduler.stop(timeout=5.0)
+
+
+def test_the_cli_leaves_background_warming_off_by_default() -> None:
+    from tensorfold import cli
+
+    assert cli.build_parser().parse_args(["serve", "m"]).background_warm is False
+    assert cli.build_parser().parse_args(["serve", "m", "--background-warm"]).background_warm is True
 
 
 def test_a_stored_state_off_the_grid_is_never_matched() -> None:

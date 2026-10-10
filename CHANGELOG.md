@@ -3,6 +3,34 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.2.0 (10 Oct 2026)
+
+Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
+SSD. Install with `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.2.0"`.
+
+- **Safe snapshot files.** Every saved system block and conversation is sealed with a crc32 checksum and checked
+  on load; a file whose bytes, header or length do not match is refused, removed and logged, and the next-longest
+  saved state is tried. Writes are flushed (`F_FULLFSYNC` on macOS) before the rename and the directory after it;
+  unfinished writes left by a crash are removed at start-up. The snapshot key now includes a fingerprint of the
+  weights (headers, sizes and sampled bytes of every tensor), so changed weights at the same path never reuse old
+  states; an edit confined to unsampled bytes is not detected. Snapshots written by 0.1.0 are not loaded.
+- **`--persist-turns`.** Writes each turn's conversation checkpoint to the session directory behind the reply, so
+  a crash or kill keeps it. When RAM has no room for a full host copy the checkpoint is streamed to disk in pieces
+  of at most 64 MiB. Queued bytes count against the memory budget; a follow-up that needs them waits for the write
+  instead of being refused. `/health` reports the writer's counters.
+- **`--checkpoint-last-user`.** Keeps one more state where the last user message starts, for clients that replace
+  a trailing reminder message every turn.
+- **`--session-dir`.** Names the conversation directory (default `session-snapshots` beside `--snapshot-dir`).
+- **`--background-warm`.** The background re-prefill of a system block saved under other kernel settings is now
+  opt-in; it slowed foreground turns for many minutes after an upgrade.
+- **Housekeeping.** A full disk removes this model's oldest saved conversations and retries once; states saved for
+  older weights of the same model go first when a directory is over budget; a superseded prefix is evicted before
+  others and a refused one is spilled to disk (ports of upstream fixes); `/health` counts write failures.
+- **`--ple-cache-mib N`** (with `--ple-on-ssd`, default off). An LRU-like (CLOCK) cache of n-gram rows in a fixed
+  arena counted in the memory budget; replies are the same tokens. `/health` reports its hits. On the 8-bit
+  checkpoint it served ~99% of decode lookups but did not make decode faster, so it stays off by default.
+- Measurements: see the Flash Next recipe (`docs/recipes/qwen3.8-flash-next.md`).
+
 ## 0.1.0 (10 Oct 2026, the-shop fork)
 
 First release of [the-shop/TensorFold](https://github.com/the-shop/TensorFold), a fork of

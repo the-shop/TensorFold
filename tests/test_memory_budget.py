@@ -269,7 +269,8 @@ def _serve_to_app(monkeypatch, tmp_path, argv, capsys):
     monkeypatch.setattr(hub, "is_repo_id", lambda model: False)
     monkeypatch.setattr(hub, "resolve", lambda *args, **kwargs: tmp_path)
     family = SimpleNamespace(title="fixture", model_type="fixture",
-                             package=SimpleNamespace(load=lambda *args, **kwargs: (object(), object())))
+                             package=SimpleNamespace(load=lambda *args, **kwargs: (object(), object()),
+                                                     ple_bytes=lambda path: 0))
     monkeypatch.setattr(families, "detect", lambda path: family)
     made = {}
 
@@ -315,6 +316,14 @@ def test_an_omitted_context_is_fitted_to_memory_and_the_banner_shows_the_window(
     assert "context: 32768" in out and "keep their prompt" not in out
     made, out = _serve_to_app(monkeypatch, tmp_path, ["--context", "131072"], capsys)
     assert "context: 131072" in out and "requests up to 61,440 tokens keep their prompt for the next turn" in out
+
+
+def test_the_ple_row_cache_is_held_outside_mlxs_share_of_the_budget(monkeypatch, tmp_path, capsys):
+    made, out = _serve_to_app(monkeypatch, tmp_path, ["--ple-on-ssd"], capsys)
+    assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES and "cached n-gram rows" not in out
+    made, out = _serve_to_app(monkeypatch, tmp_path, ["--ple-on-ssd", "--ple-cache-mib", "512"], capsys)
+    assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES + 512 * 2**20
+    assert "512.0 MiB of cached n-gram rows" in out
 
 
 def test_weights_past_the_budget_are_refused_before_loading(monkeypatch, tmp_path):

@@ -414,9 +414,11 @@ def test_the_flag_reaches_the_metal_loader(tmp_path, monkeypatch):
     assert qwen4_exp.load(tmp_path, ple_on_ssd=True) == ("model", "tokenizer")
     qwen4_exp.load(tmp_path)
     qwen4_exp.load(tmp_path, ssd_experts=24.0)
-    assert seen == [{"drafts": 0, "ple_on_ssd": True, "ssd_experts": None},
-                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": None},
-                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": 24.0}]
+    qwen4_exp.load(tmp_path, ple_on_ssd=True, ple_cache_mib=512)
+    assert seen == [{"drafts": 0, "ple_on_ssd": True, "ssd_experts": None, "ple_cache_mib": 0},
+                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": None, "ple_cache_mib": 0},
+                    {"drafts": 0, "ple_on_ssd": False, "ssd_experts": 24.0, "ple_cache_mib": 0},
+                    {"drafts": 0, "ple_on_ssd": True, "ssd_experts": None, "ple_cache_mib": 512}]
 
 
 def _fake_mlx(monkeypatch) -> None:

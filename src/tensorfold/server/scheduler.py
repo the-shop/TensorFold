@@ -25,6 +25,9 @@ class ChatJob:
     max_tokens: int
     temperature: float
     history_len: int = 0
+    # where the last user message starts (0: unknown or off): a client that replaces a trailing user message next turn
+    # (Pi's temporary tail) resumes from here, not from the history end (--checkpoint-last-user)
+    last_user_len: int = 0
     # Snapshot system-and-tools blocks for reuse across sessions; history boundaries already include session-specific text.
     shared_prefix_lens: tuple[int, ...] = ()
     # the request's proposer (suffix copies, a drafter model, tool-call structure); None: the engine's default
@@ -54,6 +57,7 @@ class ChatJob:
     stop_check: Callable[[list[int]], bool] | None = None
     call_gate: Any = None                   # tool_choice "required": the answer opens a tool call (LaneStream)
     vision: Any = None
+    persist_tokens: list[int] | None = None  # the longest conversation checkpoint its prefill kept (--persist-turns)
 
 
 class _JobQueue(queue.PriorityQueue):
@@ -115,8 +119,14 @@ class Scheduler(PromptFill):
         self.disk_blocks: Any = None
         self.session_blocks: Any = None
         if model_id and (snapshot_dir is not None or session_dir is not None):
-            from tensorfold.engine.prefix_snapshots import DiskBlocks
+            from tensorfold.engine.prefix_snapshots import DiskBlocks, clean_partials
+            from tensorfold.server.checkpoints import _size
 
+            for directory in (snapshot_dir, session_dir):
+                removed, freed = (0, 0) if directory is None else clean_partials(Path(directory))
+                if removed:
+                    print(f"[tensorfold] removed {removed} unfinished snapshot write(s), {_size(freed)}, in "
+                          f"{directory}", flush=True)
             if snapshot_dir is not None:
                 self.disk_blocks = DiskBlocks(Path(snapshot_dir), model_id)
             if session_dir is not None:
@@ -149,6 +159,9 @@ class Scheduler(PromptFill):
         self._released_at = 0            # ``starts`` when MLX's freed buffers were last handed back
         # Evaluate and save cache arrays on the scheduler thread that owns their streams during shutdown.
         self.on_stop: Callable[[], Any] | None = None
+        # ``persist.TurnWriter`` (--persist-turns): each finished turn's longest conversation checkpoint goes to disk
+        self.persist: Any = None
+
         self.stall_s = 120.0            # no round, start or finish while requests wait: dump stacks
         self.stall_prefill_s = 900.0    # the same while one prefill runs
         self._watchdog = threading.Thread(target=self._watch, name="tensorfold-watchdog", daemon=True)
@@ -390,32 +403,38 @@ class Scheduler(PromptFill):
         return self.admission.admits(len(job.prompt_ids), len(job.prompt_ids) + int(job.max_tokens), live)
 
     def _read_disk_block(self, prompt: list[int], usable: Any = None) -> None:
-        """Put the longest stored prefix ``usable`` accepts (system blocks, saved conversations) in the store."""
+        """Put the longest stored prefix ``usable`` accepts (system blocks, saved conversations) in the store; a file
+        refused on reading (corrupt, unreadable) makes way for the next-longest one."""
 
         if self.checkpoints is None or (self.disk_blocks is None and self.session_blocks is None):
             return
+        refused: set[Any] = set()
         try:
-            have = self.checkpoints.longest(prompt, usable)
-            found: Any = None
-            for blocks, pinned in ((self.disk_blocks, True), (self.session_blocks, False)):
-                hit = None if blocks is None else blocks.best(prompt, have if found is None else len(found[1]), usable)
-                if hit is not None:
-                    found = (hit[0], hit[1], blocks, pinned)
-            if found is None:
-                return
             from tensorfold.engine.prefix_snapshots import load_snapshot
 
-            started = time.perf_counter()
-            if self.prompt_memory is not None and not self.prompt_memory.allow_load(found[0].stat().st_size):
+            have = self.checkpoints.longest(prompt, usable)
+            for _ in range(8):                    # a few refusals at most; each one leaves the lookup
+                found: Any = None
+                for blocks, pinned in ((self.disk_blocks, True), (self.session_blocks, False)):
+                    hit = None if blocks is None else blocks.best(prompt, have if found is None else len(found[1]),
+                                                                  usable, skip=refused)
+                    if hit is not None:
+                        found = (hit[0], hit[1], blocks, pinned)
+                if found is None:
+                    return
+                started = time.perf_counter()
+                if self.prompt_memory is not None and not self.prompt_memory.allow_load(found[0].stat().st_size):
+                    return
+                loaded = load_snapshot(found[0], self.model_id)
+                if loaded is None:
+                    refused.add(found[0])
+                    continue
+                tokens, cache = loaded
+                self.checkpoints.insert(tokens, cache, last_prompt=tokens, pinned=found[3])
+                found[2].touch(tokens)
+                print(f"[tensorfold] read {'system-block' if found[3] else 'conversation'} snapshot "
+                      f"tokens={len(tokens)} from disk in {time.perf_counter() - started:.2f}s", flush=True)
                 return
-            loaded = load_snapshot(found[0], self.model_id)
-            if loaded is None:
-                return
-            tokens, cache = loaded
-            self.checkpoints.insert(tokens, cache, last_prompt=tokens, pinned=found[3])
-            found[2].touch(tokens)
-            print(f"[tensorfold] read {'system-block' if found[3] else 'conversation'} snapshot tokens={len(tokens)} "
-                  f"from disk in {time.perf_counter() - started:.2f}s", flush=True)
         except Exception as exc:  # noqa: BLE001 - a bad file costs a prefill, never the request
             print(f"[tensorfold] snapshot read failed: {type(exc).__name__}: {exc}", flush=True)
 
@@ -467,7 +486,11 @@ class Scheduler(PromptFill):
                     cached, cache, last_prompt = hit
                     if self.disk_blocks is not None and cached in shared_at:
                         self.disk_blocks.touch(job.prompt_ids[:cached])
+                    if self.persist is not None and cached not in shared_at:
+                        job.persist_tokens = list(job.prompt_ids[:cached])    # a longer kept checkpoint replaces it
                 chosen = choose_checkpoints(job.history_len, cached, last_prompt, job.prompt_ids)
+                if 0 < job.last_user_len < job.history_len:
+                    chosen.append(job.last_user_len)          # kept at its chunk start, like every checkpoint
                 checkpoints_at = sorted(at for at in {*(starts.floor(n) for n in chosen), *shared_at}
                                         if cached < at < len(job.prompt_ids))
             proposer = job.proposer
@@ -509,6 +532,8 @@ class Scheduler(PromptFill):
             self.checkpoints.insert(tokens, snapshot, last_prompt=job.prompt_ids, pinned=shared)
             if self.snapshot_dir is not None and shared:
                 self._persist(tokens, snapshot)
+            elif not shared and len(tokens) > len(job.persist_tokens or ()):
+                job.persist_tokens = list(tokens)
 
     def _persist(self, tokens: list[int], cache: list[Any]) -> None:
         """Write a system-block snapshot to disk once, so a restart does not lose it."""
@@ -537,7 +562,60 @@ class Scheduler(PromptFill):
         if stream is not None and stream in self.engine.streams:
             self.engine.streams.remove(stream)
         self.completed += 1
-        self._finish(job)
+        copying = self.persist is not None and bool(job.persist_tokens) and not job.background
+        if copying:
+            self.persist.copy_started()          # before the reply is out: /health never shows a gap before the queue
+        try:
+            self._finish(job)
+            self._persist_turn(job)
+        finally:
+            if copying:
+                self.persist.copy_done()
+
+    def _persist_turn(self, job: ChatJob) -> None:
+        """After the reply went out: copy the turn's longest conversation checkpoint to host memory here, on the thread
+        that owns its arrays, and queue it for the writer thread. Skipped when it is gone from the store, already on
+        disk or queued, or when memory has no room for the host copy beside what runs."""
+
+        writer, tokens = self.persist, job.persist_tokens
+        job.persist_tokens = None
+        if writer is None or not tokens or job.background or self.checkpoints is None:
+            return
+        try:
+            entry = self.checkpoints.get(tokens)
+            if entry is None or entry.pinned or writer.has(tokens):
+                return                   # gone, a system block (prefix-snapshots has it), or already written
+            memory = self.prompt_memory
+            # the copy's peak (BytesIO growth) beside this conversation's next turn, resuming from this checkpoint
+            from tensorfold.server.persist import ENCODE_PEAK
+
+            done = len(job.stream.context) if job.stream is not None else len(job.prompt_ids)
+            reply = int(job.max_tokens)
+            if memory is not None and memory.window:
+                reply = min(reply, max(0, memory.window - done))        # a reply never passes the context window
+            from tensorfold.engine.prefix_snapshots import encode_snapshot, stream_snapshot
+            from tensorfold.server.checkpoints import write_with_room
+
+            started = time.perf_counter()
+            if memory is None or memory.room_for(int(entry.nbytes * ENCODE_PEAK), tokens=done, reply=reply,
+                                                 current_cache=entry.cache):
+                payload = encode_snapshot(self.model_id, tokens, entry.cache)
+                if writer.submit(tokens, payload):
+                    print(f"[tensorfold] queued turn checkpoint tokens={len(tokens)} "
+                          f"({len(payload) / 1024**3:.2f} GiB, host copy in {time.perf_counter() - started:.2f}s)",
+                          flush=True)
+                return
+            # no room for a whole host copy: write the file here from the arrays, a bounded piece at a time; the
+            # writer thread seals, syncs and renames it
+            directory = writer.directory
+            partial = write_with_room(directory, self.model_id, entry.nbytes,
+                                      lambda: stream_snapshot(directory, self.model_id, tokens, entry.cache))
+            if partial is not None and writer.submit(tokens, partial=partial):
+                print(f"[tensorfold] streamed turn checkpoint tokens={len(tokens)} "
+                      f"({entry.nbytes / 1024**3:.2f} GiB) to disk in {time.perf_counter() - started:.2f}s "
+                      "(no memory for a host copy)", flush=True)
+        except Exception as exc:  # noqa: BLE001 - a failed copy costs a later prefill, never the request
+            print(f"[tensorfold] turn checkpoint copy failed: {type(exc).__name__}: {exc}", flush=True)
 
     @staticmethod
     def _finish(job: ChatJob) -> None:
