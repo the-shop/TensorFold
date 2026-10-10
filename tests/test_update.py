@@ -94,7 +94,7 @@ def test_update_installs_the_latest_tag_with_this_python(monkeypatch):
     monkeypatch.setattr(update.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="99.0.0\n", returncode=0))
     assert update.update() == 0
     assert commands == [[sys.executable, "-m", "pip", "install", "--upgrade",
-                         "git+https://github.com/ashhart/TensorFold.git@v99.0.0"]]
+                         "git+https://github.com/the-shop/TensorFold.git@v99.0.0"]]
 
 
 def test_check_only_and_current_install_nothing(monkeypatch, capsys):
@@ -147,7 +147,7 @@ def test_update_shows_whats_new_from_the_new_tag(monkeypatch, capsys):
     assert update.update() == 0
     out = capsys.readouterr().out
     assert f"What's new since {__version__}" in out and "Faster everything" in out
-    assert fetched == ["https://raw.githubusercontent.com/ashhart/TensorFold/v99.0.0/CHANGELOG.md"]
+    assert fetched == ["https://raw.githubusercontent.com/the-shop/TensorFold/v99.0.0/CHANGELOG.md"]
     assert update.SEEN.read_text() == "99.0.0"             # the first run after it stays quiet
 
 
