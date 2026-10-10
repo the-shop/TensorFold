@@ -3,12 +3,13 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
-## v0.1.0 (the-shop fork)
+## 0.1.0 (10 Oct 2026, the-shop fork)
 
 First release of [the-shop/TensorFold](https://github.com/the-shop/TensorFold), a fork of
 [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at release [v0.3.6.3](https://github.com/ashhart/TensorFold/tree/v0.3.6.3) (commit 1911880,
-29 Sep 2026, MIT). The fork versions itself with git
-tags from here on; the package still reports 0.3.6.3, the upstream base. Install with
+29 Sep 2026, MIT). The fork has its own version numbers from here on, starting at 0.1.0, with a git tag for each
+release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on upstream's SSD expert streaming
+(`--ssd-experts`, #17) and adds the items below. Install with
 `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"`.
 
 - **Qwen3.8 Flash Next 8-bit on M5.** The Metal path serves MLX affine 8-bit checkpoints (group 64, n-gram tables
@@ -16,8 +17,9 @@ tags from here on; the package still reports 0.3.6.3, the upstream base. Install
   through the lane matmul, per-module widths read off the checkpoint. `tools/convert_flash_next_q8.py` streams a BF16
   Hugging Face checkpoint into that layout under an MLX memory cap. 8-bit lane weights are read in place unless
   `TF_FLASH_TILE_WIDE=1`.
-- **Native expert-pool server (default).** With `--ssd-experts`, a native server in the host-sync extension answers
-  each layer's routing, keeps the LRU and reads misses on native threads, with no Python per MoE call.
+- **Native expert-pool server (default).** With upstream's `--ssd-experts`, a native server in the host-sync
+  extension answers each layer's routing, keeps the LRU and reads misses on native threads, with no Python per MoE
+  call.
   `TENSORFOLD_POOL_NATIVE=0` keeps the Python loop; `TENSORFOLD_POOL_THREADS` sets reader threads (default 8). At 40
   and 60 GiB pools it decodes 9-11% faster with drafts than the Python loop and prefills 6-8% faster.
 - **Opt-in, experimental:** decode prefetch (`TENSORFOLD_POOL_DECODE_PREFETCH=K`) and prompt seeding
