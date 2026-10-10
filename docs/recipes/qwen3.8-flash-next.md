@@ -76,8 +76,10 @@ You need:
 - Xcode Command Line Tools (`xcode-select --install`);
 - about 560 GB of free SSD: the 360 GB BF16 download plus the 194 GB 8-bit output.
 
-The converter, the SSD expert streaming and the native expert-pool server are in the-shop's fork of TensorFold,
-released as `v0.1.0` (or use `main` for the latest):
+SSD expert streaming (`--ssd-experts`) comes from upstream TensorFold 0.3.6
+([ashhart/TensorFold](https://github.com/ashhart/TensorFold), #17). The 8-bit Flash Next kernels and converter, the
+native expert-pool server, the opt-in prefetch, prompt seeding and expert pack, the short-prompt admission fix and
+failing a request on a pool error are in the-shop's fork, released as `v0.1.0` (or use `main` for the latest):
 
 ```bash
 git clone -b v0.1.0 https://github.com/the-shop/TensorFold.git && cd TensorFold
@@ -166,7 +168,7 @@ Decode and prefill in tok/s; load time in seconds (harness A / harness B):
 | 70 GiB | Python | 27.1 | 58.1 | 29.9 | 195 | 22.0 | 15.0 | 160 | 98% | 89 / 96 |
 
 - **Native vs Python loop:** at 40 and 60 GiB the native server decodes 9-11% faster with drafts (harness A first
-  runs +10% / +9%, harness B +11% / +11%) and prefills 6-8% faster; at 70 GiB the gain is 2-6%.
+  runs +10% / +9%, harness B +11% / +11%) and prefills 6-8% faster; at 70 GiB decode +2-6%, prefill +8-11%.
 - **Pool size:** on new prompts, the native server at 60 GiB decodes 22% (harness B) to 24% (harness A) faster than
   at 40 GiB. A rerun of the same prompt mostly hits the pool at 60 GiB, so harness A repeats reach 58.8 tok/s
   against 25.0 at 40 GiB. A 70 GiB pool gives no gain over 60 GiB (harness B drafts 22.5 against 23.0), prefills 10-15%
@@ -193,7 +195,8 @@ With both flags off (the default), a native server in the host-sync extension an
 own thread waits for the GPU, keeps the LRU and reads misses on native threads, with no Python per layer call.
 - **`TENSORFOLD_POOL_NATIVE=0`** keeps the Python serve loop. Both loops keep the same experts in the same slots.
 - **`TENSORFOLD_POOL_THREADS=N`** (default 8) sets the reader threads of either loop. 16 threads raised prefill
-  4-11% at 40 and 60 GiB but not at 70, and kept decode within 4% either way, so the default stays 8.
+  4-9% at 40 and 60 GiB but not at 70, and kept decode within ±3.5%, except harness B serial at 40 GiB (-10%), so
+  the default stays 8.
 - **Expert pack (opt-in, experimental, off by default):** `python tools/pack_experts.py MODEL_DIR` writes
   `MODEL_DIR/experts.pack` and its index: each expert's parts back to back in one 16 KiB-aligned record, so the
   native server reads a miss with one `pread` instead of nine. It takes as much disk as the experts. It is used only
