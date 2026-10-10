@@ -1,7 +1,7 @@
 # Contributor rules for this fork
 
-This repository is the-shop's fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (Python engine,
-MIT). These rules apply to every contributor and every automated tool working in it. `AGENTS.md` is a link to this
+This repository is the-shop's fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) v0.3.6.3 (Python
+engine, MIT). These rules apply to every contributor and every automated tool working in it. `AGENTS.md` is a link to this
 file.
 
 ## Releases

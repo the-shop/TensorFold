@@ -77,7 +77,7 @@ You need:
 - about 560 GB of free SSD: the 360 GB BF16 download plus the 194 GB 8-bit output.
 
 SSD expert streaming (`--ssd-experts`) comes from upstream TensorFold 0.3.6
-([ashhart/TensorFold](https://github.com/ashhart/TensorFold), #17). The 8-bit Flash Next kernels and converter, the
+([ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)). The 8-bit Flash Next kernels and converter, the
 native expert-pool server, the opt-in prefetch, prompt seeding and expert pack, the short-prompt admission fix and
 failing a request on a pool error are in the-shop's fork, released as `v0.1.0` (or use `main` for the latest):
 
@@ -127,7 +127,8 @@ The pool and the context window share the memory budget:
 
 A longer prompt is served, but it is prefilled again on its next turn.
 
-- **Largest pool:** a 70 GiB pool (86 GiB limit) runs, but it gains nothing over 60 GiB and needs 10 GiB more. An
+- **Largest pool:** a 70 GiB pool (86 GiB limit) runs; against 60 GiB (native) it decodes -2% (harness B) / +5%
+  (harness A), prefills 9-15% lower, and needs 10 GiB more. An
   80 GiB pool on a 96 GiB limit made macOS swap during load, and a 32K context did not fit either. 60 GiB is the
   recommended pool on a 128 GB Mac.
 
@@ -171,8 +172,8 @@ Decode and prefill in tok/s; load time in seconds (harness A / harness B):
   runs +10% / +9%, harness B +11% / +11%) and prefills 6-8% faster; at 70 GiB decode +2-6%, prefill +8-11%.
 - **Pool size:** on new prompts, the native server at 60 GiB decodes 22% (harness B) to 24% (harness A) faster than
   at 40 GiB. A rerun of the same prompt mostly hits the pool at 60 GiB, so harness A repeats reach 58.8 tok/s
-  against 25.0 at 40 GiB. A 70 GiB pool gives no gain over 60 GiB (harness B drafts 22.5 against 23.0), prefills 9-15%
-  slower, and needs 10 GiB more.
+  against 25.0 at 40 GiB. A 70 GiB pool (native) decodes -2% (harness B) / +5% (harness A) against 60 GiB, prefills
+  9-15% slower, and needs 10 GiB more.
 - **Hit rate:** 90% of expert reads at 40 GiB, 98% at 60 and 70 GiB. Expert and n-gram reads use `F_NOCACHE`, so
   the page cache does not raise these rates.
 - **Output:** output tokens were identical across all 12 measured configurations (the six above, 16 reader threads
@@ -203,7 +204,8 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
   with `TENSORFOLD_EXPERT_PACK=1` (`MODEL_DIR/experts.pack`) or `TENSORFOLD_EXPERT_PACK=PATH`, and a pack that does
   not match the checkpoint (layout, each file's size, inode and modification time, a sample of the expert bytes) is
   an error: rebuild it after any change to the checkpoint files, a copy included. It was slower at 40 and 60 GiB
-  (decode 16-23% lower, prefill about 16-21% lower) and within 0-6% at 70 GiB. `/health` reports `packed`, `preads`
+  (decode 16-23% lower, prefill about 16-21% lower; the 40 GiB harness-A pack values come from an earlier
+  window the same day) and within 0-6% at 70 GiB. `/health` reports `packed`, `preads`
   and `threads` with the pool's hits and misses.
 - `python tools/bench_pool_io.py MODEL_DIR --cold` times miss reads for the Python loop, the native server and
   the pack at 4, 8, 16 and 32 threads, on experts none of whose bytes are in the page cache.

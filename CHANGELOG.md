@@ -9,7 +9,7 @@ First release of [the-shop/TensorFold](https://github.com/the-shop/TensorFold), 
 [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at release [v0.3.6.3](https://github.com/ashhart/TensorFold/tree/v0.3.6.3) (commit 1911880,
 29 Sep 2026, MIT). The fork has its own version numbers from here on, starting at 0.1.0, with a git tag for each
 release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on upstream's SSD expert streaming
-(`--ssd-experts`, #17) and adds the items below. Install with
+(`--ssd-experts`, [ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)) and adds the items below. Install with
 `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"`.
 
 - **Qwen3.8 Flash Next 8-bit on M5.** The Metal path serves MLX affine 8-bit checkpoints (group 64, n-gram tables
@@ -135,7 +135,7 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
 - **Bigger models on smaller Macs.** `--ple-on-ssd` reads Flash Next's n-gram tables from disk, so a 128 GB Mac holds
   it (#16). `--ssd-experts GIB` streams routed experts from the checkpoint into a GPU pool of that size, so Flash Next
   fits a 64 GB Mac and GLM a 128 GB one. Replies are the resident model's tokens; decode runs at 0.31-0.39x resident
-  speed for Flash Next and 0.13-0.17x for GLM (measured on an M3 Ultra; `pip install "tensorfold[ssd]"` first) (#17).
+  speed for Flash Next and 0.13-0.17x for GLM (measured on an M3 Ultra; `pip install "tensorfold[ssd]"` first) ([ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)).
 - **EXL3 checkpoints on CUDA (experimental):** Qwen3.8-27B and Flash Next packs from turboderp, exact on the lanes.
   Decode runs 1.6-3.6x vLLM with MTP; prompt processing is about half the MLX checkpoints' speed for now, and the
   fix is next. Thanks to @vcruz305 (#42).
