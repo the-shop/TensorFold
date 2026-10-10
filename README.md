@@ -1,12 +1,19 @@
 # TensorFold
 
+> Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at 0.3.6.3 (MIT). Adds Qwen3.8 Flash Next MLX
+> 8-bit checkpoints on M5 with SSD expert streaming and a native expert-pool server; see
+> [docs/recipes/qwen3.8-flash-next.md](docs/recipes/qwen3.8-flash-next.md). Upstream's current engine is Zig
+> (Apache-2.0); this fork is the Python engine.
+
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 
 ```bash
-python -m pip install git+https://github.com/ashhart/TensorFold.git
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"
 tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
 ```
+
+The `ssd` extra builds the SSD expert pool's host side (`--ssd-experts`); drop it if you don't stream experts.
 
 Use `http://127.0.0.1:8080/v1` as the client base URL and the model ID from `/v1/models`.
 Python 3.11 or newer is required, and MLX 0.32.2 or newer on a Mac (pip installs it). See the [runbook](RUNBOOK.md)

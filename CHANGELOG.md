@@ -3,6 +3,34 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## v0.1.0 (the-shop fork)
+
+First release of [the-shop/TensorFold](https://github.com/the-shop/TensorFold), a fork of
+[ashhart/TensorFold](https://github.com/ashhart/TensorFold) at 0.3.6.3 (MIT). The fork versions itself with git
+tags from here on; the package still reports 0.3.6.3, the upstream base. Install with
+`pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.1.0"`.
+
+- **Qwen3.8 Flash Next 8-bit on M5.** The Metal path serves MLX affine 8-bit checkpoints (group 64, n-gram tables
+  group 32): 8-bit expert kernels (resident and SSD slot pool), token embedding and n-gram rows, hyper-connections
+  through the lane matmul, per-module widths read off the checkpoint. `tools/convert_flash_next_q8.py` streams a BF16
+  Hugging Face checkpoint into that layout under an MLX memory cap. 8-bit lane weights are read in place unless
+  `TF_FLASH_TILE_WIDE=1`.
+- **Native expert-pool server (default).** With `--ssd-experts`, a native server in the host-sync extension answers
+  each layer's routing, keeps the LRU and reads misses on native threads, with no Python per MoE call.
+  `TENSORFOLD_POOL_NATIVE=0` keeps the Python loop; `TENSORFOLD_POOL_THREADS` sets reader threads (default 8). At 40
+  and 60 GiB pools it decodes 9-11% faster with drafts than the Python loop and prefills 6-8% faster.
+- **Opt-in, experimental:** decode prefetch (`TENSORFOLD_POOL_DECODE_PREFETCH=K`) and prompt seeding
+  (`TENSORFOLD_POOL_PROMPT_SEED=1`), which run the Python loop; a contiguous expert pack (`tools/pack_experts.py`,
+  `TENSORFOLD_EXPERT_PACK`), checked against the checkpoint's files and bytes, slower at 40/60 GiB and within 0-6% at
+  70 GiB. `tools/bench_pool_io.py` times miss reads.
+- **Failures surface.** A failed expert-pool call (timeout, bad id, full pool, failed read, or a call released at
+  close) now fails the request instead of returning a token computed on stale slots; `/health` reports pool hits,
+  misses, bytes read and the error.
+- **Short prompts on a tight budget.** A prompt of at most the fused-row count no longer pins rollback rows that
+  admission could not reclaim, which refused it and every request after it.
+- **Recipe:** [Running it on a 128 GB M5 Mac](docs/recipes/qwen3.8-flash-next.md#running-it-on-a-128-gb-m5-mac),
+  with a 60 GiB pool recommended (40 GiB as the lighter option) and measured results for 40, 60 and 70 GiB pools.
+
 ## 0.3.6.3 (29 Sep 2026)
 
 - **Images in, on Macs and Sparks.** `--vision` lets Qwen3.8-27B read up to four images a request, as data URLs or,
