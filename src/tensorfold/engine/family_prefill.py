@@ -6,7 +6,7 @@ from functools import partial
 import time
 from typing import Any, Iterator, Sequence
 
-from tensorfold.engine.family_common import cache_arrays, drop_spares
+from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares
 from tensorfold.engine.prefill_plan import PromptChunks
 
 
@@ -68,6 +68,7 @@ class FamilyPrefill:
             # an earlier chunk is read only through its caches (and a taps head's taps): MLX skips its last layer
             reads_last = n + 1 == len(chunks) or (drafting and getattr(self.model, "draft_reads_hidden", True))
             mx.eval(*((last,) if reads_last else ()), *cache_arrays(cache))
+            check_expert_stream(self.model)
             self._prefill_at = end
             if self.prefill_guard is not None:
                 self.prefill_guard.after_chunk(cache, len(chunk))
@@ -128,7 +129,9 @@ class FamilyPrefill:
                 stream.history_checkpoints.append((list(prompt[:at]), drop_spares(self.copy_single_cache(work))))
             raise
         first = self._family_first(stream, work, hidden, cached_tokens, self._fed_rows - 1)
-        self._family_commit_first(stream, int(first.item()) if hasattr(first, "item") else int(first))
+        first = int(first.item()) if hasattr(first, "item") else int(first)
+        check_expert_stream(self.model)
+        self._family_commit_first(stream, first)
         return work
 
     def _family_first(self, stream: Any, work: list[Any], hidden: Any, cached_tokens: int, row: int) -> Any:

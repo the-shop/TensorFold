@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Any, Callable, Iterator, Sequence
 
+from tensorfold.engine.family_common import check_expert_stream
 from tensorfold.engine.family_prefill import drain
 from tensorfold.engine.lane_family import FamilyRounds
 from tensorfold.engine.prefill_plan import PrefillPlan, PromptChunks
@@ -404,9 +405,12 @@ class LaneEngine(FamilyRounds):
         return out
 
     def step(self) -> dict[str, list[int]]:
-        """One round for every live stream. Returns newly committed tokens per stream."""
+        """One round for every live stream. Returns newly committed tokens per stream; raises instead when the
+        SSD expert pool failed a call, so tokens from stale expert slots never reach a request."""
 
-        return self._family_step()
+        landed = self._family_step()
+        check_expert_stream(self.model)
+        return landed
 
     def run(self, on_tokens: Callable[[str, list[int]], None] | None = None) -> None:
         while self.active_count:
