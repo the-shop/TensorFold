@@ -34,6 +34,12 @@ GitHub has the full notes and the measurements behind them.
   [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) motivated the breakdown, and
   [oMLX](https://github.com/jundot/omlx) (Apache-2.0) GPU keep-warm and overlap observations were consulted while
   scoping it (no idle probe ships here).
+- **Steady KV pricing for Flash Next's sparse indexer.** Index keys and pooled blocks are priced per allocated
+  position, not per valid token, so one short request no longer inflates the admission profile and evicts or
+  refuses later long prompts (measured on the 8-bit model: after one 15-token request, the old pricing projected a
+  69,967-token prompt 4.03 GiB higher, 2.06 GB over the MLX budget, so it was refused; now it is served). Ported from upstream
+  [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (Apache-2.0; see
+  THIRD_PARTY_NOTICES.md). At 84 GiB the startup still picks 2,048-token prompt chunks.
 
 ## 0.2.0 (10 Oct 2026)
 
