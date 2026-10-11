@@ -58,11 +58,10 @@ class FlashNext:
             # TF_FLASH_DRAFT_VOCAB=0 scores the full vocabulary; TF_FLASH_QUEUED=0 reads each chained draft immediately.
             self._draft_ids = self._draft_head = None
             if os.environ.get("TF_FLASH_DRAFT_VOCAB", "1") != "0":
-                from tensorfold.families.qwen4_exp.draft_head import cut_head, draft_ids
+                from tensorfold.families.qwen4_exp.draft_head import draft_head_for
 
-                ids = draft_ids()
-                self._draft_ids = mx.array(ids)
-                self._draft_head = cut_head(model.lm_head, ids)
+                ids, self._draft_head = draft_head_for(model.lm_head, self.args.vocab_size)
+                self._draft_ids = None if ids is None else mx.array(ids)
             self.queued_chains = os.environ.get("TF_FLASH_QUEUED", "1") != "0"
             self.mtp_step_ms = self._time_mtp_step()
 
@@ -381,8 +380,11 @@ class FlashNext:
             return self.hidden(tokens[0], caches[0])
         if len(rows) > 64 or sum(rows) > self.rows_per_call or self.fused is None:
             raise ValueError(f"hidden_multi: at most 64 streams and {self.rows_per_call} rows in all")
-        h = embed.embed_rows(np.concatenate(tokens, axis=1).reshape(-1), self.model.model.embed_tokens,
-                             tile=self.args.hc_count)
+        from tensorfold.families.qwen4_exp.model import check_ids
+
+        flat = np.concatenate(tokens, axis=1).reshape(-1)
+        check_ids(flat, self.args.vocab_size)
+        h = embed.embed_rows(flat, self.model.model.embed_tokens, tile=self.args.hc_count)
         out = self.fused.run_multi(h, tokens, [c[: self.layer_count] for c in caches], rows)
         self._streams = self.fused.last_streams
         return out

@@ -1,0 +1,157 @@
+"""Prompts with token ids past the model's embedding are refused (HTTP 400) before any work; a load-time warning names the gap."""
+
+import types
+
+import pytest
+
+from tensorfold.server.app import model_vocab, warn_vocab_mismatch
+from tensorfold.server.http import RequestError
+from tests.test_lane_server import FakeTokenizer, make_app
+from tests.test_server_openai_compat import post_json, serve_fake
+
+
+def _ids(app, text):
+    return app.render([{"role": "user", "content": text}])[0]
+
+
+def test_out_of_vocab_prompt_is_refused_before_submission(monkeypatch):
+    app = make_app()
+    try:
+        app.model_vocab = max(_ids(app, "ab")) + 1
+        assert max(_ids(app, "abw")) >= app.model_vocab
+        monkeypatch.setattr(app.scheduler, "submit", lambda job: pytest.fail("job submitted"))
+        with pytest.raises(RequestError, match=rf"token id {max(_ids(app, 'abw'))}.*vocabulary of {app.model_vocab}"):
+            app.chat([{"role": "user", "content": "abw"}], max_tokens=2)
+        assert not app.engine.prefill_calls
+    finally:
+        app.close()
+
+
+def test_http_out_of_vocab_is_400_and_next_request_works():
+    app = make_app()
+    app.model_vocab = max(_ids(app, "ab")) + 1
+    server = serve_fake(app)
+    try:
+        for stream in (False, True):
+            status, body = post_json(server, "/v1/chat/completions",
+                                     {"messages": [{"role": "user", "content": "abw"}], "max_tokens": 2,
+                                      "stream": stream})
+            # a stream has sent its headers already: the refusal is its invalid_request_error event, as for any
+            # other RequestError (context length)
+            assert status == (200 if stream else 400) and "outside this model's vocabulary" in body
+            assert "invalid_request_error" in body
+        assert not app.engine.prefill_calls
+        status, body = post_json(server, "/v1/chat/completions",
+                                 {"messages": [{"role": "user", "content": "ab"}], "max_tokens": 2})
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        app.close()
+
+
+def test_model_vocab_reads_args():
+    assert model_vocab(None) == 0
+    assert model_vocab(types.SimpleNamespace(args=types.SimpleNamespace(vocab_size=248320))) == 248320
+
+
+def test_load_warning_only_when_tokenizer_exceeds_vocab(capsys):
+    class Sized(FakeTokenizer):
+        def __len__(self):
+            return 248077
+
+    warn_vocab_mismatch(Sized(), 248320)
+    warn_vocab_mismatch(Sized(), 0)
+    assert capsys.readouterr().out == ""
+    warn_vocab_mismatch(Sized(), 65536)
+    out = capsys.readouterr().out
+    assert "warning" in out and "248,077" in out and "65,536" in out and "HTTP 400" in out
+
+    class Wrapper:                                  # mlx-lm's TokenizerWrapper: no len(), vocab_size without added
+        vocab_size = 248044
+        _tokenizer = Sized()
+
+    warn_vocab_mismatch(Wrapper(), 65536)
+    assert "248,077" in capsys.readouterr().out
+
+
+def test_probe_tokens_leave_out_ids_past_the_vocab():
+    from tensorfold.server.prompt_memory import probe_tokens
+
+    tok = types.SimpleNamespace(encode=lambda text, add_special_tokens: [5, 70000, 9, 248045])
+    assert probe_tokens(tok) == [5, 70000, 9, 248045]
+    assert probe_tokens(tok, 65536) == [5, 9]
+
+
+def test_copied_drafts_stop_before_an_id_past_the_vocab():
+    from tensorfold.engine.lane_family import FamilyRounds
+
+    rounds = object.__new__(FamilyRounds)
+    rounds.model = types.SimpleNamespace(args=types.SimpleNamespace(vocab_size=100))
+    rounds.max_copy = 8
+
+    def stream(copied):
+        proposer = types.SimpleNamespace(propose=lambda context, n: copied, last_match=9)
+        return types.SimpleNamespace(proposer=proposer, force=[], context=[1, 2], draft_room=9)
+
+    assert rounds._copy_proposal(stream([5, 6, 7, 8])) == [5, 6, 7, 8]
+    assert rounds._copy_proposal(stream([5, 6, 7, 248045, 8])) == [5, 6, 7]
+    assert rounds._copy_proposal(stream([5, 248045, 7])) == []          # under two tokens: no copy
+    rounds.model = None                                                  # no vocabulary known: unchanged
+    assert rounds._copy_proposal(stream([5, 6, 248045])) == [5, 6, 248045]
+
+
+@pytest.mark.parametrize("vocab", [100, None])
+def test_copied_drafts_stop_before_a_negative_id(vocab):
+    from tensorfold.engine.lane_family import FamilyRounds
+
+    rounds = object.__new__(FamilyRounds)
+    rounds.model = None if vocab is None else types.SimpleNamespace(args=types.SimpleNamespace(vocab_size=vocab))
+    rounds.max_copy = 8
+
+    def stream(copied):
+        proposer = types.SimpleNamespace(propose=lambda context, n: copied, last_match=9)
+        return types.SimpleNamespace(proposer=proposer, force=[], context=[1, 2], draft_room=9)
+
+    assert rounds._copy_proposal(stream([5, 6, -1, 7])) == [5, 6]
+    assert rounds._copy_proposal(stream([-3, 5, 6])) == []
+    assert rounds._copy_proposal(stream([5, 6, 7])) == [5, 6, 7]
+
+
+def test_synthetic_probe_ids_stay_inside_the_vocab():
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    from tensorfold.engine import prefill_step
+
+    fed = []
+
+    class Engine:
+        model = types.SimpleNamespace()
+
+        def prefill_prefix(self, tokens, cache=None, cached_tokens=0):
+            fed.append(list(tokens))
+            kv = KVCache()
+            kv.update_and_fetch(mx.zeros((1, 1, len(tokens), 8)), mx.zeros((1, 1, len(tokens), 8)))
+            return [kv]
+
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [], vocab=97)
+    assert len(fed[-1]) == 256 + 64 and max(fed[-1]) < 97 and min(fed[-1]) >= 0
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [])        # no vocabulary known: as before
+    assert fed[-1] == [1000 + i for i in range(256 + 64)]
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [], vocab=248320)
+    assert fed[-1] == [1000 + i for i in range(256 + 64)]                     # a real vocabulary: unchanged ids
+
+
+def test_admission_probe_synthetic_ids_stay_inside_the_vocab():
+    from tests.test_prompt_memory import ProbeEngine, Runtime, controller
+
+    runtime = Runtime()
+    memory = controller(runtime=runtime)
+    engine = ProbeEngine(runtime)
+    memory.profile_probe(engine, None, 97)
+    assert len(engine.fed) == 256 + 64 and max(engine.fed) < 97 and min(engine.fed) >= 0
+    memory.profile_probe(engine)
+    assert engine.fed == [1000 + i for i in range(256 + 64)]
+    memory.sized(engine, lambda: "admission", None, 97)
+    assert max(engine.fed) < 97

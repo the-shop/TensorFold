@@ -8,8 +8,17 @@ from typing import Any, Sequence
 CONTEXT_FLOOR = 131072
 
 
-def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence[int], window: int = 0) -> int:
-    """Measure one chunk on the smallest step, then take the largest step whose chunk and the context floor fit."""
+def synthetic_probe(count: int, vocab: int = 0) -> list[int]:
+    """Probe ids when no real text is at hand: 1000, 1001, ... (wrapped into ``vocab``, 0: no limit, so a small
+    embedding is never read past its table)."""
+
+    return [(1000 + i) % vocab if vocab else 1000 + i for i in range(count)]
+
+
+def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence[int], window: int = 0,
+           vocab: int = 0) -> int:
+    """Measure one chunk on the smallest step, then take the largest step whose chunk and the context floor fit;
+    ``vocab`` (0: unknown) keeps the synthetic probe inside the model's embedding."""
 
     import mlx.core as mx
 
@@ -21,7 +30,7 @@ def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence
     if len(steps) == 1:
         return small
     engine = make_engine(small)
-    text = [int(t) for t in tokens] or [1000 + i for i in range(small + 64)]
+    text = [int(t) for t in tokens] or synthetic_probe(small + 64, vocab)
     probe = (text * (-(-(small + 64) // len(text))))[:small + 64]
     tighten = getattr(engine.model, "tighten_prefill", None)
     while True:
@@ -44,4 +53,4 @@ def choose(make_engine: Any, steps: Sequence[int], budget: int, tokens: Sequence
             return small
 
 
-__all__ = ["CONTEXT_FLOOR", "choose"]
+__all__ = ["CONTEXT_FLOOR", "choose", "synthetic_probe"]

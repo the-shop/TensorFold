@@ -29,10 +29,11 @@ def _close(a, b, tol=2e-2):
     assert err <= tol * max(scale, 1e-3), (err, scale)
 
 
+@pytest.mark.parametrize("width", [640, 128])     # 128: expert_down's narrow variant (resident and pool)
 @pytest.mark.parametrize("rows", [1, 3])
-def test_expert_kernels_q8(rows):
+def test_expert_kernels_q8(rows, width):
     keys = mx.random.split(mx.random.key(7), 8)
-    E, D, N, K = 64, 512, 640, 4
+    E, D, N, K = 64, 512, width, 4
     _, g = _q((E, N, D), keys[0])
     _, u = _q((E, N, D), keys[1])
     _, dn = _q((E, D, N), keys[2])
@@ -56,7 +57,9 @@ def test_expert_kernels_q8(rows):
                 wg, wu, wd = (mx.dequantize(*t, group_size=64, bits=8) for t in (sg, su, sd))
             gv = (x[r:r + 1].astype(mx.float32) @ wg.T.astype(mx.float32))
             uv = (x[r:r + 1].astype(mx.float32) @ wu.T.astype(mx.float32))
-            a = nn.silu(gv) * uv
+            # the kernel's roundings (bf16(SiLU(bf16(gate)) * bf16(up))): an unrounded reference misses by ~2% at N 128
+            bf = lambda t: t.astype(mx.bfloat16).astype(mx.float32)  # noqa: E731
+            a = bf(nn.silu(bf(gv)) * bf(uv))
             _close(act[r, k][None], a)
             _close(y[r, k][None], act[r, k][None].astype(mx.float32) @ wd.T.astype(mx.float32))
 

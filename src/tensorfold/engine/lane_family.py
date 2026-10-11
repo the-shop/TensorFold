@@ -150,6 +150,11 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
                                                                                  stream.draft_room - 1))]
         except Exception:  # noqa: BLE001 - a proposer must never break a stream
             return []
+        vocab = int(getattr(getattr(self.model, "args", None), "vocab_size", 0) or 0)
+        # an id the embedding lacks (a tool call's text past it, or negative): the copy stops there
+        cut = next((i for i, t in enumerate(copied) if t < 0 or (vocab and t >= vocab)), None)
+        if cut is not None:
+            copied = copied[:cut]
         need = self.enter_match if min_match is None else min_match
         if len(copied) < 2 or int(getattr(stream.proposer, "last_match", 0) or 0) < need:
             return []

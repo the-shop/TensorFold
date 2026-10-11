@@ -266,6 +266,7 @@ class Qwen4Exp(nn.Module):
         tokens = np.asarray(inputs, dtype=np.int64)
         if tokens.ndim == 1:
             tokens = tokens[None]
+        check_ids(tokens, self.args.vocab_size)
         fused = self.__dict__.get("fused")
         if fused is not None and tokens.shape[0] == 1 and tokens.shape[1] <= self.fused_rows:
             return fused(tokens, cache)
@@ -287,6 +288,19 @@ class Qwen4Exp(nn.Module):
 
     def __call__(self, inputs: Any, cache: list[Any]) -> mx.array:
         return self.head(self.hidden(inputs, cache))
+
+
+def check_ids(tokens: np.ndarray, vocab: int) -> None:
+    """Refuse token ids outside the embedding: the GPU gathers do not bound-check, so an id past ``vocab`` reads
+    whatever memory follows the table (different bits run to run, NaN at times), never an error. The server refuses
+    such prompts first (HTTP 400); this is the engine's own guard."""
+
+    if tokens.size:
+        high, low = int(tokens.max()), int(tokens.min())
+        if high >= vocab or low < 0:
+            bad = high if high >= vocab else low
+            raise ValueError(f"token id {bad} is outside this model's vocabulary of {vocab} (does the tokenizer "
+                             f"match the checkpoint?)")
 
 
 # Checkpoint hashing constants must equal those derived by NGramEmbedding.
