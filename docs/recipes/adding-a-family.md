@@ -24,14 +24,15 @@ when available. List shared kernel modules in `KERNEL_DEPENDENCIES` so snapshot 
 Prompt snapshots key on that source by default, so any edit to it, even a comment, discards saved states. A
 family can declare `NUMERICS_VERSION = 1` instead (Flash Next does): the key then holds the declared version,
 the pinned environment (model path and weights, MLX and mlx-lm, prompt plan, prefill route) and the digest of a
-short canary prompt prefilled on the loaded model at start-up (`engine/numerics.py`; rerun when the installed
-code, OS, GPU, `TF_*`/`MLX_*` variables or load options change, cached beside the snapshots otherwise). The
-canary cannot reach every path a real prompt takes (long chunks, 1-4 row tails, sparse attention past 4096
-keys), so bump the version whenever a change moves the bits of a prompt's cache, pin them with a golden test
-like `tests/test_numerics_golden.py` whose cases cross each size the prefill switches on (its recorder only adds
-entries: moved bits need a bump), and guard the source like `tests/test_numerics_reviewed.py`: it hashes every
-module the golden run imports and fails on any code edit there (comments and docstrings aside) until the version
-is bumped or, with the golden passing unchanged, the edit is recorded as reviewed (`TF_RECORD_NUMERICS_REVIEWED=1`). `TF_SNAPSHOT_KEY=strict` adds the exact code fingerprint to the key.
+short canary prompt prefilled on the loaded model at start-up and read back through the snapshot store
+(`engine/numerics.py`; rerun when the installed code, OS, GPU, `numerics.ENV_PREFIXES` variables or load options
+change, cached beside the snapshots otherwise). The canary cannot reach every path a real prompt takes (long
+chunks, 1-4 row tails, sparse attention past 4096 keys, MTP, SSD reads), so bump the version whenever a change
+moves the bits of a prompt's cache, pin them with a golden test like `tests/test_numerics_golden.py` whose cases
+cross each size the prefill switches on, and guard the source like `tests/test_numerics_reviewed.py`, which
+hashes the whole package minus an allow-list kept in its fixture. These tests catch accidental numerics edits; a
+deliberate re-record is one command, so treat any diff to either fixture as a `NUMERICS_VERSION` decision in
+review. `TF_SNAPSHOT_KEY=strict` adds the exact code fingerprint to the key.
 
 `weight_bytes(model_dir, ple_on_ssd)` can provide a conservative resident-weight estimate for MLX startup
 admission. Without it, the CLI counts every safetensors file's size. Read headers only, use the loader's

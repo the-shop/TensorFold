@@ -11,20 +11,24 @@ GitHub has the full notes and the measurements behind them.
   choices) and the digest of a short canary prompt prefilled on the loaded model at start-up and read back through
   the snapshot store. A refactor, comment or release that computes the same bits keeps saved system blocks and
   conversations; a change that moves the canary's bits (including how states are stored and restored), or a
-  version bump, never reads them. The canary reruns when the installed code, OS, GPU, `TF_*`/`MLX_*` variables or
-  load options (`--ssd-experts`, `--ple-on-ssd`, `--ple-cache-mib`, drafts, `--lane-kernels`, `--parallel`,
-  `--context`, memory) change, cached beside the snapshots otherwise; a malformed cache file (bad JSON, bad UTF-8, nesting past the
-  parser, wrong shape) is rewritten, and a canary measured while the code changed on disk is not recorded. The
-  canary does not reach every path (long chunks, 1-4 row tails, sparse attention past 4096 keys), so two tests make
-  each edit a checked decision: `tests/test_numerics_golden.py` pins a tiny model's prompt-cache bits on cases
-  across each of those sizes per declared version and environment (GPU, macOS, MLX, mlx-lm), fails when they move
-  or when this GPU has no entry for the current version or environment, and never re-records an existing entry
-  (moved bits need a bump); `tests/test_numerics_reviewed.py` hashes, comments and docstrings aside, every module the
-  golden run imports (engine, snapshots, dense and Flash Next kernels, the family) plus the streaming C++ sources,
-  lists them in its fixture, and fails on any edit until `NUMERICS_VERSION` is bumped or, with the golden passing
-  unchanged, the edit is recorded with `TF_RECORD_NUMERICS_REVIEWED=1`. `TF_SNAPSHOT_KEY=strict` also pins the
-  exact code. Snapshots written by 0.2.0 are not loaded (one re-prefill). Own work, building on TensorFold by
-  ashhart.
+  version bump, never reads them. The canary reruns when the installed code, OS, GPU, `TF_*`/`TENSORFOLD_*`/
+  `MLX_*`/`QWEN_*`/`GLM_*` variables (a test checks the package reads no others) or load options
+  (`--ssd-experts`, `--ple-on-ssd`, `--ple-cache-mib`, drafts, `--lane-kernels`, `--parallel`, `--context`,
+  memory) change, cached beside the snapshots otherwise; a malformed cache file is rewritten, and a canary
+  measured while the code changed on disk is not recorded.
+
+  Scope: the canary does not reach every path (long chunks, 1-4 row tails, sparse attention past 4096 keys, MTP,
+  SSD expert reads), so two tests catch *accidental* numerics edits at commit time.
+  `tests/test_numerics_golden.py` pins a tiny model's prompt-cache bits on cases across those sizes, per declared
+  version and environment (GPU, macOS, MLX, mlx-lm). It never re-records an existing entry, and it records a new
+  environment only for the code recorded as reviewed. `tests/test_numerics_reviewed.py` hashes, comments and
+  docstrings aside, every file of the package except an allow-list of HTTP/admission code, argument parsing, the
+  updater and docs, plus the golden's own generator; the allow-list and file list are in its fixture. It fails on
+  any such edit until `NUMERICS_VERSION` is bumped or, with the golden passing unchanged, the edit is recorded
+  with `TF_RECORD_NUMERICS_REVIEWED=1`. A deliberate re-record still takes only that command, so reviewers must
+  treat any diff to `tests/fixtures/numerics_reviewed.json` or `tests/fixtures/numerics_golden.json` as a
+  `NUMERICS_VERSION` decision. `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0 are
+  not loaded (one re-prefill). Own work, building on TensorFold by ashhart.
 
 ## 0.2.0 (10 Oct 2026)
 

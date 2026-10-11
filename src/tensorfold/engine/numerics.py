@@ -17,12 +17,12 @@ The canary does not reach every path a real prompt takes (chunks of thousands of
 DENSE_KEYS keys): an edit that moves bits only there keeps the key unless the declared part is bumped. Two tests
 make that bump a checked decision rather than a memory: tests/test_numerics_golden.py pins a tiny model's prompt
 caches on cases past each of those thresholds (and never re-records a declared version's digests), and
-tests/test_numerics_reviewed.py fails on any code edit to the modules a prefill runs through (the family, its
-kernels, the engine, snapshots, streaming) until the bump is made or the edit is recorded as reviewed (after the
-golden passes).
+tests/test_numerics_reviewed.py fails on any code edit to the package (apart from an allow-list of HTTP, admission
+and argument code kept in its fixture) until the bump is made or the edit is recorded as reviewed (after the golden
+passes). They catch accidental edits; a deliberate re-record is one command whose fixture diff is the decision.
 
 The canary is recomputed whenever the installed code (every file of the package, comments included), the
-environment (TF_*/MLX_* variables, GPU, OS, Python), the load options (SSD experts, PLE, drafts, kernels, lanes,
+environment (``ENV_PREFIXES`` variables, GPU, OS, Python), the load options (SSD experts, PLE, drafts, kernels, lanes,
 memory) or the declared part changes, and cached otherwise.
 """
 
@@ -49,6 +49,8 @@ CANARY_SEED = 0x7E50F01D
 CANARY_TAIL = 8                     # a last chunk this short takes the fused small-row path
 CANARY_GRID = 512                   # canary length when the plan cuts on its grid alone
 _CACHE_ENTRIES = 32
+# every variable the package reads starts with one of these (tests/test_numerics_reviewed.py checks the source)
+ENV_PREFIXES = ("TF_", "TENSORFOLD_", "MLX_", "QWEN_", "GLM_")
 _CODE: list[str] = []
 
 
@@ -105,7 +107,7 @@ def environment_fingerprint() -> str:
     except Exception:  # noqa: BLE001 - no GPU: the CPU build is the device
         info = {}
     parts = {
-        "env": sorted((k, v) for k, v in os.environ.items() if k.startswith(("TF_", "TENSORFOLD_", "MLX_"))),
+        "env": sorted((k, v) for k, v in os.environ.items() if k.startswith(ENV_PREFIXES)),
         "gpu": [str(info.get("architecture", "")), str(info.get("device_name", ""))],
         "os": [platform.system(), platform.release(), platform.mac_ver()[0], platform.machine()],
         "python": sys.version,
@@ -304,6 +306,6 @@ def cache_file_for(*directories: Path | None) -> Path | None:
     return None
 
 
-__all__ = ["CANARY_FILE", "ENGINE_NUMERICS", "cache_digest", "cache_file_for", "canary", "canary_digest",
-           "canary_tokens", "code_fingerprint", "code_on_disk", "declared", "environment_fingerprint", "model_id",
-           "model_vocab", "options_fingerprint", "restored", "strict_requested"]
+__all__ = ["CANARY_FILE", "ENGINE_NUMERICS", "ENV_PREFIXES", "cache_digest", "cache_file_for", "canary",
+           "canary_digest", "canary_tokens", "code_fingerprint", "code_on_disk", "declared", "environment_fingerprint",
+           "model_id", "model_vocab", "options_fingerprint", "restored", "strict_requested"]

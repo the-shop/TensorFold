@@ -37,22 +37,22 @@ SCRIPT = TESTS / "numerics_tiny.py"
 _INSTALLED: list[dict] = []
 
 
-def tiny_report(src: Path | None = None) -> dict:
-    """numerics_tiny.py's report in a fresh process, on ``src`` (a package tree's parent) or the installed one (run
-    once per test process)."""
+def tiny_report(src: Path | None = None, script: Path | None = None) -> dict:
+    """numerics_tiny.py (or ``script``)'s report in a fresh process, on ``src`` (a package tree's parent) or the
+    installed one (run once per test process)."""
 
     import tensorfold
 
-    if src is None and _INSTALLED:
+    if src is None and script is None and _INSTALLED:
         return _INSTALLED[0]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(src if src is not None else Path(tensorfold.__file__).resolve().parents[1])
     env.pop("TF_FLASH_PREFILL", None)
-    done = subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, timeout=600,
-                          check=False)
+    done = subprocess.run([sys.executable, str(script or SCRIPT)], env=env, capture_output=True, text=True,
+                          timeout=600, check=False)
     assert done.returncode == 0, done.stderr[-4000:]
     report = json.loads(done.stdout.strip().splitlines()[-1])
-    if src is None:
+    if src is None and script is None:
         _INSTALLED.append(report)
     return report
 
@@ -73,8 +73,9 @@ def verdict(report: dict, golden: dict) -> tuple[str, str]:
         return "fail", (
             f"no golden digests for {declared} on {environment}, though this GPU has records ({', '.join(here)}). "
             "If the code moved bits, bump NUMERICS_VERSION (families/qwen4_exp/__init__.py) or ENGINE_NUMERICS "
-            "(engine/numerics.py); if macOS, MLX or mlx-lm changed (or after the bump), record this new entry with "
-            "TF_RECORD_NUMERICS_GOLDEN=1 pytest tests/test_numerics_golden.py.")
+            "(engine/numerics.py); if only macOS, MLX or mlx-lm changed (or after the bump), record this new entry "
+            "with TF_RECORD_NUMERICS_GOLDEN=1 pytest tests/test_numerics_golden.py, which accepts a new environment "
+            "only for the code recorded as reviewed.")
     moved = sorted(k for k in set(recorded) | set(report["digests"]) if recorded.get(k) != report["digests"].get(k))
     if moved:
         return "fail", (
@@ -85,8 +86,13 @@ def verdict(report: dict, golden: dict) -> tuple[str, str]:
     return "pass", ""
 
 
-def record(report: dict, path: Path) -> None:
-    """Add ``report``'s digests for its declared numerics and environment to ``path``; refuse to change an entry."""
+def record(report: dict, path: Path, root: Path | None = None) -> None:
+    """Add ``report``'s digests for its declared numerics and environment to ``path``. Refuse to change an entry, and
+    refuse a new environment of an already recorded version unless the code under ``root`` (a repository-like tree;
+    None: this one) is the code recorded as reviewed for that version: a new environment is never a way to re-record
+    moved bits."""
+
+    from tests.test_numerics_reviewed import reviewed_mismatch
 
     golden = json.loads(path.read_text()) if path.is_file() else {}
     entry = golden.setdefault(report["declared"], {})
@@ -96,6 +102,13 @@ def record(report: dict, path: Path) -> None:
         raise AssertionError(
             f"refusing to re-record the golden digests of {report['declared']} on {report['environment']}: {moved} "
             "moved. Changed bits need a NUMERICS_VERSION (or ENGINE_NUMERICS) bump, which records a new entry.")
+    if known is None and entry:
+        why = reviewed_mismatch(root, report["declared"])
+        if why is not None:
+            raise AssertionError(
+                f"refusing to record a new environment {report['environment']} for {report['declared']}: {why}. A new "
+                "environment is recorded only for the code reviewed for that version (tests/fixtures/"
+                "numerics_reviewed.json). If the code moved bits, bump NUMERICS_VERSION (or ENGINE_NUMERICS).")
     entry[report["environment"]] = report["digests"]
     path.write_text(json.dumps(golden, indent=1, sort_keys=True) + "\n")
 
@@ -111,7 +124,10 @@ def test_prompt_cache_bits_match_the_declared_numerics():
     assert state == "pass", why
 
 
-def test_recording_never_rewrites_a_declared_versions_digests(tmp_path):
+def test_recording_never_rewrites_a_declared_versions_digests(tmp_path, monkeypatch):
+    import tests.test_numerics_reviewed as reviewed
+
+    monkeypatch.setattr(reviewed, "reviewed_mismatch", lambda root, declared: None)   # this code is the reviewed one
     path = tmp_path / "golden.json"
     report = {"declared": "qwen4_exp-v1-n1|e1", "environment": "gpu=g|macos=1|mlx=1|mlx_lm=1", "digests": {"a": "1"}}
     record(report, path)
@@ -121,11 +137,16 @@ def test_recording_never_rewrites_a_declared_versions_digests(tmp_path):
         record(moved, path)
     assert json.loads(path.read_text())["qwen4_exp-v1-n1|e1"]["gpu=g|macos=1|mlx=1|mlx_lm=1"] == {"a": "1"}
     record({**moved, "declared": "qwen4_exp-v1-n2|e1"}, path)              # a bump records a new entry
-    record({**moved, "environment": "gpu=g|macos=1|mlx=2|mlx_lm=1"}, path)  # so does another MLX
+    record({**moved, "environment": "gpu=g|macos=1|mlx=2|mlx_lm=1"}, path)  # so does another MLX, on reviewed code
+    monkeypatch.setattr(reviewed, "reviewed_mismatch", lambda root, declared: "the code differs")
+    with pytest.raises(AssertionError, match="only for the code reviewed"):        # but never on unreviewed code
+        record({**moved, "environment": "gpu=g|macos=9|mlx=1|mlx_lm=1"}, path)
+    record({**moved, "declared": "qwen4_exp-v1-n3|e1"}, path)              # a bump still records
     assert verdict(moved, json.loads(path.read_text()))[0] == "fail"
-    assert verdict({**moved, "environment": "gpu=g|macos=2|mlx=1|mlx_lm=1"}, json.loads(path.read_text()))[0] == "fail"
-    assert verdict({**moved, "environment": "gpu=other|macos=1|mlx=1|mlx_lm=1"}, json.loads(path.read_text()))[0] \
-        == "skip"
+    recorded = json.loads(path.read_text())
+    assert "gpu=g|macos=9|mlx=1|mlx_lm=1" not in recorded["qwen4_exp-v1-n1|e1"]
+    assert verdict({**moved, "environment": "gpu=g|macos=2|mlx=1|mlx_lm=1"}, recorded)[0] == "fail"
+    assert verdict({**moved, "environment": "gpu=other|macos=1|mlx=1|mlx_lm=1"}, recorded)[0] == "skip"
     assert verdict({**moved, "declared": "qwen4_exp-v1-n2|e1"}, json.loads(path.read_text()))[0] == "pass"
 
 
