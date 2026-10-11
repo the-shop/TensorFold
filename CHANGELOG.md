@@ -8,12 +8,16 @@ GitHub has the full notes and the measurements behind them.
 - **`TENSORFOLD_POOL_ALIGNED_READS=1`** (default off). On macOS, an `F_NOCACHE` read at an unaligned file offset
   leaves all but its first MiB in the page cache, so about a third of every expert's bytes stayed there. With the
   switch on, unaligned expert parts over about 1 MiB are read as the page-aligned range around them into an aligned
-  buffer and copied out: the same bytes and counters, and nothing cached.
+  buffer and copied out: the same bytes and counters, and nothing cached. Each expert pool reads the variable once,
+  when it is created (server start).
 - **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
   (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
   cold benchmarks.
-- Thanks to [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) for reporting the macOS `F_NOCACHE`
-  page-cache behaviour; the alignment cause, the fix and the eviction tool are TensorFold's own (no code copied).
+- **Credits:** [strata-mlx](https://github.com/yibie/strata-mlx) (MIT License, Copyright (c) 2026 yibie) for two
+  ideas: the finding that macOS `F_NOCACHE` reads still fill the page cache (`paged.py`, `ExpertStore.whole`), and
+  the no-sudo eviction technique (`msync(MS_INVALIDATE)` over a shared mapping, `bench/drop_cache.py`) that
+  `tools/page_cache.py evict` uses. No strata-mlx code was copied. The alignment cause (file offset and buffer) and
+  the aligned-superset read are TensorFold's own.
 
 ## 0.2.0 (10 Oct 2026)
 

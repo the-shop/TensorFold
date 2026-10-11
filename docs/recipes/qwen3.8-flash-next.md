@@ -212,6 +212,7 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
 - **`TENSORFOLD_POOL_ALIGNED_READS=1`** (default off) reads each unaligned expert part over about 1 MiB as the
   page-aligned range around it into an aligned buffer, then copies the part out: the same bytes and the same one
   `pread` a part, with nothing left in the page cache. Off keeps the leftover tails, which also serve repeat reads.
+  The expert pool reads the variable once, when it is created at server start.
 - `python tools/page_cache.py evict MODEL_DIR` drops the checkpoint files from the page cache (no sudo; run it with
   no server holding the model), and `python tools/page_cache.py resident MODEL_DIR [--experts]` prints how many of
   their bytes (or of the routed experts' bytes) are cached. Evict before every cold benchmark.
