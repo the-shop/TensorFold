@@ -12,6 +12,8 @@ GitHub has the full notes and the measurements behind them.
 - **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
   (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
   cold benchmarks.
+- Thanks to [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) for reporting the macOS `F_NOCACHE`
+  page-cache behaviour; the alignment cause, the fix and the eviction tool are TensorFold's own (no code copied).
 
 ## 0.2.0 (10 Oct 2026)
 
