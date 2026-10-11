@@ -381,8 +381,11 @@ class FlashNext:
             return self.hidden(tokens[0], caches[0])
         if len(rows) > 64 or sum(rows) > self.rows_per_call or self.fused is None:
             raise ValueError(f"hidden_multi: at most 64 streams and {self.rows_per_call} rows in all")
-        h = embed.embed_rows(np.concatenate(tokens, axis=1).reshape(-1), self.model.model.embed_tokens,
-                             tile=self.args.hc_count)
+        from tensorfold.families.qwen4_exp.model import check_ids
+
+        flat = np.concatenate(tokens, axis=1).reshape(-1)
+        check_ids(flat, self.args.vocab_size)
+        h = embed.embed_rows(flat, self.model.model.embed_tokens, tile=self.args.hc_count)
         out = self.fused.run_multi(h, tokens, [c[: self.layer_count] for c in caches], rows)
         self._streams = self.fused.last_streams
         return out

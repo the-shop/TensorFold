@@ -9,7 +9,13 @@ GitHub has the full notes and the measurements behind them.
   `down`) read past the activation row for expert widths below 512 and past both buffers above 1,024: test models
   (width 64 or 128) gave different bits run to run. Narrower rows now take a variant whose idle lanes read nothing;
   widths above 1,024 or off the group size are refused. Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640)
-  compile from the unchanged source, so their replies are the same tokens. Own work, no third-party code (builds on TensorFold by ashhart).
+  compile from the unchanged source, so their replies are the same tokens. Own work, no third-party code (builds
+  on TensorFold by ashhart).
+- **Token ids past the embedding are refused.** A rendered prompt holding an id the model's embedding lacks (a
+  tokenizer larger than the checkpoint's vocabulary, e.g. a tiny test model) gets HTTP 400 (in a stream, an
+  `invalid_request_error` event) instead of reading memory past the table; the server warns at load when the
+  tokenizer has more ids than the embedding, and the Qwen4Exp forward checks ids itself. Own work, no third-party
+  code (builds on TensorFold by ashhart).
 
 ## 0.2.0 (10 Oct 2026)
 

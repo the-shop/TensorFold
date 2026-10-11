@@ -51,6 +51,29 @@ def _token_sha(tokens: list[int]) -> str:
     return hashlib.sha256(",".join(str(int(t)) for t in tokens).encode()).hexdigest()[:12]
 
 
+def model_vocab(model: Any) -> int:
+    """The rows of the model's token embedding (0: unknown, no check)."""
+
+    try:
+        return int(getattr(getattr(model, "args", None), "vocab_size", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def warn_vocab_mismatch(tokenizer: Any, vocab: int) -> None:
+    """Say at load when the tokenizer can emit ids the embedding lacks: prompts holding one get HTTP 400."""
+
+    if not vocab:
+        return
+    try:
+        size = len(tokenizer)
+    except TypeError:
+        size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    if size > vocab:
+        print(f"[tensorfold] warning: the tokenizer has {size:,} token ids but the model's embedding only {vocab:,}; "
+              f"prompts with an id of {vocab:,} or more are refused (HTTP 400)", flush=True)
+
+
 class ChatApp(RequestOptions):
     """One model behind the OpenAI endpoint (``server.http.make_handler``)."""
 
@@ -125,6 +148,8 @@ class ChatApp(RequestOptions):
             "engine": "lanes",
             "note": "every token is the model's own sample at its position; drafts only change speed",
         }
+        self.model_vocab = model_vocab(model)
+        warn_vocab_mismatch(tokenizer, self.model_vocab)
         self.stop_ids = eos_ids_of(tokenizer)
         self.late_system = template_late_system(tokenizer)
         self.engine = factory(model, max_rows=int(max_rows), max_draft=int(max_draft),
@@ -407,6 +432,11 @@ class ChatApp(RequestOptions):
         cancellation.check()
         if not prompt_ids:
             raise RequestError("rendered prompt is empty")
+        if self.model_vocab:
+            bad = next((t for t in prompt_ids if not 0 <= int(t) < self.model_vocab), None)
+            if bad is not None:
+                raise RequestError(f"the rendered prompt has token id {int(bad)}, outside this model's vocabulary of "
+                                   f"{self.model_vocab:,} (the tokenizer has ids the checkpoint's embedding lacks)")
         limit = max(1, int(max_tokens))
         if self.context_window:
             room = self.context_window - len(prompt_ids)
