@@ -74,3 +74,21 @@ def test_off_records_nothing(hs, tmp_path, native):  # noqa: F811
     call(hs, s, "rows", 0, [1, 2, 3, 4])
     assert s.profile_drain() == ([], 0)
     s.close()
+
+
+def test_python_records_are_capped_and_drops_counted(hs, tmp_path, monkeypatch):  # noqa: F811
+    folder = tmp_path / "ckpt"
+    write_checkpoint(folder)
+    monkeypatch.setattr(pool.Streamer, "PROF_CAP", 3)
+    profile.configure(tmp_path / "p.jsonl")
+    s = make(hs, folder, slots=2 * EXPERTS + 3, native=False)
+    for layer in range(5):
+        call(hs, s, "rows", layer % 3, [1, 2, 3, 4])
+    records, dropped = s.profile_drain()
+    assert len(records) == 3 and dropped == 2
+    call(hs, s, "rows", 0, [1, 2, 3, 4])
+    assert [len(x) if isinstance(x, list) else x for x in s.profile_drain()] == [1, 0]
+    s.profile_off()
+    call(hs, s, "rows", 0, [1, 2, 3, 4])                     # off from another thread: the serve loop keeps going
+    assert s.profile_drain() == ([], 0) and s.error is None
+    s.close()

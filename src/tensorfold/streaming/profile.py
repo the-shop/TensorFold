@@ -4,10 +4,17 @@ records and the GPU start/end of the command buffers that carry its marks, writt
 TENSORFOLD_DECODE_PROFILE=<path.jsonl> turns it on (Mode A: no MLX op, eval or sync is added, so tokens cannot
 change). TENSORFOLD_DECODE_PROFILE_SYNC=1 adds Mode B: eval barriers inside the forward and the round for exact
 per-component GPU time (a scheduling change only; accept its numbers only when its token shas match).
-Off (unset), ``ACTIVE`` is None and every hook is one attribute test."""
+TENSORFOLD_DECODE_PROFILE_MAX_MB (default 1024) caps the file: a flush that would pass it first renames the file to
+``<path>.1`` (replacing an older one), so at most about twice the cap is on disk.
+Off (unset), ``ACTIVE`` is None and the hooks test it and do no MLX work.
+
+The profiler never fails a reply or a model load: a write that fails (missing directory, disk full, permission) or a
+C++ clock that disagrees with Python's logs one warning and turns the profiler off for the rest of the process."""
 
 from __future__ import annotations
 
+import bisect
+import contextlib
 import json
 import os
 import threading
@@ -17,6 +24,7 @@ from typing import Any
 
 ACTIVE: Recorder | None = None
 CLOCK_TOLERANCE_NS = 100_000          # steady_clock, mach_absolute_time and Metal GPU times share one domain on macOS
+MAX_MB = 1024                         # TENSORFOLD_DECODE_PROFILE_MAX_MB's default
 
 now = time.monotonic_ns
 
@@ -24,8 +32,9 @@ now = time.monotonic_ns
 class Recorder:
     """Rounds and prompt chunks of the current request, flushed with the pool's and the GPU's records."""
 
-    def __init__(self, path: str | os.PathLike, *, sync: bool = False) -> None:
-        self.path, self.sync = str(path), bool(sync)
+    def __init__(self, path: str | os.PathLike, *, sync: bool = False, max_bytes: int = MAX_MB << 20) -> None:
+        self.path, self.sync, self.max_bytes = str(path), bool(sync), int(max_bytes)
+        self.disabled: str | None = None
         self.lock = threading.Lock()
         self.rounds: list[dict] = []
         self.chunks: list[dict] = []
@@ -42,13 +51,36 @@ class Recorder:
     def attach(self, streamer: Any) -> None:
         """Start a pool's call records (and, once per extension, the GPU's buffer times)."""
 
-        self.streamers.add(streamer)
-        streamer.profile_on()
+        if self.disabled is not None:
+            return
         hs = streamer.hs
         if hasattr(hs, "gpu_profile") and id(hs) not in self.extensions:
+            offset = check_clock(hs)
+            if abs(offset) >= CLOCK_TOLERANCE_NS:
+                self.disable(f"the C++ steady_clock is {offset} ns off Python's clock (tolerance "
+                             f"{CLOCK_TOLERANCE_NS} ns), so its stamps cannot be compared")
+                return
             self.extensions[id(hs)] = hs
-            self.clock_offset_ns = check_clock(hs)
+            self.clock_offset_ns = offset
             hs.gpu_profile(True)
+        self.streamers.add(streamer)
+        streamer.profile_on()
+
+    def disable(self, why: str) -> None:
+        """Off for the rest of the process, with one warning: pools stop recording and later pools do not attach.
+        Hooks already holding this recorder finish their round on it harmlessly."""
+
+        global ACTIVE
+        if self.disabled is not None:
+            return
+        self.disabled = why
+        if ACTIVE is self:
+            ACTIVE = None
+        print(f"[tensorfold] decode profile off: {why}", flush=True)
+        for stop in [s.profile_off for s in list(self.streamers)] + [
+                lambda hs=hs: hs.gpu_profile(False) for hs in self.extensions.values()]:
+            with contextlib.suppress(Exception):    # a closed pool: nothing left to stop
+                stop()
 
     # -- rounds -------------------------------------------------------------------------------------------------
     def begin_round(self, **meta: Any) -> dict:
@@ -112,6 +144,8 @@ class Recorder:
         """One request done: a header line, then one line per prompt chunk and per round, with the calls and GPU
         buffer times inside each one's span attached."""
 
+        if self.disabled is not None:
+            return
         with self.lock:
             rounds, self.rounds = self.rounds, []
             chunks, self.chunks = self.chunks, []
@@ -133,8 +167,6 @@ class Recorder:
             span["calls"] = []
         orphans = []
         starts = [s[1]["t0"] for s in spans]
-        import bisect
-
         for call in sorted(calls, key=lambda c: c["t_submit"]):
             i = bisect.bisect_right(starts, call["t_submit"]) - 1
             if i >= 0 and call["t_submit"] <= spans[i][1]["t_end"]:
@@ -145,14 +177,28 @@ class Recorder:
         header = {"type": "request", "n": self.requests, "sync": self.sync, "clock_offset_ns": self.clock_offset_ns,
                   "rounds": len(rounds), "chunks": len(chunks), "events": events, "orphan_calls": orphans,
                   "outside_runs": len(outside), **lost, **meta}
+        text = "".join([json.dumps(header) + "\n"] + [json.dumps({"type": kind, **span}) + "\n" for kind, span in spans])
+        try:
+            self._write(text)
+        except OSError as error:
+            self.disable(f"cannot write {self.path}: {error}")
+
+    def _write(self, text: str) -> None:
+        """Append one request's lines; past the size cap, the current file becomes ``<path>.1`` first."""
+
+        try:
+            size = os.path.getsize(self.path)
+        except FileNotFoundError:
+            size = 0
+        if size and size + len(text) > self.max_bytes:
+            os.replace(self.path, self.path + ".1")
         with open(self.path, "a") as handle:
-            handle.write(json.dumps(header) + "\n")
-            for kind, span in spans:
-                handle.write(json.dumps({"type": kind, **span}) + "\n")
+            handle.write(text)
 
 
 def check_clock(hs: Any) -> int:
-    """The extension's steady_clock against Python's monotonic clock: the smallest bracketed offset (ns)."""
+    """The extension's steady_clock against Python's monotonic clock: the smallest bracketed offset (ns); the caller
+    compares it with CLOCK_TOLERANCE_NS."""
 
     best = None
     for _ in range(9):
@@ -162,12 +208,10 @@ def check_clock(hs: Any) -> int:
         off = c - (a + b) // 2
         if best is None or b - a < best[0]:
             best = (b - a, off)
-    offset = best[1]
-    assert abs(offset) < CLOCK_TOLERANCE_NS, f"decode profile: C++ steady_clock is {offset} ns off Python's clock"
-    return offset
+    return best[1]
 
 
-def configure(path: str | os.PathLike | None, *, sync: bool = False) -> Recorder | None:
+def configure(path: str | os.PathLike | None, *, sync: bool = False, max_mb: float = MAX_MB) -> Recorder | None:
     """Turn the profiler on (a path) or off (None). Pools built later attach themselves; existing ones are not
     reached from here, so configure before loading the model."""
 
@@ -180,7 +224,7 @@ def configure(path: str | os.PathLike | None, *, sync: bool = False) -> Recorder
                 hs.gpu_profile(False)
         ACTIVE = None
         return None
-    ACTIVE = Recorder(path, sync=sync)
+    ACTIVE = Recorder(path, sync=sync, max_bytes=int(max_mb * 2**20))
     return ACTIVE
 
 
@@ -190,7 +234,11 @@ def from_env(env: dict | None = None) -> Recorder | None:
     if not path:
         return None
     sync = (env.get("TENSORFOLD_DECODE_PROFILE_SYNC", "0") or "0").strip() not in ("0", "", "off", "no", "false")
-    return configure(path, sync=sync)
+    try:
+        max_mb = float(env.get("TENSORFOLD_DECODE_PROFILE_MAX_MB") or MAX_MB)
+    except ValueError:
+        max_mb = MAX_MB
+    return configure(path, sync=sync, max_mb=max_mb if max_mb > 0 else MAX_MB)
 
 
 from_env()

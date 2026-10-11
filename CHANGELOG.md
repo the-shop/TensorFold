@@ -13,9 +13,14 @@ GitHub has the full notes and the measurements behind them.
   stall, host answer, Python-bound idle, head tail, MTP, gaps) and the TTFT phases of each request;
   `tools/decode_health_delta.py` reads `/health` counters around requests; `tools/bench_flash_decode_parts.py`
   measures the parts on random weights of the checkpoint's shapes. The `done` line's `draft=` and `post=` now report
-  settle and after-read time for single-stream rounds. Idea credits (no code copied): the dense-versus-expert
-  bytes-per-token analysis of [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) motivated the breakdown, and
-  [oMLX](https://github.com/jundot/omlx) (Apache-2.0) GPU keep-warm observations shaped the idle probe.
+  settle and after-read time for single-stream rounds. The profiler never fails a reply or a model load: a write
+  error (missing directory, full disk, permission) or a C++ clock off Python's logs one line and turns it off.
+  `TENSORFOLD_DECODE_PROFILE_MAX_MB` (default 1024) caps the file, rotating it to `<path>.1`. Prompt chunks of 16
+  rows or fewer take the decode rows path and count in `/health` misses; the report attributes them to the prompt.
+  Idea credits (no code copied): the dense-versus-expert bytes-per-token analysis of
+  [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) motivated the breakdown, and
+  [oMLX](https://github.com/jundot/omlx) (Apache-2.0) GPU keep-warm and overlap observations were consulted while
+  scoping it (no idle probe ships here).
 
 ## 0.2.0 (10 Oct 2026)
 

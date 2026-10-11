@@ -1,20 +1,30 @@
 """Decode profile (TENSORFOLD_DECODE_PROFILE JSONL) -> per-round time buckets, per request and phase.
 
-    python tools/decode_profile_report.py PROFILE.jsonl [--attention 3,7,...] [--expert-bytes 5222400] [--json OUT]
+    python tools/decode_profile_report.py [PROFILE.jsonl.1] PROFILE.jsonl [--attention 3,7,...]
+                                          [--expert-bytes 5222400] [--json OUT]
+
+Pass the rotated ``.1`` file first when TENSORFOLD_DECODE_PROFILE_MAX_MB rotated it. A malformed line (a flush cut by
+kill -9 or a full disk) is skipped with a warning on stderr; a request header glued to its end is recovered.
 
 Each decode round is cut at host stamps the round really passes (R1): before layer 0's signal, then per layer the
 host's answer [signal seen -> ready] and the segment [ready(L-1) -> signal(L)], then the tail [ready(47) -> tokens
-read] and the host work after the read. The cuts telescope, so the buckets sum to the round's wall time exactly when
-every layer's call is present (the closure check flags a round otherwise). Inside a segment, the GPU start/end of the
-command buffers that carry the marks split expert(L-1) GPU, Python-bound GPU idle and dense(L) GPU, where those
-buffers have clean boundaries; other segments are split by the clean ones' mean fractions for that layer type.
-Decode SSD bytes are misses x the expert's bytes (R2: window fills are reported apart, never mixed in)."""
+read] and the host work after the read. The cuts telescope, so the buckets always sum to the round's wall time; that
+is an identity, not a check. A round is flagged instead when its calls are not exactly one per layer in layer order
+(a lost or extra record), or a bucket comes out negative (stamps out of order). Inside a segment, the GPU start/end
+of the command buffers that carry the marks split expert(L-1) GPU, Python-bound GPU idle and dense(L) GPU, where
+those buffers have clean boundaries; other segments are split by the clean ones' mean fractions for that layer type.
+
+Only calls inside a decode round count as decode. A prompt chunk of 16 rows or fewer (a short prompt, or the tail
+chunk of a long one) takes the same rows path as decode (kind 0) and its misses count in /health "misses" too; those
+calls fall inside the prompt chunk's span, so the prompt-chunk table shows them (rows calls) and the decode tables
+do not. Decode SSD bytes are decode-round misses x the expert's bytes (R2: window fills are reported apart)."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -41,14 +51,42 @@ LABELS = {
 }
 
 
-def load(path: Path) -> list[dict]:
-    """Requests: header plus its chunks and rounds, in file order."""
+def _parse(line: str, where: str) -> dict | None:
+    """One JSONL record; a malformed line is skipped with a warning, keeping a whole record glued to its end."""
+
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        pass
+    tail = line.rfind('{"type": ')
+    rec = None
+    if tail > 0:
+        try:
+            rec = json.loads(line[tail:])
+        except json.JSONDecodeError:
+            rec = None
+    print(f"warning: {where}: skipped a malformed line ({len(line)} chars)"
+          + (f", kept the {rec['type']} record at its end" if rec else ""), file=sys.stderr)
+    return rec
+
+
+def load(*paths: Path) -> list[dict]:
+    """Requests: header plus its chunks and rounds, in file order (files in the order given)."""
 
     requests: list[dict] = []
-    for line in path.read_text().splitlines():
+    for path in paths:
+        requests += _load(path)
+    return requests
+
+
+def _load(path: Path) -> list[dict]:
+    requests: list[dict] = []
+    for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
         if not line.strip():
             continue
-        rec = json.loads(line)
+        rec = _parse(line, f"{path}:{n}")
+        if rec is None:
+            continue
         if rec["type"] == "request":
             requests.append({"header": rec, "rounds": [], "chunks": []})
         elif requests:
@@ -78,6 +116,10 @@ def round_buckets(rnd: dict, attention: set[int], ratios: dict | None, nxt: dict
              "mtp_runs": sum(1 for r in rnd.get("runs", []) if r is not run), "ok": True, "why": ""}
     if len(calls) != layers or "t_read" not in rnd:
         facts["ok"], facts["why"] = False, f"{len(calls)} calls for {layers} layers" if "t_read" in rnd else "no read"
+        return {"b": out, "f": facts, "seg": []}
+    order = [c.get("layer") for c in calls]
+    if order != list(range(layers)):
+        facts["ok"], facts["why"] = False, f"call layers {order[:8]}... not 0..{layers - 1} in order"
         return {"b": out, "f": facts, "seg": []}
     q = run["q"] if run else [None] * layers
     for c in calls:
@@ -137,9 +179,9 @@ def round_buckets(rnd: dict, attention: set[int], ratios: dict | None, nxt: dict
     out["after_other"] += t["t_end"] - t.get("t_settled", t.get("t_kept", t["t_read"]))
     if nxt is not None:
         out["gap"] += max(0, nxt["t0"] - rnd["t_end"])
-    total = sum(v for k, v in out.items() if k != "gap")
-    if abs(total - facts["wall"]) > 0.03 * facts["wall"]:
-        facts["ok"], facts["why"] = False, f"closure {total * NS:.2f} vs wall {facts['wall'] * NS:.2f} ms"
+    negative = [k for k, v in out.items() if v < 0]
+    if negative:
+        facts["ok"], facts["why"] = False, f"negative buckets {negative} (stamps out of order)"
     if "t_head" in rnd:                       # Mode B: the round's own evals give exact head / MTP times
         facts["b_head_ms"] = (rnd["t_head"] - (run["t_end"] if run else rnd["t_hidden"])) * NS
         facts["b_spec_ms"] = (rnd.get("t_spec", rnd["t_head"]) - rnd["t_head"]) * NS
@@ -255,26 +297,46 @@ def prefill_view(req: dict, expert_bytes: int) -> str:
         pieces += [("TTFT (received -> first token)", h["t_first_token"] - h["t_received"])]
         lines += ["| TTFT phase | ms |", "|---|---|"] + [f"| {k} | {v * NS:.1f} |" for k, v in pieces] + [""]
     if chunks:
-        lines += ["| chunk | wall ms | window calls | experts read | GiB | read ms | host answer ms | rest (GPU + Python) ms |",
-                  "|---|---|---|---|---|---|---|---|"]
+        # a chunk of <= 16 rows runs the decode rows path (kind 0): its misses are prompt reads, counted here
+        lines += [("| chunk | wall ms | window calls | rows calls | experts read | rows misses | GiB | read ms | "
+                   "host answer ms | rest (GPU + Python) ms |"), "|---|---|---|---|---|---|---|---|---|---|"]
         for i, ch in enumerate(chunks):
-            calls = [c for c in ch.get("calls", []) if c["kind"] == 1]
+            calls = ch.get("calls", [])
+            window = sum(1 for c in calls if c["kind"] == 1)
+            rows_calls = [c for c in calls if c["kind"] == 0]
             reads = sum(c["misses"] for c in calls)
             nbytes = sum(c["bytes"] for c in calls)
             read_ms = sum(c["t_read1"] - c["t_read0"] for c in calls if c["misses"]) * NS
             host = sum(c["t_ready"] - c["t_sig"] for c in calls) * NS
             wall = (ch["t_end"] - ch["t0"]) * NS
-            lines.append(f"| {i} | {wall:.1f} | {len(calls)} | {reads} | {nbytes / 2**30:.2f} | {read_ms:.1f} | "
+            lines.append(f"| {i} | {wall:.1f} | {window} | {len(rows_calls)} | {reads} | "
+                         f"{sum(c['misses'] for c in rows_calls)} | {nbytes / 2**30:.2f} | {read_ms:.1f} | "
                          f"{host:.1f} | {wall - host:.1f} |")
         lines.append("")
+    split = misses_split(req)
+    lines += [(f"rows-path misses (/health \"misses\"): decode rounds {split['decode']} + prompt chunks "
+               f"{split['prompt']} + outside any span {split['outside']} = {sum(split.values())}"), ""]
     if h.get("events"):
         lines += ["events: " + ", ".join(f"{e['name']}={(e['t_end'] - e['t0']) * NS:.1f} ms" for e in h["events"]), ""]
     return "\n".join(lines)
 
 
+def misses_split(req: dict) -> dict:
+    """The request's rows-path (kind 0) misses by phase: decode rounds, prompt chunks and calls outside both (load-time
+    checks land in request 1's orphans). Their sum is what /health's "misses" moved by over the request."""
+
+    def rows(calls: list[dict]) -> int:
+        return sum(c["misses"] for c in calls if c["kind"] == 0)
+
+    return {"decode": sum(rows(r.get("calls", [])) for r in req["rounds"]),
+            "prompt": sum(rows(c.get("calls", [])) for c in req["chunks"]),
+            "outside": rows(req["header"].get("orphan_calls", []))}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("profile", type=Path)
+    ap.add_argument("profile", type=Path, nargs="+",
+                    help="profile files, oldest first (a rotated .1 before the live one)")
     ap.add_argument("--attention", default=",".join(str(i) for i in range(3, 48, 4)),
                     help="0-based sparse-attention layer ids (default: every 4th from 3, the q8 checkpoint)")
     ap.add_argument("--expert-bytes", type=int, default=EXPERT_BYTES)
@@ -284,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     attention = {int(x) for x in args.attention.split(",") if x}
     labels = [x for x in args.labels.split(",") if x]
     out_json = []
-    for i, req in enumerate(load(args.profile)):
+    for i, req in enumerate(load(*args.profile)):
         h = req["header"]
         name = labels[i] if i < len(labels) else f"request {h['n']}"
         print(f"## {name}: job={h.get('job')} prompt={h.get('prompt')} cached={h.get('cached')} tokens={h.get('tokens')} "
@@ -302,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Mode B (eval barriers; use as ratios) mean ms per round: "
                   + ", ".join(f"{k}={v:.2f}" for k, v in sorted(b.items())) + "\n")
         out_json.append({"name": name, "header": {k: v for k, v in h.items() if k != "orphan_calls"},
+                         "misses": misses_split(req),
                          "ratios": s["ratios"], "modeB": b,
                          "rounds": [{"b": {k: v * NS for k, v in r["b"].items()}, "f": r["f"]} for r in s["rows"]]})
     if args.json:

@@ -165,6 +165,8 @@ class Streamer:
         self._jobs: queue.Queue = queue.Queue()
         self._prof: list | None = None                                  # the Python serve loop's call records
         self._prof_cur: dict | None = None
+        self._prof_mu = threading.Lock()
+        self._prof_dropped = 0
         if native is None:
             native = native_wanted()
         if native and not self.decode_prefetch and not self.prompt_seed and hasattr(hostsync, "PoolServer"):
@@ -187,18 +189,21 @@ class Streamer:
     # -- decode profiler (streaming/profile.py) ---------------------------------------------------------------------
     _PROF_KEYS = ("kind", "layer", "rows", "unique", "misses", "bytes", "signal", "t_submit", "t_sig", "t_read0",
                   "t_read1", "t_ready")
+    PROF_CAP = 1 << 16                                                  # records kept between drains (as native)
 
     def profile_on(self) -> None:
         if self._server is not None:
             self._server.profile(True)
         else:
-            self._prof = []
+            with self._prof_mu:
+                self._prof, self._prof_dropped = [], 0
 
     def profile_off(self) -> None:
         if self._server is not None:
             self._server.profile(False)
         else:
-            self._prof = None
+            with self._prof_mu:
+                self._prof = None
 
     def profile_drain(self) -> tuple[list[dict], int]:
         """Each call since the last drain: kind (0 rows, 1 window), layer, rows, unique experts, misses (expert
@@ -208,8 +213,10 @@ class Streamer:
         if self._server is not None:
             got, dropped = self._server.drain_profile()
             return [dict(zip(self._PROF_KEYS, (int(v) for v in rec))) for rec in got], int(dropped)
-        got, self._prof = (self._prof or []), ([] if self._prof is not None else None)
-        return got, 0
+        with self._prof_mu:
+            got, self._prof = (self._prof or []), ([] if self._prof is not None else None)
+            dropped, self._prof_dropped = self._prof_dropped, 0
+        return got, dropped
 
     def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
         """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
@@ -392,8 +399,13 @@ class Streamer:
             if rec is not None:
                 rec["t_ready"] = _profile.now()
                 self._prof_cur = None
-                if self._prof is not None:
-                    self._prof.append(rec)
+                with self._prof_mu:                 # profile_off/drain may run on another thread
+                    if self._prof is None:
+                        pass
+                    elif len(self._prof) < self.PROF_CAP:
+                        self._prof.append(rec)
+                    else:
+                        self._prof_dropped += 1
             self.channel.signal(ready)
             for step, *args in after:             # speculative reads start once the GPU runs on
                 if self.error is not None:

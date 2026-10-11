@@ -4,8 +4,12 @@
                                                                     # after) and srvline (the server's done line)
     python tools/decode_health_delta.py live URL REQUEST.json [...]  # snapshot /health around each request itself
 
-Decode SSD bytes are misses x one expert's bytes: only decode calls count misses, while bytes_read also counts the
-prompt's window fills, reported apart (VERIFY R2)."""
+/health "misses" counts every rows-path call, and that is not only decode: a prompt chunk of 16 rows or fewer (a
+short prompt, or the tail chunk of a long one; FlashNext.fused_rows) takes the decode rows path too. So the deltas
+here are rows-path figures (rows_*): decode plus those prompt chunks, an upper bound on decode. bytes_read also
+counts the window fills of the prompt's larger chunks; window_GiB is bytes_read minus the rows-path bytes. To split
+the rows-path misses into prompt and decode, run with TENSORFOLD_DECODE_PROFILE and read the report's "rows-path
+misses" line and prompt-chunk table (decode_profile_report.py), which attribute those calls to the prompt."""
 
 from __future__ import annotations
 
@@ -21,16 +25,16 @@ EXPERT_BYTES = 5_222_400
 
 def delta(ex0: dict, ex1: dict, tokens: int, rounds: int, ms_round: float | None, expert_bytes: int) -> dict:
     d = {k: int(ex1.get(k, 0)) - int(ex0.get(k, 0)) for k in ("hits", "misses", "bytes_read", "preads")}
-    decode_bytes = d["misses"] * expert_bytes
+    rows_bytes = d["misses"] * expert_bytes            # decode + prompt chunks of <= 16 rows (see the docstring)
     out = {**{f"d_{k}": v for k, v in d.items()}, "tokens": tokens, "rounds": rounds,
-           "decode_MiB": decode_bytes / 2**20, "window_GiB": (d["bytes_read"] - decode_bytes) / 2**30,
-           "hit_pct": 100 * d["hits"] / max(1, d["hits"] + d["misses"])}
+           "rows_MiB": rows_bytes / 2**20, "window_GiB": (d["bytes_read"] - rows_bytes) / 2**30,
+           "rows_hit_pct": 100 * d["hits"] / max(1, d["hits"] + d["misses"])}
     if tokens:
-        out.update(misses_per_token=d["misses"] / tokens, decode_MiB_per_token=decode_bytes / 2**20 / tokens)
+        out.update(rows_misses_per_token=d["misses"] / tokens, rows_MiB_per_token=rows_bytes / 2**20 / tokens)
     if rounds:
-        out.update(misses_per_round=d["misses"] / rounds)
+        out.update(rows_misses_per_round=d["misses"] / rounds)
         if ms_round:
-            out["implied_decode_GBps_if_serial"] = decode_bytes / rounds / (ms_round * 1e-3) / 1e9
+            out["rows_GBps_if_serial_upper"] = rows_bytes / rounds / (ms_round * 1e-3) / 1e9
     return out
 
 
