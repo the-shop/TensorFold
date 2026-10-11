@@ -30,8 +30,8 @@ TEXT = {
     "rope_parameters": {"rope_theta": 10000, "partial_rotary_factor": 0.25, "mrope_section": [2, 1, 1]},
     "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 128,
     "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "output_gate_type": "sigmoid",
-    "num_experts": 32, "num_experts_per_tok": 4, "moe_intermediate_size": 128,
-    "shared_expert_intermediate_size": 128, "hc_count": 4, "hc_lowrank": 64,
+    "num_experts": 32, "num_experts_per_tok": 4, "moe_intermediate_size": 640,
+    "shared_expert_intermediate_size": 640, "hc_count": 4, "hc_lowrank": 64,
     "indexer_n_heads": 2, "indexer_head_dim": 128, "indexer_budget": 16, "indexer_compress_ratio": 4,
     "ple_layer_ids": [2], "ple_embed_dim": 512, "ple_conv_kernel_size": 4, "ngram_size": 3,
     "heads_per_ngram": 2, "ngram_vocab_size_base": 1000, "make_ngram_vocab_size_divisible_by": 8,
@@ -153,16 +153,18 @@ def engine(rt, layer_major: bool, plan=PLAN) -> LaneEngine:
     return e
 
 
-def prefill(e: LaneEngine, ids: list[int], *, checkpoints=(), max_new: int = 1, cache=None, cached: int = 0):
+def prefill(e: LaneEngine, ids: list[int], *, checkpoints=(), max_new: int = 4, cache=None, cached: int = 0):
     """Add a stream; returns (stream, a copy of the working cache as its prefill leaves it, before the first token,
-    with the prompt's last hidden state appended). One token by default: the fused decode of these tiny shapes
-    is not deterministic run to run even chunk by chunk, so decoded tokens past the first prove nothing here."""
+    with the prompt's last hidden state appended). The tiny model's expert width is 640 (inside 512..1024, as the
+    real one's): the fused decode is then deterministic, so decoded tokens are compared too."""
 
     stream = LaneStream("s", list(ids), max_new)
     taken: list = []
     first = e._family_first
 
     def keep(stream, work, hidden, *args):
+        pool = e.model.model.__dict__.get("streamer")
+        stream.prefill_bytes = None if pool is None else pool.bytes_read          # before any decode row reads
         taken.extend(e.copy_single_cache(work))
         taken.append(SimpleNamespace(hidden=mx.array(hidden)))
         return first(stream, work, hidden, *args)
@@ -219,7 +221,8 @@ def test_groups_give_chunk_by_chunk_bits_with_the_draft_head_and_inner_checkpoin
 
 
 def test_a_tail_of_at_most_fused_rows_runs_alone_after_the_group(monkeypatch):
-    """The last chunk (10 rows) takes the fused decode path chunk by chunk too; the cache it starts from is equal."""
+    """The last chunk (10 rows) takes the fused decode path chunk by chunk too: the cache it starts from, its own
+    output, the cache it leaves and the decoded tokens are equal."""
 
     rt = runtime(tiny(), monkeypatch, drafts=False)
     ids = prompt(7058)
@@ -230,7 +233,7 @@ def test_a_tail_of_at_most_fused_rows_runs_alone_after_the_group(monkeypatch):
     grouped = engine(rt, True)
     two = prefill(grouped, ids, checkpoints=[cut])
     assert grouped.prefill_steps == (len(starts) - 1) * 8
-    bad: list[str] = []
+    bad = compare(one, two, "tail")
     (t1, c1), = one[0].history_checkpoints
     (t2, c2), = two[0].history_checkpoints
     assert t1 == t2 and len(t1) == cut
@@ -391,9 +394,8 @@ def test_streamed_experts_give_the_same_bits_with_one_window_fill_per_layer_a_gr
         assert pool.native == (native == "1")
         rt = runtime(model, monkeypatch, drafts=False)
         before = pool.bytes_read
-        # one token: decode rows through the pool fail on these tiny shapes chunk by chunk too (not a prompt matter)
         out[layer_major] = prefill(engine(rt, layer_major), ids, checkpoints=[chunks[2][0]])
-        out[layer_major, "loads"] = (pool.bytes_read - before) // pool_expert_nbytes(pool)
+        out[layer_major, "loads"] = (out[layer_major][0].prefill_bytes - before) // pool_expert_nbytes(pool)
         assert pool.error is None
         pool.close()
     assert not compare(out[False], out[True], "streamed")
@@ -420,7 +422,7 @@ def test_many_experts_and_small_chunks_keep_the_window_calls_in_order(tmp_path, 
         rt = runtime(model, monkeypatch, drafts=False)
         before = pool.bytes_read
         out[layer_major] = prefill(engine(rt, layer_major, SMALL), ids)
-        out[layer_major, "loads"] = (pool.bytes_read - before) // pool_expert_nbytes(pool)
+        out[layer_major, "loads"] = (out[layer_major][0].prefill_bytes - before) // pool_expert_nbytes(pool)
         assert pool.error is None
         pool.close()
     assert not compare(out[False], out[True], "small chunks")
