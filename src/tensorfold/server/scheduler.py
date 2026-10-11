@@ -337,8 +337,9 @@ class Scheduler(PromptFill):
 
             started = profile.now()
             self.prompt_memory.release_freed()
-            if profile.ACTIVE is not None:
-                profile.ACTIVE.event("release_freed", started, profile.now())
+            prof = profile.ACTIVE
+            if prof is not None:
+                prof.event("release_freed", started, profile.now())
 
     def _preempt_background(self) -> None:
         """Release background work until the next foreground request has both a lane and enough memory."""

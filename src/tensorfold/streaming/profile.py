@@ -22,6 +22,8 @@ import time
 import weakref
 from typing import Any
 
+_WRITE_MU = threading.Lock()
+
 ACTIVE: Recorder | None = None
 CLOCK_TOLERANCE_NS = 100_000          # steady_clock, mach_absolute_time and Metal GPU times share one domain on macOS
 MAX_MB = 1024                         # TENSORFOLD_DECODE_PROFILE_MAX_MB's default
@@ -186,14 +188,15 @@ class Recorder:
     def _write(self, text: str) -> None:
         """Append one request's lines; past the size cap, the current file becomes ``<path>.1`` first."""
 
-        try:
-            size = os.path.getsize(self.path)
-        except FileNotFoundError:
-            size = 0
-        if size and size + len(text) > self.max_bytes:
-            os.replace(self.path, self.path + ".1")
-        with open(self.path, "a") as handle:
-            handle.write(text)
+        with _WRITE_MU:  # parallel lanes flush concurrently: keep each request's lines whole and rotate once
+            try:
+                size = os.path.getsize(self.path)
+            except FileNotFoundError:
+                size = 0
+            if size and size + len(text) > self.max_bytes:
+                os.replace(self.path, self.path + ".1")
+            with open(self.path, "a") as handle:
+                handle.write(text)
 
 
 def check_clock(hs: Any) -> int:
