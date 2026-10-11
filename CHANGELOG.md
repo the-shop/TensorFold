@@ -3,6 +3,21 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Layer-major prompt groups (`TF_PREFILL_LAYER_MAJOR=1`, off by default).** Flash Next's prompt chunks can run in
+  groups, every chunk through a layer before the next layer, over the same chunk cuts and with the same per-call
+  shapes, so replies, caches and saved prompt states are bit for bit those of chunk-by-chunk prefill while the SSD
+  expert window is filled once per layer a group instead of once per layer a chunk. Checkpoints inside a group are
+  assembled per layer as each layer passes the cut. A group's carried activations are capped
+  (`TF_PREFILL_GROUP_GIB`, default 1) and counted in admission; a cancelled group keeps no half-filled state.
+  Ideas credited: staggered segments and per-chunk state marks of the upstream TensorFold native engine
+  (ashhart/TensorFold, `zig/src/core/segments.zig`, `zig/src/flashnext/marks.zig`), expert-major prefill with
+  offloaded experts in oMLX, and strata-mlx's planned overlap of next-layer reads with compute. No code copied.
+- **Expert pool tripwire and call log.** A prompt chunk's expert-window call now carries a tag the host checks, so a
+  call that would read another call's routing fails the request instead of loading the wrong experts.
+  `TF_POOL_JOBLOG=path` logs every pool call's host time, GPU gap and bytes (diagnostics, off by default).
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
