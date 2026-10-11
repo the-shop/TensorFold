@@ -404,6 +404,49 @@ def test_streamed_experts_give_the_same_bits_with_one_window_fill_per_layer_a_gr
     assert out[True, "loads"] <= layers * experts < out[False, "loads"]
 
 
+@pytest.mark.parametrize("fill", [1, 2])
+def test_a_failed_ssd_read_inside_a_group_keeps_no_checkpoint_of_it(tmp_path, monkeypatch, hostsync, fill):
+    """An EIO on the last layer's ``fill``-th window fill (Python pool), a group of two chunks with a checkpoint at the
+    cut between them. The failed call is one of the group's last two, so its error is first seen when the group's
+    calls are all answered: no checkpoint assembled inside the group may be kept (the scheduler would store it and
+    save a system block from it). Chunk by chunk keeps nothing past the failed chunk either."""
+
+    import tensorfold.streaming.pool as poolmod
+
+    monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", "0")
+    ids = prompt(2900)
+    chunks = PLAN.chunks(ids).between(0, len(ids))
+    assert [end for _, end in chunks] == [2048, 2900]
+    last = TEXT["num_hidden_layers"] - 1
+    real = poolmod.Streamer._fill_window
+    kept = {}
+    for layer_major in (False, True):
+        left = {"n": fill}
+
+        def flaky(self, layer, experts, left=left):
+            if layer == last:
+                left["n"] -= 1
+                if left["n"] == 0:
+                    raise OSError(5, "injected EIO")
+            return real(self, layer, experts)
+
+        model, pool = streamed(tmp_path)
+        rt = runtime(model, monkeypatch)
+        monkeypatch.setattr(poolmod.Streamer, "_fill_window", flaky)
+        e = engine(rt, layer_major)
+        stream = LaneStream("s", list(ids), 4)
+        with pytest.raises(RuntimeError, match="expert streaming"):
+            e.add_stream(stream, checkpoints_at=[2048])
+            while e.active_count:
+                e.step()
+        kept[layer_major] = [len(t) for t, _ in stream.history_checkpoints]
+        assert isinstance(pool.error, OSError) and "injected EIO" in str(pool.error)
+        monkeypatch.setattr(poolmod.Streamer, "_fill_window", real)
+        pool.close()
+    assert kept[True] == []
+    assert kept[False] == ([] if fill == 1 else [2048])          # chunk by chunk: the chunk before the failed one
+
+
 def pool_expert_nbytes(pool) -> int:
     from tensorfold.streaming.pool import expert_nbytes
 

@@ -220,7 +220,9 @@ class FamilyPrefill:
                            cuts: Sequence[int]) -> Any:
         """One layer-major group: its chunks' forwards, the draft head's absorbs in chunk order, and every inner
         checkpoint; the last chunk's hidden state [1, R, D] (evaluated). The working cache holds no prompt prefix
-        whole until the group ends: a failure keeps only the checkpoints already assembled."""
+        whole until the group ends. Inner checkpoints are kept only once every call of the group is answered without
+        a pool error: a failed group keeps none of its own, and a cancel while its calls run loses its progress (a
+        retry reruns the group from the last kept state)."""
 
         import mlx.core as mx
         import numpy as np
@@ -260,6 +262,9 @@ class FamilyPrefill:
 
             inputs = [np.array([[int(t) for t in prompt[begin:end]]], dtype=np.int64) for begin, end in group]
             outs = layer_major.prefill_group(model, inputs, work, before=before, after=after)
+            # every pool call is answered now; one that failed must leave no inner checkpoint (the serial path checks
+            # before it keeps a chunk's), or the scheduler would store and save a state built on stale experts
+            check_expert_stream(model)
             drafting = getattr(model, "mtp", None) is not None
             last = None
             for j, ((begin, end), (streams, hidden)) in enumerate(zip(group, outs)):
