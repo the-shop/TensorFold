@@ -163,3 +163,50 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, nativ
         streamer.close()
     finally:
         mx.set_default_device(previous)
+
+
+@needs_metal
+@pytest.mark.parametrize("native", ["1", "0"])
+def test_a_prompt_chunk_after_decode_is_the_same_with_window_reuse_on_and_off(tmp_path, monkeypatch, native):
+    """Decode fills the LRU, then a prompt chunk's window copies the experts it finds there: the hidden states equal
+    the resident model's and the reuse-off run's bit for bit."""
+
+    from tensorfold.streaming import build
+
+    try:
+        build.load()
+    except RuntimeError as error:                                        # no cmake or nanobind here
+        pytest.skip(str(error))
+    monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", native)
+    monkeypatch.setattr(glm5_fakes, "D", 512)
+    monkeypatch.setitem(glm5_fakes.TEXT, "hidden_size", 512)
+    monkeypatch.setitem(glm5_fakes.TEXT, "moe_intermediate_size", 512)
+    previous = mx.default_device()
+    mx.set_default_device(mx.gpu)
+    try:
+        folder = glm5_fakes.write_checkpoint(tmp_path / "glm", seed=2)
+        per = expert_nbytes(sources(folder, stream.expert_names(folder, 6))[0], 1)
+        rng = np.random.default_rng(7)
+        steps = [rng.integers(0, glm5_fakes.VOCAB, n) for n in (40, 1, 1, 4, 1, 40, 1)]
+        runs = {}
+        for reuse in ("resident", "1", "0"):
+            monkeypatch.setenv("TENSORFOLD_POOL_WINDOW_REUSE", reuse if reuse != "resident" else "1")
+            model = weights.load_backbone(folder, stream=reuse != "resident")
+            streamer = None if reuse == "resident" else stream.attach(model, folder, (2 * 8 + 12) * per / 2**30)
+            cache = model.make_cache()
+            outs = []
+            for step in steps:                                           # one forward per eval, as served
+                outs.append(model.hidden(mx.array(step, dtype=mx.uint32), cache))
+                mx.eval(outs[-1])
+            runs[reuse] = (outs, streamer)
+        for i in range(len(steps)):
+            assert same(runs["1"][0][i], runs["resident"][0][i]), i
+            assert same(runs["0"][0][i], runs["resident"][0][i]), i
+        on, off = runs["1"][1], runs["0"][1]
+        assert on.window_copies > 0 and off.window_copies == 0 and on.error is None and off.error is None
+        assert on.window_reads + on.window_copies == off.window_reads
+        assert on.bytes_read == off.bytes_read - on.copy_bytes and (on.hits, on.misses) == (off.hits, off.misses)
+        on.close()
+        off.close()
+    finally:
+        mx.set_default_device(previous)

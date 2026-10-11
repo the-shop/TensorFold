@@ -41,6 +41,14 @@ def native_wanted(env: dict | None = None) -> bool:
     return (env.get("TENSORFOLD_POOL_NATIVE", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
 
 
+def window_reuse_wanted(env: dict | None = None) -> bool:
+    """TENSORFOLD_POOL_WINDOW_REUSE=0 reads every window expert from the checkpoint (v0.2.0); otherwise a window
+    expert already in the decode LRU is copied from its slot."""
+
+    env = os.environ if env is None else env
+    return (env.get("TENSORFOLD_POOL_WINDOW_REUSE", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
+
+
 @dataclass
 class Source:
     """Where expert 0 of one tensor starts in a checkpoint file, and the bytes of one expert."""
@@ -112,12 +120,14 @@ class Streamer:
 
     With decode prefetch and prompt seeding off and an extension that has one, the extension's PoolServer serves
     the calls (no Python per call); otherwise the Python thread below does. Both keep the same LRU, slots and
-    counters for the same calls. ``pack`` (opt-in, native only): None follows TENSORFOLD_EXPERT_PACK, False is
+    counters for the same calls. A window expert already in the LRU is copied from its slot instead of read
+    (``window_reuse``; None follows TENSORFOLD_POOL_WINDOW_REUSE), which leaves the LRU as it was. ``pack`` (opt-in, native only): None follows TENSORFOLD_EXPERT_PACK, False is
     off, True is MODEL_DIR/experts.pack, a path is that pack; a pack in use must validate or the pool refuses it."""
 
     def __init__(self, found: dict, shapes: dict, *, layers: int, experts: int, top_k: int, slots: int,
                  box_rows: int, hostsync: Any, workers: int | None = None, decode_prefetch: int = 0,
-                 prompt_seed: int = 0, native: bool | None = None, pack: str | Path | bool | None = None) -> None:
+                 prompt_seed: int = 0, native: bool | None = None, pack: str | Path | bool | None = None,
+                 window_reuse: bool | None = None) -> None:
         if slots < 2 * experts:
             raise ValueError(f"the expert pool needs a layer's {experts} window slots plus as many for decode, "
                              f"got {slots}")
@@ -144,6 +154,8 @@ class Streamer:
         self.pack_path: Path | None = None                              # the expert pack the native server reads
         self._error: BaseException | None = None
         self.hits = self.misses = self.bytes_read = 0
+        self.window_reuse = window_reuse_wanted() if window_reuse is None else bool(window_reuse)
+        self.window_reads = self.window_copies = self.copy_bytes = 0
         workers = pool_threads() if workers is None else int(workers)
         self._bytes_lock = threading.Lock()                             # reader threads add to bytes_read
         self._readers = ThreadPoolExecutor(workers, thread_name_prefix="expert-read")
@@ -194,7 +206,7 @@ class Streamer:
         server = self.hs.PoolServer(self.channel, self.box, self.slot_of,
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
-                                    workers, TIMEOUT_MS)
+                                    workers, TIMEOUT_MS, self.window_reuse)
         path = packs.choose(self._model_dir(), pack=pack)
         if path is None:
             return server
@@ -233,9 +245,11 @@ class Streamer:
     def error(self, value: BaseException | None) -> None:
         self._error = value
 
-    def _counter(index: int, name: str) -> property:   # a property factory, run in the class body
+    def _counter(index: int, name: str, method: str = "counters") -> property:   # a property factory (class body)
         def get(self) -> int:
-            return int(self._server.counters()[index]) if self._server is not None else self.__dict__[name]
+            if self._server is not None:
+                return int(getattr(self._server, method)()[index])
+            return self.__dict__[name]
 
         def put(self, value: int) -> None:
             self.__dict__[name] = value
@@ -245,6 +259,9 @@ class Streamer:
     hits = _counter(0, "_hits")
     misses = _counter(1, "_misses")
     bytes_read = _counter(2, "_bytes_read")
+    window_reads = _counter(0, "_window_reads", "window_counters")
+    window_copies = _counter(1, "_window_copies", "window_counters")
+    copy_bytes = _counter(2, "_copy_bytes", "window_counters")
     del _counter
 
     def lru_items(self) -> list[tuple[tuple[int, int], int]]:
@@ -286,15 +303,20 @@ class Streamer:
         return {proj: Slots(*(getattr(s, p)[:self.experts] for p in PARTS)) for proj, s in self.pool.items()}
 
     def stats(self) -> dict[str, int | str]:
-        """Hits, misses and bytes read; with decode prefetch or prompt seeding on, their counters too; the native
-        server's read counts; and "error" once a call failed (the pool then refuses every later call)."""
+        """Hits, misses and bytes read; window experts read, and copied from the LRU (with the bytes copied); with
+        decode prefetch or prompt seeding on, their counters too; the native server's read counts; and "error" once a
+        call failed (the pool then refuses every later call)."""
 
         if self._server is not None:
             hits, misses, read, preads = self._server.counters()
-            out = {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "native": 1,
+            reads, copies, copied = self._server.window_counters()
+            out = {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "window_reads": int(reads),
+                   "window_copies": int(copies), "copy_bytes": int(copied), "native": 1,
                    "packed": int(self._server.packed()), "preads": int(preads), "threads": int(self._server.workers())}
             return self._with_error(out)
-        out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read)}
+        out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read),
+               "window_reads": int(self.window_reads), "window_copies": int(self.window_copies),
+               "copy_bytes": int(self.copy_bytes)}
         if self.decode_prefetch:
             out.update(prefetch_issued=self.prefetch_issued, prefetch_hits=self.prefetch_hits,
                        prefetch_misses=self.prefetch_misses, prefetch_cancelled=self.prefetch_cancelled)
@@ -490,11 +512,46 @@ class Streamer:
         for e, slot in table:
             self.hs.write_into(self.slot_of, 4 * (layer * self.experts + e), struct.pack("<i", slot))
 
+    def _resident(self, key: tuple[int, int]) -> int | None:
+        """The LRU slot holding ``key`` with all its bytes (a speculative read still in flight is not), no recency
+        change: an eviction policy that replaces the LRU reimplements only this lookup."""
+
+        return None if key in self.pending else self.lru.get(key)
+
     def _fill_window(self, layer: int, ids: list[int]) -> None:
-        need = [(e, e) for e in ids if self.window[e] != layer]
+        reuse = self.window_reuse and self._error is None       # after a failure an LRU slot may be partly read
+        need, copy = [], []
+        for e in ids:
+            if self.window[e] == layer:
+                continue
+            src = self._resident((layer, e)) if reuse else None
+            if src is None:
+                need.append((e, e))
+            else:
+                copy.append((e, src))
         self._read_all(layer, need)
-        for e, _ in need:
+        self._copy_all(copy)
+        self.window_reads += len(need)
+        self.window_copies += len(copy)
+        self.copy_bytes += len(copy) * sum(a.nbytes // a.shape[0] for s in self.pool.values()
+                                           for a in (s.weight, s.scales, s.biases))
+        for e, _ in need + copy:
             self.window[e] = layer
+
+    def _copy_all(self, copy: list[tuple[int, int]]) -> None:
+        """(dst, src) slot pairs, every part: src in the LRU, dst in the window."""
+
+        arrays = [getattr(s, part) for s in self.pool.values() for part in PARTS]
+
+        def one(item):
+            (dst, src), a = item
+            n = a.nbytes // a.shape[0]
+            if hasattr(self.hs, "copy_within"):
+                self.hs.copy_within(a, dst * n, src * n, n)
+            else:
+                self.hs.write_into(a, dst * n, self.hs.peek(a, src * n, n))
+
+        list(self._readers.map(one, [(pair, a) for pair in copy for a in arrays]))
 
     def _evict(self, keep: set) -> int:
         for key in self.lru:
@@ -545,4 +602,4 @@ class Streamer:
 
 
 __all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "native_wanted", "pool_threads",
-           "sources"]
+           "sources", "window_reuse_wanted"]

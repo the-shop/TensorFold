@@ -163,3 +163,18 @@ def test_the_window_holds_expert_e_of_one_layer_in_slot_e(tmp_path):
 def test_a_pool_without_room_for_a_window_and_decode_is_refused(tmp_path):
     with pytest.raises(ValueError, match="window"):
         streamer(tmp_path, slots=2 * EXPERTS - 1)
+
+
+def test_a_window_expert_in_the_lru_is_copied_from_its_slot(tmp_path):
+    s, fake = streamer(tmp_path, slots=2 * EXPERTS + 4)                  # FakeSync: no copy_within, peek + write
+    call(s, fake, "rows", 1, [3, 5, 6, 6])
+    lru, read = list(s.lru.items()), s.bytes_read
+    call(s, fake, "window", 1, [3, 5, 1])
+    assert (s.window_reads, s.window_copies) == (1, 2) and s.bytes_read - read == pool.expert_nbytes(s.found, 1)
+    assert list(s.lru.items()) == lru and (s.hits, s.misses) == (0, 3)
+    for e in (1, 3, 5):
+        for proj in s.pool:
+            for part, size in (("weight", 32), ("scales", 8), ("biases", 8)):
+                got = fake.buf(getattr(s.pool[proj], part))[e * size:(e + 1) * size]
+                assert (got == 16 + e).all(), (e, proj, part)
+    s.close()

@@ -26,7 +26,8 @@ PROJS = ("gate", "up", "down")
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in ("TENSORFOLD_EXPERT_PACK", "TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS"):
+    for name in ("TENSORFOLD_EXPERT_PACK", "TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS",
+                 "TENSORFOLD_POOL_WINDOW_REUSE"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -93,10 +94,10 @@ def names(per_expert: bool) -> dict:
     return out
 
 
-def make(hs, folder, slots, native, pack=False, per_expert=False, workers=4):
+def make(hs, folder, slots, native, pack=False, per_expert=False, workers=4, reuse=None):
     found, shapes = pool.sources(folder, names(per_expert))
     s = pool.Streamer(found, shapes, layers=LAYERS, experts=EXPERTS, top_k=TOPK, slots=slots, box_rows=BOX_ROWS,
-                      hostsync=hs, workers=workers, native=native, pack=pack)
+                      hostsync=hs, workers=workers, native=native, pack=pack, window_reuse=reuse)
     assert s.native == native
     return s
 
@@ -125,6 +126,7 @@ def snapshot(hs, s) -> dict:
     out["free"] = s.free_slots()
     out["window"] = s.window_layers()
     out["counters"] = (s.hits, s.misses, s.bytes_read)
+    out["window_counters"] = (s.window_reads, s.window_copies, s.copy_bytes)
     return out
 
 
@@ -168,13 +170,14 @@ def random_sequence(seed: int, n: int) -> list:
 
 # -- native == Python ------------------------------------------------------------------------------------------
 
+@pytest.mark.parametrize("reuse", [True, False])
 @pytest.mark.parametrize("per_expert", [False, True])
 @pytest.mark.parametrize("slots,sequence", [(2 * EXPERTS + 3, SEQUENCE), (2 * EXPERTS, random_sequence(1, 150)),
                                             (2 * EXPERTS + 5, random_sequence(2, 150))])
-def test_native_serves_exactly_as_python(hs, tmp_path, per_expert, slots, sequence):
+def test_native_serves_exactly_as_python(hs, tmp_path, per_expert, slots, sequence, reuse):
     truth = write_checkpoint(tmp_path, per_expert, seed=3)
-    py = make(hs, tmp_path, slots, native=False, per_expert=per_expert)
-    nat = make(hs, tmp_path, slots, native=True, per_expert=per_expert)
+    py = make(hs, tmp_path, slots, native=False, per_expert=per_expert, reuse=reuse)
+    nat = make(hs, tmp_path, slots, native=True, per_expert=per_expert, reuse=reuse)
     for kind, layer, ids in sequence:
         call(hs, py, kind, layer, ids)
         call(hs, nat, kind, layer, ids)
@@ -184,11 +187,108 @@ def test_native_serves_exactly_as_python(hs, tmp_path, per_expert, slots, sequen
         assert a[key] == b[key], key
     check_resident(hs, nat, truth)
     assert nat.stats()["native"] == 1 and nat.stats()["packed"] == 0
-    assert {k: nat.stats()[k] for k in ("hits", "misses", "bytes_read")} == py.stats()
+    shared = ("hits", "misses", "bytes_read", "window_reads", "window_copies", "copy_bytes")
+    assert {k: nat.stats()[k] for k in shared} == py.stats()
+    assert (nat.window_copies > 0) == reuse
     found, _ = pool.sources(tmp_path, names(per_expert))
     assert nat.stats()["preads"] * pool.expert_nbytes(found, 0) == 9 * nat.bytes_read     # 9 parts an expert
     py.close()
     nat.close()
+
+
+@pytest.mark.parametrize("pack", [False, True])
+@pytest.mark.parametrize("slots,sequence", [(2 * EXPERTS + 3, SEQUENCE), (2 * EXPERTS, random_sequence(1, 150)),
+                                            (3 * EXPERTS, random_sequence(4, 150))])
+def test_window_reuse_lands_the_same_bytes_and_leaves_the_lru_alone(hs, tmp_path, slots, sequence, pack):
+    """Reuse on vs off, native and Python: every pool byte, the slot table, LRU, free list, window, hits and misses
+    are the same; only window experts move from reads to copies, and bytes_read drops by exactly the bytes copied."""
+
+    truth = write_checkpoint(tmp_path, seed=11)
+    if pack:
+        packs.build(pool.sources(tmp_path, names(False))[0], EXPERTS, tmp_path / packs.PACK_NAME)
+    runs = {(native, reuse): make(hs, tmp_path, slots, native=native, pack=pack and native, reuse=reuse)
+            for native in (False, True) for reuse in (False, True)}
+    for kind, layer, ids in sequence:
+        for s in runs.values():
+            call(hs, s, kind, layer, ids)
+    snaps = {k: snapshot(hs, s) for k, s in runs.items()}
+    ref = snaps[(False, False)]
+    for k, snap in snaps.items():
+        for key in ref:
+            if key not in ("counters", "window_counters"):
+                assert snap[key] == ref[key], (k, key)
+        assert snap["counters"][:2] == ref["counters"][:2], k
+    per = pool.expert_nbytes(pool.sources(tmp_path, names(False))[0], 0)
+    for native in (False, True):
+        off, on = runs[(native, False)], runs[(native, True)]
+        assert off.window_copies == off.copy_bytes == 0
+        assert on.window_copies > 0 and on.copy_bytes == on.window_copies * per
+        assert on.window_reads + on.window_copies == off.window_reads
+        assert on.bytes_read == off.bytes_read - on.copy_bytes
+        check_resident(hs, on, truth)
+    if not pack:
+        nat_on = runs[(True, True)]
+        assert nat_on.stats()["preads"] * per == 9 * nat_on.bytes_read          # copies are not preads
+    for s in runs.values():
+        s.close()
+
+
+def test_a_window_expert_in_the_lru_is_copied_not_read(hs, tmp_path):
+    truth = write_checkpoint(tmp_path, seed=12)
+    per = pool.expert_nbytes(pool.sources(tmp_path, names(False))[0], 0)
+    for native in (False, True):
+        s = make(hs, tmp_path, 2 * EXPERTS + 4, native=native)
+        call(hs, s, "rows", 1, [3, 5, 6, 6])
+        lru, free, read = s.lru_items(), s.free_slots(), s.bytes_read
+        call(hs, s, "window", 1, [3, 5, 1])
+        assert s.bytes_read - read == per and (s.window_reads, s.window_copies) == (1, 2)
+        assert s.lru_items() == lru and s.free_slots() == free and (s.hits, s.misses) == (0, 3)
+        check_resident(hs, s, truth)
+        s.close()
+
+
+def test_the_kill_switch_reads_every_window_expert(hs, tmp_path, monkeypatch):
+    write_checkpoint(tmp_path)
+    monkeypatch.setenv("TENSORFOLD_POOL_WINDOW_REUSE", "0")
+    for native in (False, True):
+        s = make(hs, tmp_path, 2 * EXPERTS + 4, native=native)
+        assert not s.window_reuse and (not native or not s._server.window_reuse())
+        call(hs, s, "rows", 1, [3, 5, 6, 6])
+        call(hs, s, "window", 1, [3, 5, 1])
+        assert (s.window_reads, s.window_copies, s.copy_bytes) == (3, 0, 0)
+        s.close()
+    assert pool.window_reuse_wanted({}) and not pool.window_reuse_wanted({"TENSORFOLD_POOL_WINDOW_REUSE": "off"})
+
+
+def test_after_a_failed_read_the_window_reads_instead_of_copying(hs, tmp_path):
+    """A rows call whose read fails leaves its LRU keys pushed (maybe partly read); a window call queued behind it
+    must not copy from them: with an error recorded every window expert is read from the checkpoint."""
+
+    truth = write_checkpoint(tmp_path, seed=13)
+    found, _ = pool.sources(tmp_path, names(False))
+    last = found[(2, "down", "biases")]                          # the last tensor of its shard
+    assert last.offset + EXPERTS * last.nbytes == last.path.stat().st_size
+    with open(last.path, "r+b") as f:                            # experts 6 and 7 of that tensor gone
+        f.truncate(last.offset + 6 * last.nbytes)
+    for native in (False, True):
+        s = make(hs, tmp_path, 2 * EXPERTS + 4, native=native)
+        rows = s.marks("rows", 2, 2)
+        window = s.marks("window", 2, 1)                         # queued before the failure is known
+        hs.write_into(s.box, 0, struct.pack("<4I", 1, 6, 1, 6))
+        s.channel.signal(rows[0])
+        assert s.channel.wait(rows[1], 10_000)
+        assert isinstance(s.error, RuntimeError) and "short read" in str(s.error)
+        assert (2, 1) in dict(s.lru_items())
+        words = [0] * EXPERTS
+        words[1] = 1
+        hs.write_into(s.box, 0, struct.pack(f"<{EXPERTS}I", *words))
+        s.channel.signal(window[0])
+        assert s.channel.wait(window[1], 10_000)
+        assert (s.window_reads, s.window_copies) == (1, 0)
+        assert s.window_layers()[1] == 2
+        for (proj, part), blob in truth[(2, 1)].items():
+            assert slot_part(hs, s, proj, part, 1) == blob
+        s.close()
 
 
 def test_preads_are_nine_an_expert_unpacked_and_one_packed(hs, tmp_path):

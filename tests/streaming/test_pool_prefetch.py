@@ -110,7 +110,10 @@ def test_flags_off_is_the_old_lru_slot_for_slot(tmp_path, flags):
     assert s.free == ref.free and (s.hits, s.misses) == (ref.hits, ref.misses)
     for (layer, e), slot in ref.table.items():
         assert table(s, fake)[layer, e] == slot
-    assert s.stats() == {"hits": ref.hits, "misses": ref.misses, "bytes_read": s.bytes_read}
+    assert s.stats() == {"hits": ref.hits, "misses": ref.misses, "bytes_read": s.bytes_read,
+                         "window_reads": s.window_reads, "window_copies": s.window_copies,
+                         "copy_bytes": s.copy_bytes}
+    assert (s.window_reads, s.window_copies) == (2, 1)                  # (0, 2) was resident: copied
     assert s.guess_box is None and s.prompt_counts is None and s._seeders is None
     assert not s.pending and not s.speculative
     s.close()
@@ -253,6 +256,35 @@ def test_a_routed_seed_still_queued_is_read_on_demand_not_behind_the_seeds(tmp_p
         s.close()
 
 
+def test_a_seed_still_reading_is_not_copied_into_the_window(tmp_path):
+    s, fake = make(tmp_path, slots=3 * EXPERTS, prompt_seed=1)
+    gate = threading.Event()
+    real = s._read
+
+    def gated(layer, proj, part, expert, slot):
+        if (layer, expert) == (1, 6) and slot >= EXPERTS:                # only the seed's read into its LRU slot
+            gate.wait(10)
+        real(layer, proj, part, expert, slot)
+
+    call(s, fake, "window", 1, [6] * 3)
+    s._read = gated
+    try:
+        call(s, fake, "rows", 0, [0, 0])                                 # seeds (1, 6) behind this call
+        end = time.monotonic() + 5
+        while s.seeded < 1:
+            assert time.monotonic() < end
+            time.sleep(0.005)
+        call(s, fake, "window", 0, [6])                                  # window slot 6 now holds layer 0's
+        assert (1, 6) in s.lru and (1, 6) in s.pending
+        reads, copies = s.window_reads, s.window_copies
+        call(s, fake, "window", 1, [6])
+        assert (s.window_reads - reads, s.window_copies - copies) == (1, 0)
+        assert (slot_bytes(s, fake, 6) == 16 + 6).all()
+    finally:
+        gate.set()
+        s.close()
+
+
 # -- stale guesses ---------------------------------------------------------------------------------------------
 
 def test_stale_guesses_are_cancelled_and_partial_slots_freed(tmp_path):
@@ -385,8 +417,9 @@ def test_health_reports_the_new_counters_only_when_on(tmp_path):
 
     off, _ = make(tmp_path, slots=3 * EXPERTS)
     on, _ = make(tmp_path, slots=3 * EXPERTS, decode_prefetch=2, prompt_seed=4)
-    for s, keys in ((off, {"hits", "misses", "bytes_read"}),
-                    (on, {"hits", "misses", "bytes_read", "prefetch_issued", "prefetch_hits", "prefetch_misses",
+    window = {"window_reads", "window_copies", "copy_bytes"}
+    for s, keys in ((off, {"hits", "misses", "bytes_read", *window}),
+                    (on, {"hits", "misses", "bytes_read", *window, "prefetch_issued", "prefetch_hits", "prefetch_misses",
                           "prefetch_cancelled", "seeded", "seed_hits"})):
         inner = SimpleNamespace()
         inner.__dict__["streamer"] = s
