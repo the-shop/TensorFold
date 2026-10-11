@@ -1,12 +1,26 @@
 {
  "qwen4_exp-v1-n1|e1": {
   "mlx=0.32.2|gpu=applegpu_g17s": {
-   "q4-canary": "136:762a4ba4f4516254",
-   "q4-mlx-route": "136:e8adfc351aa35657",
-   "q4-sparse": "58e0126e4099768a",
-   "q8-canary": "136:2fe4b99c7299593c",
-   "q8-mlx-route": "136:7fff5576e3a68b14",
-   "q8-sparse": "3c949d0955a99818"
+   "q4-canary": "136:f7a72ab9aae55106",
+   "q4-long-8192": "421cee30a7f3bce5",
+   "q4-long-8448": "5d3a793fa3abee46",
+   "q4-mlx-route": "136:3966a2957a5a7e72",
+   "q4-mlx-route-long-8448": "811e86949f913b49",
+   "q4-sparse": "93ca0b348531f571",
+   "q4-tail-1": "6249574819a5be13",
+   "q4-tail-2": "748f0ec1d0cfffed",
+   "q4-tail-3": "4231f931f4c976f2",
+   "q4-tail-4": "a10921b9d9aa2695",
+   "q8-canary": "136:3e524e5d27a4e480",
+   "q8-long-8192": "0941af72a8c6f5e6",
+   "q8-long-8448": "ddb1c9375606e3b7",
+   "q8-mlx-route": "136:1383240f0cc2bd43",
+   "q8-mlx-route-long-8448": "a8870f3f9492ad5a",
+   "q8-sparse": "5ea12eed8eaf59ab",
+   "q8-tail-1": "c7500e52d15cfe42",
+   "q8-tail-2": "cfa86a9feff466ff",
+   "q8-tail-3": "41eefdf237238999",
+   "q8-tail-4": "758415a0304ddb0f"
   }
  }
 }

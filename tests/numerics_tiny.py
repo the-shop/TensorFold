@@ -1,5 +1,11 @@
 """A tiny deterministic Flash Next and the prompt-cache digests the numerics golden test pins (GPU).
 
+The full-attention layer sits second, so its output reaches the later layers' cached states: the digests depend on
+prompt attention (dense and selected-blocks), not only on its keys and values. The cases straddle each size the
+prefill code switches on: chunks of 8192 tokens (32768 expert rows, MLX's sorted gather in one call) and 8448
+(33792 rows: split in MAX_SORTED_ROWS slices), more than DENSE_KEYS keys (selected-blocks attention, unpatched),
+and last chunks of 1, 2, 3 and 4 rows (GDN's PIPE_ROWS kernel; hc's SCALAR_ROWS path and the 8-row tiles).
+
 Run as a script it prints the digests as JSON: the key tests run it on an edited copy of the package.
 """
 
@@ -12,7 +18,7 @@ from typing import Any
 
 TEXT = {
     "hidden_size": 512, "num_hidden_layers": 4, "vocab_size": 128, "rms_norm_eps": 1e-6,
-    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    "layer_types": ["linear_attention", "full_attention", "linear_attention", "linear_attention"],
     "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 256,
     "rope_parameters": {"rope_theta": 10000, "partial_rotary_factor": 0.25, "mrope_section": [2, 1, 1]},
     "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 128,
@@ -26,11 +32,16 @@ TEXT = {
 }
 ASSISTANT = (3, 4)                       # the tiny plan's reply marker: the canary cuts there
 SPARSE_PROMPT = 300                      # past the patched dense limit: the selected-blocks attention runs
+LONG_EVEN = 8192                         # the largest production chunk: 32768 expert rows, one sorted gather
+LONG_SPLIT = 8448                        # 33792 expert rows: past MAX_SORTED_ROWS, so split; past DENSE_KEYS
+LONG_TAIL = {LONG_EVEN: 3, LONG_SPLIT: 100}   # then a chunk past those keys (a PIPE tail, a 400-row chunk)
+TAIL_CHUNK = 64                          # a chunk of this many tokens, then a last one of each TAILS rows
+TAILS = (1, 2, 3, 4)
 
 
 def tiny_model(bits: int, group: int, seed: int = 0) -> Any:
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     from mlx.utils import tree_flatten
 
     from tensorfold.families.qwen4_exp import model as q4
@@ -49,11 +60,14 @@ def tiny_model(bits: int, group: int, seed: int = 0) -> Any:
     return model
 
 
-def digests() -> dict[str, str]:
-    """Each case's prompt-cache digest; every case runs twice and must repeat bit for bit."""
-
-    import mlx.core as mx
+def _tokens(seed: int, n: int) -> list[int]:
     import numpy as np
+
+    return [int(t) for t in np.random.default_rng(seed).integers(6, TEXT["vocab_size"], size=n)]
+
+
+def _cases(bits: int, group: int, out: dict[str, str]) -> None:
+    import mlx.core as mx
 
     from tensorfold.engine import numerics
     from tensorfold.engine.lane_engine import LaneEngine
@@ -61,39 +75,53 @@ def digests() -> dict[str, str]:
     from tensorfold.families.qwen4_exp import model as q4
     from tensorfold.families.qwen4_exp.runtime import FlashNext
 
-    mx.set_default_device(mx.gpu)
     plan = PrefillPlan(128, (), 64, ASSISTANT)
-    grid = PrefillPlan(128)
-    sparse = [int(t) for t in np.random.default_rng(5).integers(6, TEXT["vocab_size"], size=SPARSE_PROMPT)]
-    out: dict[str, str] = {}
+    runtime = FlashNext(tiny_model(bits, group), drafts=0)
+    engine = LaneEngine(runtime, prefill_plan=plan)
+
+    def prefill(step: int, tokens: list[int]) -> str:
+        return numerics.cache_digest(LaneEngine(runtime, prefill_plan=PrefillPlan(step)).prefill_prefix(tokens))[:16]
 
     def twice(name: str, run: Any) -> None:
         first, second = run(), run()
         if first != second:
             raise AssertionError(f"{name}: two runs of the same code differ ({first} vs {second})")
-        out[name] = first
+        out[f"q{bits}-{name}"] = first
+        mx.clear_cache()
 
+    twice("canary", lambda: numerics.canary_digest(engine, plan, TEXT["vocab_size"]))
+    dense_keys = q4.prefill.DENSE_KEYS
+    q4.prefill.DENSE_KEYS = 64
+    try:
+        twice("sparse", lambda: prefill(128, _tokens(5, SPARSE_PROMPT)))
+    finally:
+        q4.prefill.DENSE_KEYS = dense_keys
+    for step, tail in LONG_TAIL.items():
+        twice(f"long-{step}", lambda step=step, tail=tail: prefill(step, _tokens(step, step + tail)))
+    for rows in TAILS:
+        twice(f"tail-{rows}", lambda rows=rows: prefill(TAIL_CHUNK, _tokens(rows, TAIL_CHUNK + rows)))
+    previous = os.environ.get("TF_FLASH_PREFILL")
+    os.environ["TF_FLASH_PREFILL"] = "0"
+    try:
+        twice("mlx-route", lambda: numerics.canary_digest(engine, plan, TEXT["vocab_size"]))
+        twice(f"mlx-route-long-{LONG_SPLIT}",
+              lambda: prefill(LONG_SPLIT, _tokens(LONG_SPLIT, LONG_SPLIT + LONG_TAIL[LONG_SPLIT])))
+    finally:
+        if previous is None:
+            os.environ.pop("TF_FLASH_PREFILL", None)
+        else:
+            os.environ["TF_FLASH_PREFILL"] = previous
+
+
+def digests() -> dict[str, str]:
+    """Each case's prompt-cache digest; every case runs twice and must repeat bit for bit."""
+
+    import mlx.core as mx
+
+    mx.set_default_device(mx.gpu)
+    out: dict[str, str] = {}
     for bits, group in ((8, 64), (4, 32)):
-        runtime = FlashNext(tiny_model(bits, group), drafts=0)
-        engine = LaneEngine(runtime, prefill_plan=plan)
-        twice(f"q{bits}-canary", lambda: numerics.canary_digest(engine, plan, TEXT["vocab_size"]))
-        dense_keys = q4.prefill.DENSE_KEYS
-        q4.prefill.DENSE_KEYS = 64
-        try:
-            sparse_engine = LaneEngine(runtime, prefill_plan=grid)
-            twice(f"q{bits}-sparse", lambda: numerics.cache_digest(sparse_engine.prefill_prefix(sparse))[:16])
-        finally:
-            q4.prefill.DENSE_KEYS = dense_keys
-        previous = os.environ.get("TF_FLASH_PREFILL")
-        os.environ["TF_FLASH_PREFILL"] = "0"
-        try:
-            twice(f"q{bits}-mlx-route", lambda: numerics.canary_digest(engine, plan, TEXT["vocab_size"]))
-        finally:
-            if previous is None:
-                os.environ.pop("TF_FLASH_PREFILL", None)
-            else:
-                os.environ["TF_FLASH_PREFILL"] = previous
-        del runtime, engine, sparse_engine
+        _cases(bits, group, out)
         mx.clear_cache()
     return out
 
