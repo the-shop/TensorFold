@@ -6,7 +6,7 @@ from functools import partial
 import time
 from typing import Any, Iterator, Sequence
 
-from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares
+from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares, stream_note
 from tensorfold.engine.prefill_plan import PromptChunks
 
 
@@ -53,6 +53,7 @@ class FamilyPrefill:
             if self.prefill_guard is not None:
                 self.prefill_guard.before_chunk(cache, len(chunk))
             self._prefill_at = None                    # a chunk in flight: the cache holds no prompt prefix whole
+            stream_note(self.model, f"chunk {begin} {end}")
             inputs = mx.array([chunk], dtype=mx.uint32)
             hidden = (self.model.prefill_vision(inputs, cache, prompt_data, begin, end)
                       if prompt_data is not None else feed(inputs, cache))
@@ -69,6 +70,7 @@ class FamilyPrefill:
             reads_last = n + 1 == len(chunks) or (drafting and getattr(self.model, "draft_reads_hidden", True))
             mx.eval(*((last,) if reads_last else ()), *cache_arrays(cache))
             check_expert_stream(self.model)
+            stream_note(self.model, f"chunk-done {begin} {end}")
             self._prefill_at = end
             if self.prefill_guard is not None:
                 self.prefill_guard.after_chunk(cache, len(chunk))

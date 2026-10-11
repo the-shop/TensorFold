@@ -1,5 +1,6 @@
 // The GPU signals and waits for the host inside MLX's command stream through an MTLSharedEvent, never an MLX eval.
 
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -291,7 +292,8 @@ class PoolServer {
     }
   }
 
-  // One MoE call: kind 0 = decode rows (rows x top_k ids in the box), 1 = window (E presence flags).
+  // One MoE call: kind 0 = decode rows (rows x top_k ids in the box), 1 = window (E presence flags), 2 = window
+  // whose flags carry their call's tag (box word E = the signal's low 32 bits, written before the flags).
   void submit(int kind, int layer, int rows, uint64_t signal, uint64_t ready) {
     {
       std::lock_guard<std::mutex> lk(jobs_mu_);
@@ -325,6 +327,16 @@ class PoolServer {
   std::vector<int> window() {
     std::lock_guard<std::mutex> lk(state_mu_);
     return window_;
+  }
+
+  // Per-call timing (diagnostics): (kind, layer, rows, signal seen ns, ready ns, bytes read, preads), uptime clock.
+  void set_log(bool on) { log_on_.store(on); }
+
+  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> take_log() {
+    std::lock_guard<std::mutex> lk(log_mu_);
+    std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> out;
+    out.swap(log_);
+    return out;
   }
 
   bool packed() const { return pack_fd_ >= 0; }
@@ -369,11 +381,17 @@ class PoolServer {
         jobs_.pop_front();
       }
       if (job.stop) break;
+      uint64_t seen = 0, bytes0 = 0, preads0 = 0;
       try {
         if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing, fail it
           record("RuntimeError", "expert streaming closed before the GPU reached layer " + std::to_string(job.layer));
           channel_->signal(job.ready);
           continue;
+        }
+        if (log_on_.load()) {
+          seen = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+          bytes0 = bytes_read_.load();
+          preads0 = preads_.load();
         }
         std::lock_guard<std::mutex> lk(state_mu_);
         if (job.kind == 0) {
@@ -387,10 +405,22 @@ class PoolServer {
           routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
           load(job.layer, routed);
         } else {
-          const uint32_t* flags = box_.data<uint32_t>();
+          const volatile uint32_t* flags = box_.data<uint32_t>();
+          const bool tagged = job.kind == 2;
+          const uint32_t want = static_cast<uint32_t>(job.signal);
+          if (tagged && box_.nbytes() < static_cast<size_t>(experts_ + 1) * sizeof(uint32_t)) {
+            throw PoolError("IndexError", "peek: the array is not evaluated or the range passes its end");
+          }
+          uint32_t before = tagged ? flags[experts_] : want;
           std::vector<int64_t> present;
           for (int e = 0; e < experts_; ++e) {
             if (flags[e] != 0) present.push_back(e);
+          }
+          uint32_t after = tagged ? flags[experts_] : want;
+          if (before != want || after != want) {   // another call's routing is in the box: prompt calls out of order
+            throw PoolError("RuntimeError", "window call for layer " + std::to_string(job.layer) +
+                                                " found another call's routing in the box (tag " + std::to_string(before) +
+                                                "/" + std::to_string(after) + ", expected " + std::to_string(want) + ")");
           }
           fill_window(job.layer, present);
         }
@@ -400,6 +430,11 @@ class PoolServer {
         record("MemoryError", e.what());
       } catch (const std::exception& e) {
         record("RuntimeError", e.what());
+      }
+      if (seen) {
+        uint64_t done = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        std::lock_guard<std::mutex> lk(log_mu_);
+        log_.emplace_back(job.kind, job.layer, job.rows, seen, done, bytes_read_.load() - bytes0, preads_.load() - preads0);
       }
       channel_->signal(job.ready);   // the GPU always gets its release; the next Python call raises
     }
@@ -563,6 +598,9 @@ class PoolServer {
   std::vector<int> free_, window_;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, bytes_read_{0}, preads_{0};
+  std::atomic<bool> log_on_{false};
+  std::mutex log_mu_;
+  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> log_;
   std::mutex error_mu_;
   std::optional<std::pair<std::string, std::string>> error_;
 
@@ -605,6 +643,8 @@ NB_MODULE(_hostsync, m) {
       .def("lru_items", &PoolServer::lru_items)
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
+      .def("set_log", &PoolServer::set_log, nb::arg("on"))
+      .def("take_log", &PoolServer::take_log)
       .def("packed", &PoolServer::packed)
       .def("workers", &PoolServer::workers)
       .def("close", &PoolServer::close, nb::call_guard<nb::gil_scoped_release>());

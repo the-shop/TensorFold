@@ -7,6 +7,7 @@ import queue
 import struct
 import sys
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_all
@@ -22,7 +23,7 @@ from tensorfold.streaming.checkpoint import headers
 PARTS = ("weight", "scales", "biases")
 _DTYPES = {"U32": mx.uint32, "BF16": mx.bfloat16, "F16": mx.float16, "F32": mx.float32}
 TIMEOUT_MS = 60_000          # a layer's loads finish long before this; past it the forward fails
-_KINDS = {"rows": 0, "window": 1}
+_KINDS = {"rows": 0, "window": 1, "window_tagged": 2}
 _ERRORS = {"TimeoutError": TimeoutError, "ValueError": ValueError, "MemoryError": MemoryError,
            "IndexError": IndexError, "KeyError": KeyError, "RuntimeError": RuntimeError}
 
@@ -32,6 +33,17 @@ def pool_threads(env: dict | None = None) -> int:
 
     env = os.environ if env is None else env
     return min(256, max(1, int(env.get("TENSORFOLD_POOL_THREADS", "8") or 8)))
+
+
+def job_log_path(env: dict | None = None) -> str:
+    """TF_POOL_JOBLOG=path appends one line per pool call (diagnostics): kind layer rows seen_ns ready_ns bytes preads."""
+
+    env = os.environ if env is None else env
+    return (env.get("TF_POOL_JOBLOG", "") or "").strip()
+
+
+def _now_ns() -> int:
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) if hasattr(time, "CLOCK_UPTIME_RAW") else time.monotonic_ns()
 
 
 def native_wanted(env: dict | None = None) -> bool:
@@ -130,7 +142,8 @@ class Streamer:
             self.pool[proj] = Slots(*parts)
             arrays += parts
         self.slot_of = mx.zeros((layers * experts,), dtype=mx.int32)
-        self.box = mx.zeros((max(box_rows * top_k, experts, 8),), dtype=mx.uint32)
+        # word E past a window call's flags holds its tag (window_tagged): one more word than the flags
+        self.box = mx.zeros((max(box_rows * top_k, experts + 1, 8),), dtype=mx.uint32)
         self.layer_ids = [mx.array([i] + [0] * 7, dtype=mx.int32) for i in range(layers)]
         mx.eval(*arrays, self.slot_of, self.box, *self.layer_ids)
         self.fds = {path: _uncached(path) for path in {s.path for s in found.values()}}
@@ -162,6 +175,10 @@ class Streamer:
         self._prompted = False                                          # window calls since the last seed
         self._seeders = ThreadPoolExecutor(2, thread_name_prefix="expert-seed") if self.prompt_seed else None
         self._jobs: queue.Queue = queue.Queue()
+        self._log_path = job_log_path()
+        self._log: list[tuple] = []
+        self._notes: list[str] = []
+        self._log_lock = threading.Lock()
         if native is None:
             native = native_wanted()
         if native and not self.decode_prefetch and not self.prompt_seed and hasattr(hostsync, "PoolServer"):
@@ -173,9 +190,50 @@ class Streamer:
                     os.close(fd)
                 raise
             self._thread = None
+            self._start_log()
             return
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
+        self._start_log()
+
+    def _start_log(self) -> None:
+        if not self._log_path:
+            return
+        if self._server is not None:
+            self._server.set_log(True)
+        threading.Thread(target=self._write_log, name="expert-joblog", daemon=True).start()
+
+    def take_log(self) -> list[tuple]:
+        """Pool calls logged since the last take: (kind, layer, rows, seen_ns, ready_ns, bytes, preads)."""
+
+        if self._server is not None:
+            return [tuple(int(v) for v in row) for row in self._server.take_log()]
+        with self._log_lock:
+            out, self._log = self._log, []
+        return out
+
+    def note(self, text: str) -> None:
+        """A marker line in the call log (when TF_POOL_JOBLOG is set), at the uptime clock's now."""
+
+        if self._log_path:
+            with self._log_lock:
+                self._notes.append(f"# {_now_ns()} {text}")
+
+    def _write_log(self) -> None:
+        while True:
+            time.sleep(1.0)
+            rows = self.take_log()
+            with self._log_lock:
+                notes, self._notes = self._notes, []
+            lines = [" ".join(str(v) for v in row) for row in rows]
+            # notes and calls interleaved by time; a note is "# ns text", a call "kind layer rows seen ready ..."
+            merged = sorted([(int(n.split()[1]), n) for n in notes] + [(int(r[3]), line) for r, line in zip(rows, lines)])
+            if merged:
+                try:
+                    with open(self._log_path, "a") as f:
+                        f.write("".join(line + "\n" for _, line in merged))
+                except OSError:
+                    pass
 
     def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
         """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
@@ -260,13 +318,20 @@ class Streamer:
     def window_layers(self) -> list[int]:
         return list(self._server.window()) if self._server is not None else list(self.window)
 
-    def marks(self, kind: str, layer: int, rows: int, guess: int = 0) -> tuple[int, int]:
+    def next_signal(self) -> int:
+        """The signal the next ``marks`` call takes (a window_tagged call's tag, written by its routing kernel)."""
+
+        return self.value + 1
+
+    def marks(self, kind: str, layer: int, rows: int, guess: int = 0, expect: int | None = None) -> tuple[int, int]:
         """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags
         (or counts); ``guess`` > 0: rows x guess ids for layer + 1 wait in the guess box."""
 
         if self.error is not None:
             raise RuntimeError("expert streaming stopped") from self.error
         signal, ready = self.value + 1, self.value + 2
+        if expect is not None and signal != expect:
+            raise RuntimeError(f"pool call signal {signal} is not the tagged {expect}: calls were built out of order")
         self.value = ready
         if self._server is not None:
             self._server.submit(_KINDS[kind], layer, rows, signal, ready)
@@ -274,10 +339,11 @@ class Streamer:
         self._jobs.put((kind, layer, rows, signal, ready, guess))
         return signal, ready
 
-    def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0) -> mx.array:
+    def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0,
+             expect: int | None = None) -> mx.array:
         """``token`` once the GPU has signalled this call to the host and the host has answered it (graph marks)."""
 
-        signal, ready = self.marks(kind, layer, rows, guess)
+        signal, ready = self.marks(kind, layer, rows, guess, expect)
         return self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
 
     def window_views(self) -> dict[str, Slots]:
@@ -315,9 +381,12 @@ class Streamer:
                 return
             kind, layer, rows, signal, ready, guess = job
             after: list = []
+            seen = 0
             try:
                 if not self.channel.wait(signal, TIMEOUT_MS):
                     raise TimeoutError(f"no routing from the GPU for layer {layer}")
+                if self._log_path:
+                    seen, bytes0 = _now_ns(), self.bytes_read
                 if kind == "rows":
                     ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
@@ -337,13 +406,24 @@ class Streamer:
                 else:
                     self._check(layer, [])
                     self._resolve(layer, [])
+                    if kind == "window_tagged":     # the tag before and after the flags: no later call wrote the box
+                        want = signal & 0xFFFFFFFF
+                        before = int(np.frombuffer(self.hs.peek(self.box, 4 * self.experts, 4), dtype=np.uint32)[0])
                     flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
+                    if kind == "window_tagged":
+                        after_tag = int(np.frombuffer(self.hs.peek(self.box, 4 * self.experts, 4), dtype=np.uint32)[0])
+                        if before != want or after_tag != want:
+                            raise RuntimeError(f"window call for layer {layer} found another call's routing in the box "
+                                               f"(tag {before}/{after_tag}, expected {want})")
                     if self.prompt_counts is not None:
                         self.prompt_counts[layer] += flags
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
             except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
                 self.error = error
+            if seen:
+                with self._log_lock:
+                    self._log.append((_KINDS[kind], layer, rows, seen, _now_ns(), self.bytes_read - bytes0, 0))
             self.channel.signal(ready)
             for step, *args in after:             # speculative reads start once the GPU runs on
                 if self.error is not None:

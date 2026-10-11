@@ -591,3 +591,64 @@ def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, p
     check_resident(hs, packed, truth)
     for s in (py, plain, packed):
         s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_a_tagged_window_call_checks_its_tag_in_the_box(hs, tmp_path, native):
+    """window_tagged: box word E must hold the call's signal (low 32 bits); another call's tag fails the call."""
+
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+
+    def tagged(layer, ids, tag=None):
+        words = [0] * EXPERTS
+        for e in ids:
+            words[e] = 1
+        want = s.next_signal()
+        words.append(want if tag is None else tag)
+        hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+        signal, ready = s.marks("window_tagged", layer, 1, expect=want)
+        assert signal == want
+        s.channel.signal(signal)
+        assert s.channel.wait(ready, 10_000)
+
+    tagged(1, [4, 5])
+    assert s.error is None and s.window_layers()[4] == 1 and s.window_layers()[5] == 1
+    tagged(2, [4], tag=12345)
+    assert s.window_layers()[4] == 1                       # nothing loaded from the wrong call's flags
+    assert isinstance(s.error, RuntimeError) and "another call's routing" in str(s.error)
+    with pytest.raises(RuntimeError, match="expert streaming stopped"):
+        s.marks("window_tagged", 0, 1)
+    s.close()
+
+
+def test_a_call_built_out_of_order_is_refused(hs, tmp_path):
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
+    with pytest.raises(RuntimeError, match="out of order"):
+        s.marks("window_tagged", 0, 1, expect=s.next_signal() + 2)
+    s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_the_call_log_times_every_call_and_its_reads(hs, tmp_path, monkeypatch, native):
+    write_checkpoint(tmp_path)
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("TF_POOL_JOBLOG", str(log))
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+    call(hs, s, "rows", 0, [1, 2, 3, 3])
+    call(hs, s, "window", 1, [4, 5])
+    s.note("chunk 0")
+    rows = s.take_log()
+    per = pool.expert_nbytes(s.found, 0)
+    assert [(r[0], r[1], r[5]) for r in rows] == [(0, 0, 3 * per), (1, 1, 2 * per)]
+    assert all(r[3] <= r[4] for r in rows)
+    call(hs, s, "window", 2, [4])
+    deadline = time.time() + 5
+    while time.time() < deadline and not (log.exists() and "chunk 0" in log.read_text() and
+                                           len(log.read_text().splitlines()) >= 2):
+        time.sleep(0.1)
+    lines = log.read_text().splitlines()
+    assert any(line.startswith("# ") and line.endswith("chunk 0") for line in lines)
+    assert any(line.split()[:2] == ["1", "2"] for line in lines)
+    s.close()

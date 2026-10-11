@@ -39,6 +39,13 @@ _COUNT = r"""
 """
 
 
+# a window call's tag first (box word E, the host checks it before and after reading the flags), then the flags
+_TAG = r"""
+  if (thread_position_in_threadgroup.x == 0) ((device uint32_t*)BOX)[NE] = TAG[0];
+  threadgroup_barrier(mem_flags::mem_device);
+"""
+
+
 def pool_flags(env: dict | None = None) -> tuple[int, int]:
     """(decode prefetch k, prompt seed experts a layer) from TENSORFOLD_POOL_DECODE_PREFETCH (0..16) and
     TENSORFOLD_POOL_PROMPT_SEED=1 (TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER, default 32); both off by default."""
@@ -121,11 +128,13 @@ def moe_chunk(moe: Any, x: mx.array) -> mx.array:
     streamer, layer = moe.__dict__["streamer"], moe.__dict__["stream_layer"]
     experts, weights = moe.route(x)
     ids = experts.reshape(-1).astype(mx.uint32)
-    present = (kernel("q4_stream_count", _COUNT, ["IDS", "BOX"], ["OUT"]) if streamer.prompt_seed else
-               kernel("q4_stream_present", _PRESENT, ["IDS", "BOX"], ["OUT"]))
-    token = present(inputs=[ids, streamer.box], template=[("NE", streamer.experts), ("N", int(ids.size))],
+    present = (kernel("q4_stream_count_tagged", _TAG + _COUNT, ["IDS", "BOX", "TAG"], ["OUT"]) if streamer.prompt_seed
+               else kernel("q4_stream_present_tagged", _TAG + _PRESENT, ["IDS", "BOX", "TAG"], ["OUT"]))
+    tag = streamer.next_signal()
+    token = present(inputs=[ids, streamer.box, mx.array([tag & 0xFFFFFFFF], dtype=mx.uint32)],
+                    template=[("NE", streamer.experts), ("N", int(ids.size))],
                     grid=(1024, 1, 1), threadgroup=(1024, 1, 1), output_shapes=[(1,)], output_dtypes=[mx.uint32])[0]
-    token = streamer.hold(token, "window", layer, int(x.shape[1]))
+    token = streamer.hold(token, "window_tagged", layer, int(x.shape[1]), expect=tag)
     views = streamer.window_views()
     switch = copy.copy(moe.switch_mlp)
     for proj in PROJS:
