@@ -162,9 +162,10 @@ _NARROW_DOWN = (("  const float sa = load16(x + lane * 16, xa);",
 def down_width(width: int, bits: int) -> bool:
     """Whether expert_down_y takes the narrow variant for activation rows of ``width``; refuses widths it can't read."""
 
-    if width % (16 if bits == 4 else 64) or width > 1024:
-        raise ValueError(f"expert_down_y: {bits}-bit activation rows of {width} (needs a multiple of "
-                         f"{16 if bits == 4 else 64}, at most 1024)")
+    group = 32 if bits == 4 else 64                     # a lane's scale index assumes whole quantization groups
+    if width <= 0 or width % group or width > 1024:
+        raise ValueError(f"expert_down_y: {bits}-bit activation rows of {width} (needs a positive multiple of "
+                         f"{group}, at most 1024)")
     return width < 512
 
 

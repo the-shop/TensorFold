@@ -79,14 +79,25 @@ def test_wide_rows_keep_the_original_source(width, bits):
     assert experts.down_source(stream, False, bits) == want
 
 
-@pytest.mark.parametrize(("width", "bits"), [(64, 4), (128, 8), (448, 8), (496, 4)])
+@pytest.mark.parametrize(("width", "bits"), [(64, 4), (128, 8), (448, 8), (480, 4), (32, 4)])
 def test_narrow_rows_take_the_narrow_variant(width, bits):
     assert experts.down_width(width, bits) is True
     for source in (experts._EXPERT_DOWN_Y, stream_experts._down_source()):
         assert "const bool first = int(lane) < NC;" in experts.down_source(source, True, bits)
 
 
-@pytest.mark.parametrize(("width", "bits"), [(1040, 4), (1088, 8), (72, 4), (96, 8)])
+@pytest.mark.parametrize(("width", "bits"), [(1040, 4), (1088, 8), (72, 4), (96, 8), (496, 4), (48, 4), (16, 4), (1008, 4),
+                                              (0, 4), (0, 8), (-64, 8), (-32, 4)])
 def test_unsupported_widths_are_refused(width, bits):
     with pytest.raises(ValueError):
         experts.down_width(width, bits)
+
+
+@pytest.mark.parametrize("width", [16, 48, 496])
+def test_q4_rows_off_the_group_size_never_reach_the_kernel(width):
+    """A 4-bit lane reads one scale per 32 inputs: a row of 16 mod 32 would take the next group's scale."""
+
+    act, picks, down, shared, _ = _case(64, 4)
+    act = mx.zeros((act.shape[0], act.shape[1], width), dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        experts.expert_down_y(act, picks, down, shared)
