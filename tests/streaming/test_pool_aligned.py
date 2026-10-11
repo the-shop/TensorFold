@@ -207,7 +207,8 @@ def test_a_part_cut_short_by_the_end_of_file_fails(hs, tmp_path, monkeypatch):
 
 
 def test_aligned_reads_switch(monkeypatch):
-    assert isinstance(pool.aligned_reads({}), bool)                       # the default may be either
+    assert pool.aligned_reads({}) is True                                 # on by default
+    assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": ""}) is True
     for on in ("1", "on", "yes", "true", " TRUE "):
         assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": on}) is True
     for off in ("0", "off", "no", "false"):

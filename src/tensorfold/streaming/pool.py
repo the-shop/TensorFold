@@ -42,12 +42,12 @@ def native_wanted(env: dict | None = None) -> bool:
 
 
 def aligned_reads(env: dict | None = None) -> bool:
-    """TENSORFOLD_POOL_ALIGNED_READS=1 reads each unaligned expert part over ~1 MiB as a page-aligned superset into
-    an aligned buffer, then copies it out: same bytes, but macOS F_NOCACHE then leaves none of them in the page cache
-    (an unaligned read leaves all but its first MiB there). Off by default: those leftovers also serve repeat reads."""
+    """On by default: each unaligned expert part over ~1 MiB is read as a page-aligned superset into an aligned
+    buffer, then copied out: same bytes, but macOS F_NOCACHE then leaves none of them in the page cache (an unaligned
+    read leaves all but its first MiB there). TENSORFOLD_POOL_ALIGNED_READS=0 restores the plain unaligned reads."""
 
     env = os.environ if env is None else env
-    return (env.get("TENSORFOLD_POOL_ALIGNED_READS", "0") or "0").strip().lower() in ("1", "on", "yes", "true")
+    return (env.get("TENSORFOLD_POOL_ALIGNED_READS", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
 
 
 @dataclass

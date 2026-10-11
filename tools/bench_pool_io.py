@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", type=Path, default=None, help="also write the results here")
     ap.add_argument("--cold", action="store_true", help="sample only experts with no page-cache-resident bytes")
     ap.add_argument("--aligned", choices=("0", "1"), default=None,
-                    help="unpacked reads as page-aligned supersets (default: TENSORFOLD_POOL_ALIGNED_READS, else 0)")
+                    help="unpacked reads as page-aligned supersets (default: TENSORFOLD_POOL_ALIGNED_READS, else 1)")
     args = ap.parse_args(argv)
     from tensorfold.streaming.build import load
 

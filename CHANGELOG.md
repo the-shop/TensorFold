@@ -5,11 +5,11 @@ GitHub has the full notes and the measurements behind them.
 
 ## Unreleased
 
-- **`TENSORFOLD_POOL_ALIGNED_READS=1`** (default off). On macOS, an `F_NOCACHE` read at an unaligned file offset
-  leaves all but its first MiB in the page cache, so about a third of every expert's bytes stayed there. With the
-  switch on, unaligned expert parts over about 1 MiB are read as the page-aligned range around them into an aligned
-  buffer and copied out: the same bytes and counters, and nothing cached. Each expert pool reads the variable once,
-  when it is created (server start).
+- **Page-cache-safe expert reads** (on by default; `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old reads). On
+  macOS, an `F_NOCACHE` read at an unaligned file offset leaves all but its first MiB in the page cache, so about a
+  third of every expert's bytes stayed there. Unaligned expert parts over about 1 MiB are now read as the
+  page-aligned range around them into an aligned buffer and copied out: the same bytes, counters and output tokens,
+  and nothing cached. Each expert pool reads the variable once, when it is created (server start).
 - **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
   (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
   cold benchmarks.

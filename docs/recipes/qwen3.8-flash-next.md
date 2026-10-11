@@ -178,6 +178,8 @@ Decode and prefill in tok/s; load time in seconds (harness A / harness B):
   use `F_NOCACHE`, but on macOS a read whose file offset or buffer is not 4 KiB-aligned leaves every byte after its
   first MiB in the page cache. Checkpoint tensors are not aligned, so about a third of each expert's bytes (the tail
   of each 1.56 MiB weight) stays cached unless RAM is short, and later misses on those pages are served from RAM.
+  The numbers above were measured with those unaligned reads; aligned expert reads (below, on by default) leave
+  nothing cached.
 - **Output:** output tokens were identical across all 12 measured configurations (the six above, 16 reader threads
   and the expert pack at each pool size), with drafts on and off.
 
@@ -209,10 +211,11 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
   (decode 16-23% lower, prefill about 16-21% lower; the 40 GiB harness-A pack values come from an earlier
   window the same day) and within 0-6% at 70 GiB. `/health` reports `packed`, `preads`
   and `threads` with the pool's hits and misses.
-- **`TENSORFOLD_POOL_ALIGNED_READS=1`** (default off) reads each unaligned expert part over about 1 MiB as the
-  page-aligned range around it into an aligned buffer, then copies the part out: the same bytes and the same one
-  `pread` a part, with nothing left in the page cache. Off keeps the leftover tails, which also serve repeat reads.
-  The expert pool reads the variable once, when it is created at server start.
+- **Aligned expert reads** (on by default): each unaligned expert part over about 1 MiB is read as the
+  page-aligned range around it into an aligned buffer, then the part is copied out: the same bytes and the same one
+  `pread` a part, with nothing left in the page cache. `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old unaligned
+  reads, which leave the tails cached (they also serve some repeat reads). The expert pool reads the variable once,
+  when it is created at server start.
 - `python tools/page_cache.py evict MODEL_DIR` drops the checkpoint files from the page cache (no sudo; run it with
   no server holding the model), and `python tools/page_cache.py resident MODEL_DIR [--experts]` prints how many of
   their bytes (or of the routed experts' bytes) are cached. Evict before every cold benchmark.
