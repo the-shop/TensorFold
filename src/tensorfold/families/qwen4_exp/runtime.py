@@ -120,10 +120,13 @@ class FlashNext:
     def prefill_key(self) -> str:
         """How prompt chunks are prefilled (path, matmul route, GPU), for snapshot keys: each rounds differently."""
 
+        from tensorfold.families.qwen4_exp import decode
         from tensorfold.kernels.qwen.flash_next.v1 import prefill_mm
 
         fast = self.fused is not None and prefill_mm.fast_prefill()
         key = "flash-prefill=" + ("fast;" + prefill_mm.prefill_identity() if fast else "mlx")
+        # short prompt tails run the fused rows: their dense matmul (TF_FLASH_DENSE) and tile width (TF_FLASH_TILE_WIDE)
+        key += f";dense={decode.DENSE};tile-wide={int(decode.TILE_WIDE)}"
         resolved = self.__dict__.get("_resolved_prefill_identity")
         if resolved is not None and key != resolved:
             raise RuntimeError("Flash Next's prefill arithmetic changed after the snapshot key was fixed: reload")

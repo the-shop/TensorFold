@@ -28,10 +28,10 @@ short canary prompt prefilled on the loaded model at start-up (`engine/numerics.
 code, OS, GPU, `TF_*`/`MLX_*` variables or load options change, cached beside the snapshots otherwise). The
 canary cannot reach every path a real prompt takes (long chunks, 1-4 row tails, sparse attention past 4096
 keys), so bump the version whenever a change moves the bits of a prompt's cache, pin them with a golden test
-like `tests/test_numerics_golden.py` whose cases cross each size the prefill switches on, and guard the source
-like `tests/test_numerics_reviewed.py`: it fails on any code edit (comments and docstrings aside) until the
-version is bumped or, with the golden passing unchanged, the edit is recorded as reviewed
-(`TF_RECORD_NUMERICS_REVIEWED=1`). `TF_SNAPSHOT_KEY=strict` adds the exact code fingerprint to the key.
+like `tests/test_numerics_golden.py` whose cases cross each size the prefill switches on (its recorder only adds
+entries: moved bits need a bump), and guard the source like `tests/test_numerics_reviewed.py`: it hashes every
+module the golden run imports and fails on any code edit there (comments and docstrings aside) until the version
+is bumped or, with the golden passing unchanged, the edit is recorded as reviewed (`TF_RECORD_NUMERICS_REVIEWED=1`). `TF_SNAPSHOT_KEY=strict` adds the exact code fingerprint to the key.
 
 `weight_bytes(model_dir, ple_on_ssd)` can provide a conservative resident-weight estimate for MLX startup
 admission. Without it, the CLI counts every safetensors file's size. Read headers only, use the loader's

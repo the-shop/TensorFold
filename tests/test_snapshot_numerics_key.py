@@ -181,7 +181,7 @@ def test_serve_keys_a_declared_family_without_the_release(monkeypatch, tmp_path)
     assert f"|numerics=e{numerics.ENGINE_NUMERICS}|" in key and "|weights=" in key
     assert "|canary=136:fake|" in key
     assert options[0]["lane_kernels"] == "off" and options[0]["drafter"] == "" and options[0]["memory_limit"] == 1 << 30
-    assert {"parallel", "drafter_bits", "mlx_cache_gib", "mtp_confidence"} <= set(options[0])
+    assert {"parallel", "drafter_bits", "mlx_cache_gib", "mtp_confidence", "context"} <= set(options[0])
 
 
 def test_a_moved_canary_moves_the_key(monkeypatch, served):
@@ -203,13 +203,17 @@ def test_load_options_are_part_of_the_canary_lookup(served):
     assert served.engine.calls == 7                                           # and cached per options
 
 
-@pytest.mark.parametrize("content", ['{"x": 5}', '{"x": {"saved": "zz"}}', '{"x": {"canary": "1:a", "saved": "zz"}}',
-                                     '{"x": {"canary": 1, "saved": 1}}', '{"x": {"canary": "1:a", "saved": true}}',
-                                     "[1, 2]", "null", "{not json", ""])
+DEEP = b"[" * 200_000 + b"]" * 200_000                                      # past the JSON parser's recursion
+MALFORMED = [b'{"x": 5}', b'{"x": {"saved": "zz"}}', b'{"x": {"canary": "1:a", "saved": "zz"}}',
+             b'{"x": {"canary": 1, "saved": 1}}', b'{"x": {"canary": "1:a", "saved": true}}', b"[1, 2]", b"null",
+             b"{not json", b"", b'{"x": "\xff\xfe"}', b"\xff\xfe\x00{", DEEP, b'{"x": ' + DEEP + b"}"]
+
+
+@pytest.mark.parametrize("content", MALFORMED)
 def test_a_malformed_canary_cache_is_rewritten(served, content):
     served.blocks.mkdir(parents=True)
     path = served.blocks / numerics.CANARY_FILE
-    path.write_text(content)
+    path.write_bytes(content)
     first = served.build()
     assert served.engine.calls == 1 and "|canary=code-" not in first
     entries = json.loads(path.read_text())
@@ -232,6 +236,38 @@ def test_code_edited_while_starting_is_not_recorded(monkeypatch, served):
     first = served.build()
     assert served.engine.calls == 1 and not (served.blocks / numerics.CANARY_FILE).exists()
     assert served.build() == first and served.engine.calls == 2               # measured again, never cached
+
+
+def test_the_fused_tail_flags_are_in_the_prefill_key(monkeypatch):
+    from tensorfold.families.qwen4_exp import decode
+    from tensorfold.families.qwen4_exp.runtime import FlashNext
+
+    runtime = object.__new__(FlashNext)
+    runtime.fused = None
+    base = runtime.prefill_key
+    assert f";dense={decode.DENSE};tile-wide={int(decode.TILE_WIDE)}" in base
+    monkeypatch.setattr(decode, "DENSE", "simd")
+    assert runtime.prefill_key != base
+    monkeypatch.setattr(decode, "TILE_WIDE", not decode.TILE_WIDE)
+    assert len({base, runtime.prefill_key}) == 2 and runtime.prefill_key.endswith(f"tile-wide={int(decode.TILE_WIDE)}")
+
+
+def test_the_canary_digests_its_cache_as_restored(monkeypatch):
+    from tensorfold.engine import prefix_snapshots
+
+    plan = PrefillPlan(2048, (7,), 256, (7, 9))
+    same = numerics.canary_digest(_Engine(), plan, 1000)
+    real = prefix_snapshots.load_snapshot
+
+    def lossy(path, model_id):                                                 # a restore that rounds via bf16
+        tokens, cache = real(path, model_id)
+        mx = pytest.importorskip("mlx.core")
+        for layer in cache:
+            layer.keys = (layer.keys.astype(mx.bfloat16) + 1).astype(mx.float32)
+        return tokens, cache
+
+    monkeypatch.setattr(prefix_snapshots, "load_snapshot", lossy)
+    assert numerics.canary_digest(_Engine(), plan, 1000) != same
 
 
 def test_without_stored_snapshots_no_canary_runs(served):

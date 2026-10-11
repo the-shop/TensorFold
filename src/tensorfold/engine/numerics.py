@@ -6,17 +6,20 @@ source refuses that across every comment, refactor or release; trusting a versio
 developer to bump it. A family that declares ``NUMERICS_VERSION`` gets a key of three parts instead:
 
 * what is pinned verbatim: the model path and weights, MLX and mlx-lm versions, the prompt plan and prefill route
-  (as before);
+  (with the fused-tail matmul flags);
 * what is declared: the family's ``NUMERICS_VERSION`` and this module's ``ENGINE_NUMERICS``, bumped whenever a change
   moves bits;
 * what is measured: the digest of a short canary prompt (two plan chunks and an 8-row tail) prefilled on the loaded
-  model through the production plan, so an undeclared change on a path the canary reaches still moves the key.
+  model through the production plan, then stored and restored as a snapshot, so an undeclared change on a path the
+  canary reaches, or to how states are stored and restored, still moves the key.
 
 The canary does not reach every path a real prompt takes (chunks of thousands of rows, tails of 1-4 rows, more than
 DENSE_KEYS keys): an edit that moves bits only there keeps the key unless the declared part is bumped. Two tests
 make that bump a checked decision rather than a memory: tests/test_numerics_golden.py pins a tiny model's prompt
-caches on cases past each of those thresholds, and tests/test_numerics_reviewed.py fails on any code edit to the
-family or its kernels until the bump is made or the edit is recorded as reviewed (after the golden passes).
+caches on cases past each of those thresholds (and never re-records a declared version's digests), and
+tests/test_numerics_reviewed.py fails on any code edit to the modules a prefill runs through (the family, its
+kernels, the engine, snapshots, streaming) until the bump is made or the edit is recorded as reviewed (after the
+golden passes).
 
 The canary is recomputed whenever the installed code (every file of the package, comments included), the
 environment (TF_*/MLX_* variables, GPU, OS, Python), the load options (SSD experts, PLE, drafts, kernels, lanes,
@@ -156,13 +159,33 @@ def cache_digest(cache: list[Any]) -> str:
     return digest.hexdigest()
 
 
+def restored(cache: list[Any], tokens: list[int]) -> list[Any]:
+    """``cache`` as a later server reads it back: encoded as a snapshot file and loaded through ``load_snapshot`` (in a
+    temporary directory, never the snapshot one), so an edit to storing or restoring states moves the digest too."""
+
+    import tempfile
+
+    from tensorfold.engine.prefix_snapshots import encode_snapshot, load_snapshot
+
+    payload = encode_snapshot("canary", tokens, cache)
+    with tempfile.TemporaryDirectory(prefix="tensorfold-canary-") as directory:
+        path = Path(directory) / "canary.safetensors"
+        path.write_bytes(payload)
+        del payload
+        loaded = load_snapshot(path, "canary")
+    if loaded is None:
+        raise RuntimeError("the canary's prompt state did not load back from its snapshot")
+    return loaded[1]
+
+
 def canary_digest(engine: Any, plan: Any, vocab: int) -> str:
-    """Prefill the canary on ``engine`` (the production plan) and digest the cache it leaves."""
+    """Prefill the canary on ``engine`` (the production plan), store and restore the cache as a snapshot, and
+    digest what was restored."""
 
     tokens = canary_tokens(plan, vocab)
     cache = engine.prefill_prefix(tokens)
     try:
-        return f"{len(tokens)}:{cache_digest(cache)[:16]}"
+        return f"{len(tokens)}:{cache_digest(restored(cache, tokens))[:16]}"
     finally:
         del cache
         release = getattr(engine, "release_rounds", None)
@@ -179,14 +202,14 @@ def _load_cache(path: Path) -> tuple[dict[str, Any], bool]:
     """The cache file's well-formed entries, and whether it held anything else (then it is rewritten)."""
 
     try:
-        text = path.read_text()
+        raw = path.read_bytes()
     except FileNotFoundError:
         return {}, False
     except OSError:
         return {}, True
     try:
-        data = json.loads(text)
-    except ValueError:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):      # not JSON, not UTF-8, nested past the parser
         return {}, True
     if not isinstance(data, dict):
         return {}, True
@@ -283,4 +306,4 @@ def cache_file_for(*directories: Path | None) -> Path | None:
 
 __all__ = ["CANARY_FILE", "ENGINE_NUMERICS", "cache_digest", "cache_file_for", "canary", "canary_digest",
            "canary_tokens", "code_fingerprint", "code_on_disk", "declared", "environment_fingerprint", "model_id",
-           "model_vocab", "options_fingerprint", "strict_requested"]
+           "model_vocab", "options_fingerprint", "restored", "strict_requested"]

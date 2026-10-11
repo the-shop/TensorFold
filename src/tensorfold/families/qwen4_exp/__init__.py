@@ -16,10 +16,11 @@ QUANT_METHODS = {"cuda": ("mlx", "exl3", "modelopt")}  # MLX affine 4-bit, EXL3 
 EXL3_VARIANT = "any"                           # every EXL3 codebook and width (tensorfold.families.EXL3_VARIANT_ANY)
 KERNEL_PACKAGE = "tensorfold.kernels.qwen.flash_next.v1"
 KERNEL_VERSION = "v1"
-# Bump whenever a change moves the bits of a prompt's cache, then re-record tests/test_numerics_golden.py's digests and
-# tests/test_numerics_reviewed.py's source digest: prompt snapshots key on this and a start-up canary instead of the
+# Bump whenever a change moves the bits of a prompt's cache, then record tests/test_numerics_golden.py's digests for
+# the new version and tests/test_numerics_reviewed.py's source digest: prompt snapshots key on this and a start-up canary instead of the
 # source, so bit-identical edits keep them. The golden fails when its cases' bits move without a bump; the reviewed
-# digest fails on any code edit here or in the kernels until it is bumped or the edit is recorded as reviewed.
+# digest fails on any code edit to a module a prefill runs through until it is bumped or the edit is recorded as
+# reviewed. The golden never re-records a version's digests.
 NUMERICS_VERSION = 1
 # The CLI sets these before MLX starts, respecting environment overrides, to keep expert bindings from ending each command buffer.
 MLX_ENV = {"MLX_MAX_OPS_PER_BUFFER": "200", "MLX_MAX_MB_PER_BUFFER": "100000"}

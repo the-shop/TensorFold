@@ -1,6 +1,6 @@
 {
  "qwen4_exp-v1-n1|e1": {
-  "mlx=0.32.2|gpu=applegpu_g17s": {
+  "gpu=applegpu_g17s|macos=27.0.1|mlx=0.32.2|mlx_lm=0.31.3": {
    "q4-canary": "136:f7a72ab9aae55106",
    "q4-long-8192": "421cee30a7f3bce5",
    "q4-long-8448": "5d3a793fa3abee46",

@@ -6,7 +6,11 @@ prefill code switches on: chunks of 8192 tokens (32768 expert rows, MLX's sorted
 (33792 rows: split in MAX_SORTED_ROWS slices), more than DENSE_KEYS keys (selected-blocks attention, unpatched),
 and last chunks of 1, 2, 3 and 4 rows (GDN's PIPE_ROWS kernel; hc's SCALAR_ROWS path and the 8-row tiles).
 
-Run as a script it prints the digests as JSON: the key tests run it on an edited copy of the package.
+Every cache is stored and restored as a snapshot before its digest (``numerics.restored``), as a later server reads
+it. The process caps MLX at 6 GiB with a 512 MiB buffer cache and exits if it grows past 8 GB.
+
+Run as a script it prints the digests as JSON, with the environment they depend on and the package files the run
+imported (what tests/test_numerics_reviewed.py hashes): the key tests run it on an edited copy of the package.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 TEXT = {
@@ -80,7 +85,8 @@ def _cases(bits: int, group: int, out: dict[str, str]) -> None:
     engine = LaneEngine(runtime, prefill_plan=plan)
 
     def prefill(step: int, tokens: list[int]) -> str:
-        return numerics.cache_digest(LaneEngine(runtime, prefill_plan=PrefillPlan(step)).prefill_prefix(tokens))[:16]
+        cache = LaneEngine(runtime, prefill_plan=PrefillPlan(step)).prefill_prefix(tokens)
+        return numerics.cache_digest(numerics.restored(cache, tokens))[:16]
 
     def twice(name: str, run: Any) -> None:
         first, second = run(), run()
@@ -113,11 +119,41 @@ def _cases(bits: int, group: int, out: dict[str, str]) -> None:
             os.environ["TF_FLASH_PREFILL"] = previous
 
 
+MLX_LIMIT = 6 * 1024**3                  # the tiny cases peak near 3 GiB
+MLX_CACHE = 512 * 1024**2
+RSS_LIMIT = 8 * 1000**3
+
+
+def _bounded() -> None:
+    """Cap MLX's memory and buffer cache, and end the process if its resident set passes RSS_LIMIT anyway."""
+
+    import resource
+    import threading
+    import time
+
+    import mlx.core as mx
+
+    mx.set_memory_limit(MLX_LIMIT)
+    mx.set_cache_limit(MLX_CACHE)
+
+    unit = 1 if sys.platform == "darwin" else 1024              # ru_maxrss: bytes on macOS, KiB elsewhere
+
+    def watch() -> None:
+        while True:
+            if resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit > RSS_LIMIT:
+                print("numerics_tiny: resident set past 8 GB; stopping", file=sys.stderr, flush=True)
+                os._exit(3)
+            time.sleep(0.5)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def digests() -> dict[str, str]:
     """Each case's prompt-cache digest; every case runs twice and must repeat bit for bit."""
 
     import mlx.core as mx
 
+    _bounded()
     mx.set_default_device(mx.gpu)
     out: dict[str, str] = {}
     for bits, group in ((8, 64), (4, 32)):
@@ -127,12 +163,39 @@ def digests() -> dict[str, str]:
 
 
 def environment() -> str:
-    """What the golden digests depend on besides the code: MLX and the GPU."""
+    """What the golden digests depend on besides the code: the GPU, macOS (its Metal compiler), MLX and mlx-lm."""
+
+    import platform
+    from importlib import metadata
 
     import mlx.core as mx
 
     info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-    return f"mlx={mx.__version__}|gpu={info.get('architecture', 'unknown')}"
+    try:
+        mlx_lm = metadata.version("mlx-lm")
+    except metadata.PackageNotFoundError:
+        mlx_lm = "none"
+    return (f"gpu={info.get('architecture', 'unknown')}|macos={platform.mac_ver()[0] or platform.release()}"
+            f"|mlx={mx.__version__}|mlx_lm={mlx_lm}")
+
+
+def imported_files() -> list[str]:
+    """The tensorfold package files this process imported (relative paths), apart from the server, CLI and updater:
+    the code a prompt cache's bits can depend on."""
+
+    import tensorfold
+
+    root = Path(tensorfold.__file__).resolve().parent
+    files = set()
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if not (name == "tensorfold" or name.startswith("tensorfold.")) or not path:
+            continue
+        rel = Path(path).resolve().relative_to(root).as_posix()
+        if rel.startswith("server/") or rel in ("cli.py", "update.py"):
+            continue
+        files.add(rel)
+    return sorted(files)
 
 
 def declared() -> str:
@@ -157,5 +220,6 @@ def kernels() -> str:
 if __name__ == "__main__":
     from tensorfold.engine import numerics
 
+    found = digests()
     json.dump({"declared": declared(), "environment": environment(), "kernels": kernels(),
-               "code": numerics.code_fingerprint(), "digests": digests()}, sys.stdout)
+               "code": numerics.code_fingerprint(), "digests": found, "files": imported_files()}, sys.stdout)

@@ -631,7 +631,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     else:
         # every load option that can pick another compute path: a canary measured under one is not another's
         load_options = {**options, "memory_limit": memory_limit, "mlx_cache_gib": args.mlx_cache_gib,
-                        "mtp_confidence": args.mtp_confidence}
+                        "mtp_confidence": args.mtp_confidence, "context": context}
         model_id = _declared_model_id(family, model, tokenizer, plan, model_dir, version("mlx-lm"),
                                       (snapshot_dir, session_dir), load_options)
     gib = args.prompt_cache_gib

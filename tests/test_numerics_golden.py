@@ -4,12 +4,15 @@ model's prompt-cache bits per declared numerics so an edit that moves them is ca
 It prefills a tiny deterministic model (8- and 4-bit, the full-attention layer second so attention output reaches
 the cache) through the canary's reply-cut plan, the selected-blocks attention (DENSE_KEYS patched to 64, and
 unpatched past 4096 keys), chunks of 8192 and 8448 tokens (expert rows at and past MAX_SORTED_ROWS), last chunks of
-1-4 rows (PIPE_ROWS, SCALAR_ROWS) and MLX's matmul route, and compares the caches' digests with the ones recorded for
-this NUMERICS_VERSION, MLX and GPU. It covers what those cases reach on that model, not every shape a real model
-takes (other head counts, expert counts or MTP). Another MLX or GPU has no record and skips. When bits move on
-purpose: bump ``NUMERICS_VERSION`` in families/qwen4_exp/__init__.py (or ``ENGINE_NUMERICS`` in engine/numerics.py
-for shared engine code), then record with ``TF_RECORD_NUMERICS_GOLDEN=1`` and commit
-tests/fixtures/numerics_golden.json (then tests/test_numerics_reviewed.py's digest).
+1-4 rows (PIPE_ROWS, SCALAR_ROWS) and MLX's matmul route, stores and restores each cache as a snapshot, and compares
+the digests with the ones recorded for this NUMERICS_VERSION and environment (GPU, macOS, MLX, mlx-lm). It covers
+what those cases reach on that model, not every shape a real model takes (other head counts, expert counts or MTP).
+
+A GPU with no records skips. A GPU with records but none for this declared version or environment fails until a
+new entry is recorded. Recording (``TF_RECORD_NUMERICS_GOLDEN=1``) only adds entries: it refuses to change the
+digests of a recorded version and environment, so bits that move need a bump of ``NUMERICS_VERSION`` in
+families/qwen4_exp/__init__.py (or ``ENGINE_NUMERICS`` in engine/numerics.py for shared engine code). Commit
+tests/fixtures/numerics_golden.json, then record tests/test_numerics_reviewed.py's digest.
 """
 
 from __future__ import annotations
@@ -31,38 +34,99 @@ GOLDEN = TESTS / "fixtures" / "numerics_golden.json"
 SCRIPT = TESTS / "numerics_tiny.py"
 
 
+_INSTALLED: list[dict] = []
+
+
 def tiny_report(src: Path | None = None) -> dict:
-    """numerics_tiny.py's report in a fresh process, on ``src`` (a package tree's parent) or the installed one."""
+    """numerics_tiny.py's report in a fresh process, on ``src`` (a package tree's parent) or the installed one (run
+    once per test process)."""
 
     import tensorfold
 
+    if src is None and _INSTALLED:
+        return _INSTALLED[0]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(src if src is not None else Path(tensorfold.__file__).resolve().parents[1])
     env.pop("TF_FLASH_PREFILL", None)
     done = subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, timeout=600,
                           check=False)
     assert done.returncode == 0, done.stderr[-4000:]
-    return json.loads(done.stdout.strip().splitlines()[-1])
+    report = json.loads(done.stdout.strip().splitlines()[-1])
+    if src is None:
+        _INSTALLED.append(report)
+    return report
+
+
+def _gpu(environment: str) -> str:
+    return dict(part.split("=", 1) for part in environment.split("|")).get("gpu", "unknown")
+
+
+def verdict(report: dict, golden: dict) -> tuple[str, str]:
+    """("pass" | "skip" | "fail", why) for a report against the recorded digests."""
+
+    declared, environment = report["declared"], report["environment"]
+    recorded = golden.get(declared, {}).get(environment)
+    if recorded is None:
+        here = sorted(f"{d} on {e}" for d, envs in golden.items() for e in envs if _gpu(e) == _gpu(environment))
+        if not here:
+            return "skip", f"no golden digests on this GPU ({_gpu(environment)}): nothing to compare with"
+        return "fail", (
+            f"no golden digests for {declared} on {environment}, though this GPU has records ({', '.join(here)}). "
+            "If the code moved bits, bump NUMERICS_VERSION (families/qwen4_exp/__init__.py) or ENGINE_NUMERICS "
+            "(engine/numerics.py); if macOS, MLX or mlx-lm changed (or after the bump), record this new entry with "
+            "TF_RECORD_NUMERICS_GOLDEN=1 pytest tests/test_numerics_golden.py.")
+    moved = sorted(k for k in set(recorded) | set(report["digests"]) if recorded.get(k) != report["digests"].get(k))
+    if moved:
+        return "fail", (
+            f"prompt-cache bits moved for {moved} under the same declared numerics {declared} on {environment}: "
+            "stored prompt snapshots would be reused with other bits. Bump NUMERICS_VERSION "
+            "(families/qwen4_exp/__init__.py) or ENGINE_NUMERICS (engine/numerics.py), then record the new version "
+            "with TF_RECORD_NUMERICS_GOLDEN=1. A recorded version's digests are never re-recorded.")
+    return "pass", ""
+
+
+def record(report: dict, path: Path) -> None:
+    """Add ``report``'s digests for its declared numerics and environment to ``path``; refuse to change an entry."""
+
+    golden = json.loads(path.read_text()) if path.is_file() else {}
+    entry = golden.setdefault(report["declared"], {})
+    known = entry.get(report["environment"])
+    if known is not None and known != report["digests"]:
+        moved = sorted(k for k in set(known) | set(report["digests"]) if known.get(k) != report["digests"].get(k))
+        raise AssertionError(
+            f"refusing to re-record the golden digests of {report['declared']} on {report['environment']}: {moved} "
+            "moved. Changed bits need a NUMERICS_VERSION (or ENGINE_NUMERICS) bump, which records a new entry.")
+    entry[report["environment"]] = report["digests"]
+    path.write_text(json.dumps(golden, indent=1, sort_keys=True) + "\n")
 
 
 def test_prompt_cache_bits_match_the_declared_numerics():
     report = tiny_report()
-    golden = json.loads(GOLDEN.read_text()) if GOLDEN.is_file() else {}
-    recorded = golden.get(report["declared"], {}).get(report["environment"])
     if os.environ.get("TF_RECORD_NUMERICS_GOLDEN") == "1":
-        golden.setdefault(report["declared"], {})[report["environment"]] = report["digests"]
-        GOLDEN.write_text(json.dumps(golden, indent=1, sort_keys=True) + "\n")
+        record(report, GOLDEN)
         return
-    if recorded is None:
-        pytest.skip(f"no golden digests for {report['declared']} on {report['environment']}: record them with "
-                    "TF_RECORD_NUMERICS_GOLDEN=1 (on the code whose bits they are)")
-    moved = sorted(k for k in report["digests"] if recorded.get(k) != report["digests"][k])
-    assert not moved, (
-        f"prompt-cache bits moved for {moved} under the same declared numerics {report['declared']} on "
-        f"{report['environment']}: stored prompt snapshots would be reused with other bits. If the change is meant, "
-        "bump NUMERICS_VERSION (families/qwen4_exp/__init__.py) or ENGINE_NUMERICS (engine/numerics.py) and record "
-        "with TF_RECORD_NUMERICS_GOLDEN=1; if MLX or macOS changed rather than the code, record for it.")
-    assert set(recorded) <= set(report["digests"]), "a recorded case no longer runs"
+    state, why = verdict(report, json.loads(GOLDEN.read_text()) if GOLDEN.is_file() else {})
+    if state == "skip":
+        pytest.skip(why)
+    assert state == "pass", why
+
+
+def test_recording_never_rewrites_a_declared_versions_digests(tmp_path):
+    path = tmp_path / "golden.json"
+    report = {"declared": "qwen4_exp-v1-n1|e1", "environment": "gpu=g|macos=1|mlx=1|mlx_lm=1", "digests": {"a": "1"}}
+    record(report, path)
+    record(report, path)                                                    # the same bits: nothing to refuse
+    moved = {**report, "digests": {"a": "2"}}
+    with pytest.raises(AssertionError, match="NUMERICS_VERSION"):
+        record(moved, path)
+    assert json.loads(path.read_text())["qwen4_exp-v1-n1|e1"]["gpu=g|macos=1|mlx=1|mlx_lm=1"] == {"a": "1"}
+    record({**moved, "declared": "qwen4_exp-v1-n2|e1"}, path)              # a bump records a new entry
+    record({**moved, "environment": "gpu=g|macos=1|mlx=2|mlx_lm=1"}, path)  # so does another MLX
+    assert verdict(moved, json.loads(path.read_text()))[0] == "fail"
+    assert verdict({**moved, "environment": "gpu=g|macos=2|mlx=1|mlx_lm=1"}, json.loads(path.read_text()))[0] == "fail"
+    assert verdict({**moved, "environment": "gpu=other|macos=1|mlx=1|mlx_lm=1"}, json.loads(path.read_text()))[0] \
+        == "skip"
+    assert verdict({**moved, "declared": "qwen4_exp-v1-n2|e1"}, json.loads(path.read_text()))[0] == "pass"
 
 
 def test_the_cases_straddle_every_size_the_prefill_switches_on():
