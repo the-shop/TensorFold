@@ -22,7 +22,7 @@
   "tool_parameters.py": "tool-call schemas",
   "update.py": "release checks"
  },
- "digest": "90354f1514f7b425",
+ "digest": "a199491a18eb9e4a",
  "files": [
   "src/tensorfold/__init__.py",
   "src/tensorfold/cuda/__init__.py",
@@ -104,6 +104,7 @@
   "src/tensorfold/engine/gpu_sampling.py",
   "src/tensorfold/engine/lane_engine.py",
   "src/tensorfold/engine/lane_family.py",
+  "src/tensorfold/engine/layer_major.py",
   "src/tensorfold/engine/memory.py",
   "src/tensorfold/engine/numerics.py",
   "src/tensorfold/engine/prefill_plan.py",
@@ -353,7 +354,9 @@
   "src/tensorfold/streaming/hostsync/__init__.py",
   "src/tensorfold/streaming/hostsync/hostsync.cpp",
   "src/tensorfold/streaming/pack.py",
+  "src/tensorfold/streaming/page_cache.py",
   "src/tensorfold/streaming/pool.py",
+  "src/tensorfold/streaming/profile.py",
   "src/tensorfold/vision/__init__.py",
   "src/tensorfold/vision/config.py",
   "src/tensorfold/vision/images.py",
