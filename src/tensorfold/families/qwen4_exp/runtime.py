@@ -192,49 +192,6 @@ class FlashNext:
             self.fused.row_states.clear()
         return out
 
-    @property
-    def groups_prompt_chunks(self) -> bool:
-        """Whether ``prefill_group`` can take several prompt chunks layer-major (the fast prefill path only)."""
-
-        from tensorfold.kernels.qwen.flash_next.v1 import prefill_mm
-
-        return self.fused is not None and prefill_mm.fast_prefill()
-
-    @property
-    def frontier_bytes_per_token(self) -> int:
-        """What a layer-major group carries per prompt token between layers: the residual streams [S*D], the MoE
-        branch [D] and the inject gates [S], bf16."""
-
-        streams, dims = int(self.args.hc_count), int(self.args.hidden_size)
-        return 2 * (streams * dims + dims + streams)
-
-    def prefill_group(self, inputs: list[Any], cache: list[Any], *, before: Any = None,
-                      after: Any = None) -> list[tuple[mx.array, mx.array]]:
-        """Consecutive prompt chunks (each more than ``fused_rows`` rows) layer-major, bit for bit what ``prefill``
-        gives chunk by chunk: per chunk (its streams before the final mixer, its mixed hidden state [1, R, D]).
-        ``adopt_streams`` makes one chunk's streams the ones the draft head reads."""
-
-        from tensorfold.kernels.qwen.flash_next.v1 import prefill_hc
-
-        chunks = []
-        for inputs_j in inputs:
-            tokens = np.asarray(inputs_j, dtype=np.int64)
-            if tokens.ndim == 1:
-                tokens = tokens[None]
-            if tokens.shape[0] != 1 or tokens.shape[1] <= self.fused_rows:
-                raise ValueError("a layer-major group takes batch-1 chunks of more than fused_rows rows")
-            chunks.append(tokens)
-        if not self.groups_prompt_chunks:
-            raise RuntimeError("layer-major prompt groups need the fused prefill path")
-        if "_resolved_prefill_identity" in self.__dict__:
-            _ = self.prefill_key  # refuse a changed prefill mode before reading or updating a keyed cache
-        return prefill_hc.hidden_groups(self.model, chunks, cache[: self.layer_count], before=before, after=after)
-
-    def adopt_streams(self, streams: mx.array) -> None:
-        """The residual streams [R, S*D] the next draft absorb or speculate reads (a grouped chunk's)."""
-
-        self._streams = streams
-
     def head(self, hidden: mx.array) -> mx.array:
         from tensorfold.families.qwen4_exp.decode import project
 

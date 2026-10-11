@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from functools import partial
 import os
 import time
+from functools import partial
 from typing import Any, Iterator, Sequence
 
 from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares, stream_note
@@ -160,7 +160,11 @@ class FamilyPrefill:
 
     def _groups_chunks(self) -> bool:
         wanted = layer_major_wanted() if self.layer_major is None else bool(self.layer_major)
-        return wanted and bool(getattr(self.model, "groups_prompt_chunks", False))
+        if not wanted:
+            return False
+        from tensorfold.engine import layer_major
+
+        return layer_major.supports(self.model)
 
     def _family_prefill_grouped(self, stream: Any, prompt: Sequence[int], work: list[Any], chunks: Any, start: int,
                                 checkpoints_at: Sequence[int]) -> Iterator[None]:
@@ -195,7 +199,9 @@ class FamilyPrefill:
         small = int(getattr(self.model, "fused_rows", 16))
         if todo[0][1] - todo[0][0] <= small:
             return [todo.pop(0)]
-        per = int(self.model.frontier_bytes_per_token)
+        from tensorfold.engine import layer_major
+
+        per = layer_major.frontier_bytes_per_token(self.model)
         cap = group_cap_bytes()
         group, rows = [todo[0]], todo[0][1] - todo[0][0]
         for begin, end in todo[1:]:
@@ -219,12 +225,14 @@ class FamilyPrefill:
         import mlx.core as mx
         import numpy as np
 
+        from tensorfold.engine import layer_major
+
         guard = self.prefill_guard
         model = self.model
         layers = int(model.layer_count)
         rows = sum(end - begin for begin, end in group)
         if guard is not None:
-            guard.carry_frontier(rows * int(model.frontier_bytes_per_token))
+            guard.carry_frontier(rows * layer_major.frontier_bytes_per_token(model))
         try:
             if guard is not None:
                 guard.before_chunk(work, group[0][1] - group[0][0])
@@ -251,11 +259,11 @@ class FamilyPrefill:
                     ahead(prompt, *group[j + 2])
 
             inputs = [np.array([[int(t) for t in prompt[begin:end]]], dtype=np.int64) for begin, end in group]
-            outs = model.prefill_group(inputs, work, before=before, after=after)
+            outs = layer_major.prefill_group(model, inputs, work, before=before, after=after)
             drafting = getattr(model, "mtp", None) is not None
             last = None
             for j, ((begin, end), (streams, hidden)) in enumerate(zip(group, outs)):
-                model.adopt_streams(streams)
+                layer_major.adopt_streams(model, streams)
                 if drafting:
                     nxt = [int(t) for t in prompt[begin + 1:end + 1]]
                     if nxt:

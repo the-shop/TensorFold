@@ -79,6 +79,42 @@ class Mark : public mx::UnaryPrimitive {
   bool wait_;
 };
 
+// The routing box itself (sharing its buffer), once the GPU has filled its word ``word`` with byte ``tag`` (a blit
+// before every kernel that reads the result): a window call's tag, written before its routing kernel writes flags.
+class BoxTag : public mx::UnaryPrimitive {
+ public:
+  BoxTag(mx::Stream s, size_t word, uint8_t tag) : mx::UnaryPrimitive(s), word_(word), tag_(tag) {}
+  void eval_cpu(const std::vector<mx::array>&, mx::array&) override {
+    throw std::runtime_error("hostsync box tags run on the GPU stream only");
+  }
+  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override {
+    out.copy_shared_buffer(inputs[0]);
+    auto& enc = mx::metal::get_command_encoder(stream());
+    enc.end_encoding();
+    auto* buffer = static_cast<MTL::Buffer*>(const_cast<void*>(out.buffer().ptr()));
+    auto* blit = enc.get_command_buffer()->blitCommandEncoder();
+    blit->fillBuffer(buffer, NS::Range(out.offset() + word_ * sizeof(uint32_t), sizeof(uint32_t)), tag_);
+    blit->endEncoding();
+  }
+  const char* name() const override { return "BoxTag"; }
+  bool is_equivalent(const mx::Primitive& other) const override {
+    auto* o = dynamic_cast<const BoxTag*>(&other);
+    return o && o->word_ == word_ && o->tag_ == tag_;
+  }
+
+ private:
+  size_t word_;
+  uint8_t tag_;
+};
+
+mx::array box_tag(const mx::array& box, size_t word, uint8_t tag) {
+  if (box.dtype() != mx::uint32 || word >= static_cast<size_t>(box.size())) {
+    throw std::out_of_range("box_tag: the box must be uint32 with the word inside it");
+  }
+  auto s = mx::default_stream(mx::Device::gpu);
+  return mx::array(box.shape(), box.dtype(), std::make_shared<BoxTag>(s, word, tag), {box});
+}
+
 mx::array mark(const mx::array& x, std::shared_ptr<Channel> channel, uint64_t value, bool wait) {
   auto s = mx::default_stream(mx::Device::gpu);
   return mx::array(x.shape(), x.dtype(), std::make_shared<Mark>(s, std::move(channel), value, wait), {x});
@@ -293,7 +329,7 @@ class PoolServer {
   }
 
   // One MoE call: kind 0 = decode rows (rows x top_k ids in the box), 1 = window (E presence flags), 2 = window
-  // whose flags carry their call's tag (box word E = the signal's low 32 bits, written before the flags).
+  // whose box carries its call's tag (word E = the signal's low byte in all four bytes, written before the flags).
   void submit(int kind, int layer, int rows, uint64_t signal, uint64_t ready) {
     {
       std::lock_guard<std::mutex> lk(jobs_mu_);
@@ -407,7 +443,7 @@ class PoolServer {
         } else {
           const volatile uint32_t* flags = box_.data<uint32_t>();
           const bool tagged = job.kind == 2;
-          const uint32_t want = static_cast<uint32_t>(job.signal);
+          const uint32_t want = (job.signal & 0xFFu) * 0x01010101u;   // BoxTag's byte in all four
           if (tagged && box_.nbytes() < static_cast<size_t>(experts_ + 1) * sizeof(uint32_t)) {
             throw PoolError("IndexError", "peek: the array is not evaluated or the range passes its end");
           }
@@ -625,6 +661,7 @@ NB_MODULE(_hostsync, m) {
       .def("wait", &Channel::wait, nb::arg("value"), nb::arg("timeout_ms"));
   m.def("gpu_signal", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, false); });
   m.def("gpu_wait", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, true); });
+  m.def("box_tag", &box_tag, nb::arg("box"), nb::arg("word"), nb::arg("tag"));
   m.def("pread_into", &pread_into);
   m.def("write_into", &write_into);
   m.def("peek", &peek);

@@ -89,54 +89,30 @@ def project(h_new: mx.array, ssp: mx.array, down: Any, up: Any, norm_scale: mx.a
 QUEUE_LAYERS = 2                    # layers a slice; MLX holds a queued slice's buffers, so this bounds memory
 
 
-def embed(model: Any, tokens: np.ndarray) -> mx.array:
-    """A chunk's residual streams before layer 0: the token embeddings tiled over the streams, [L, S*D]."""
-
-    h = model.model.embed_tokens(mx.array(tokens.astype(np.int32)))[0]
-    return mx.tile(h, (1, model.args.hc_count))
-
-
-def layer_step(model: Any, i: int, h: mx.array, pending: tuple[mx.array, mx.array] | None, tokens: np.ndarray,
-               c: Any, after: mx.array | None = None) -> tuple[mx.array, tuple[mx.array, mx.array]]:
-    """Layer ``i`` on one chunk: (streams, pending (MoE branch, inject gates)) for the next layer. ``after``: an
-    array the MoE's input waits for (the previous prompt call's MoE output: the expert window's calls in order)."""
+def hidden(model: Any, tokens: np.ndarray, cache: list[Any]) -> mx.array:
+    """Qwen4Exp.hidden for a prompt chunk (batch 1); the same graph and bits however it is sliced."""
 
     fused = model.__dict__["fused"]
     streams = model.args.hc_count
     eps = fused.eps
-    layer, entry = model.layers[i], fused.layers[i]
-    if "ple" in layer:
-        if pending is not None:
-            h = hc_norm(h, streams=streams, write_back="plain", branch=(pending[0],), inject=pending[1])[0]
-            pending = None
-        h = h + layer.ple(h[None], tokens, c)[0]
-    h, mixed, inj = hyper_connection(entry["attn_hc"], h, pending, streams=streams, eps=eps)
-    mixer = layer.linear_attn if layer.is_linear else layer.self_attn
-    branch = mixer(mixed[None], c)[0]
-    h, mixed, inj2 = hyper_connection(entry["mlp_hc"], h, (branch, inj), streams=streams, eps=eps)
-    if after is not None:
-        mixed = mx.depends([mixed], [after])[0]
-    return h, (layer.mlp(mixed[None])[0], inj2)
-
-
-def finish(model: Any, h: mx.array, pending: tuple[mx.array, mx.array] | None) -> tuple[mx.array, mx.array]:
-    """After the last layer: (the streams before the final mixer [L, S*D], the mixed hidden state [1, L, D])."""
-
-    fused = model.__dict__["fused"]
-    h, mixed, _ = hyper_connection(fused.mixer, h, pending, streams=model.args.hc_count, eps=fused.eps)
-    return h, mixed[None]
-
-
-def hidden(model: Any, tokens: np.ndarray, cache: list[Any]) -> mx.array:
-    """Qwen4Exp.hidden for a prompt chunk (batch 1); the same graph and bits however it is sliced."""
-
-    h = embed(model, tokens)                                            # [L, S*D]
+    h = model.model.embed_tokens(mx.array(tokens.astype(np.int32)))[0]
+    h = mx.tile(h, (1, streams))                                        # [L, S*D]
     pending = None
     queued = None
     depth = model.__dict__.get("prefill_queue", QUEUE_LAYERS)          # 1 where memory is tight
     states: list[mx.array] = []
-    for i, c in enumerate(cache[:len(model.layers)]):
-        h, pending = layer_step(model, i, h, pending, tokens, c)
+    for i, (layer, c) in enumerate(zip(model.layers, cache)):
+        entry = fused.layers[i]
+        if "ple" in layer:
+            if pending is not None:
+                h = hc_norm(h, streams=streams, write_back="plain", branch=(pending[0],), inject=pending[1])[0]
+                pending = None
+            h = h + layer.ple(h[None], tokens, c)[0]
+        h, mixed, inj = hyper_connection(entry["attn_hc"], h, pending, streams=streams, eps=eps)
+        mixer = layer.linear_attn if layer.is_linear else layer.self_attn
+        branch = mixer(mixed[None], c)[0]
+        h, mixed, inj2 = hyper_connection(entry["mlp_hc"], h, (branch, inj), streams=streams, eps=eps)
+        pending = (layer.mlp(mixed[None])[0], inj2)
         states += c.state                   # evaluated with its layer, so the chunk's inputs they read go with it
         if depth and (i + 1) % depth == 0:
             step = (h, *pending, *states)
@@ -145,40 +121,6 @@ def hidden(model: Any, tokens: np.ndarray, cache: list[Any]) -> mx.array:
             if queued is not None:
                 mx.eval(*queued)
             queued = step
-    h, mixed = finish(model, h, pending)
+    h, mixed, _ = hyper_connection(fused.mixer, h, pending, streams=streams, eps=eps)
     model.__dict__["last_streams"] = h                                  # [L, S*D]: the streams before the mixer
-    return mixed
-
-
-def hidden_groups(model: Any, chunks: list[np.ndarray], cache: list[Any], *, before: Any = None,
-                  after: Any = None) -> list[tuple[mx.array, mx.array]]:
-    """Several consecutive prompt chunks layer-major: every chunk through layer i before layer i + 1, each
-    (layer, chunk) call exactly the call ``hidden`` makes for that chunk (same rows, same cache state, same
-    inputs), so every output and cache bit equals feeding the chunks one by one. Returns per chunk (streams before
-    the final mixer, mixed hidden state [1, L, D]).
-
-    The MoE input of each call waits for the previous call's MoE output (``mx.depends``), across chunks and
-    layers, and every call is its own async_eval in program order: the expert window and the routing box are
-    shared, so their host calls must run in the order they were queued. ``before(i, j)`` runs before a call is
-    built and ``after(i, j)`` once it is queued (a layer's cache then holds chunk j's state, not yet evaluated)."""
-
-    hs = [embed(model, t) for t in chunks]
-    pends: list[Any] = [None] * len(chunks)
-    last = None
-    queued = None
-    for i, c in enumerate(cache[:len(model.layers)]):
-        for j, tokens in enumerate(chunks):
-            if before is not None:
-                before(i, j)
-            hs[j], pends[j] = layer_step(model, i, hs[j], pends[j], tokens, c, after=last)
-            last = pends[j][0]
-            step = (hs[j], *pends[j], *c.state)
-            mx.async_eval(*step)
-            if queued is not None:
-                mx.eval(*queued)
-            queued = step
-            if after is not None:
-                after(i, j)
-    if queued is not None:
-        mx.eval(*queued)
-    return [finish(model, h, pending) for h, pending in zip(hs, pends)]
+    return mixed[None]

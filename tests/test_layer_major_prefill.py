@@ -17,6 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
+from tensorfold.engine import layer_major  # noqa: E402
 from tensorfold.engine.lane_engine import LaneEngine, LaneStream  # noqa: E402
 from tensorfold.engine.prefill_plan import PrefillPlan  # noqa: E402
 from tensorfold.families.qwen4_exp import model as q4  # noqa: E402
@@ -247,7 +248,7 @@ def test_groups_split_at_the_cap_and_where_memory_has_no_room(monkeypatch):
     rt = runtime(tiny(), monkeypatch, drafts=False)
     ids = prompt(8200)
     rows = [b - a for a, b in PLAN.chunks(ids).between(0, len(ids))]
-    per = rt.frontier_bytes_per_token
+    per = layer_major.frontier_bytes_per_token(rt)
     assert per == 2 * (4 * 512 + 512 + 4)
     asked: list[int] = []
 
@@ -337,7 +338,7 @@ def test_off_by_default_and_never_without_the_fast_prefill(monkeypatch):
     monkeypatch.setenv("TF_PREFILL_LAYER_MAJOR", "1")
     assert e._groups_chunks() is True
     monkeypatch.setenv("TF_FLASH_PREFILL", "0")
-    assert rt.groups_prompt_chunks is False and e._groups_chunks() is False
+    assert layer_major.supports(rt) is False and e._groups_chunks() is False
 
 
 def test_the_n_gram_read_ahead_asks_for_every_chunk_once_in_order(monkeypatch):
@@ -430,7 +431,7 @@ def test_many_experts_and_small_chunks_keep_the_window_calls_in_order(tmp_path, 
 
 
 class _Lazy:
-    """mlx.core for prefill_hc with every eval deferred (``chain``: keep mx.depends, else drop it)."""
+    """mlx.core for layer_major with every eval deferred (``chain``: keep mx.depends, else drop it)."""
 
     def __init__(self, chain: bool) -> None:
         self.chain = chain
@@ -454,8 +455,6 @@ def test_the_order_chain_keeps_the_bits_when_mlx_evaluates_out_of_order(tmp_path
     calls out of program order. The chain keeps them in order (equal bits); without it the routing box's tags catch
     a call that read another's routing, and the request fails instead of reading the wrong experts."""
 
-    from tensorfold.kernels.qwen.flash_next.v1 import prefill_hc
-
     monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", native)
     ids = prompt(192)
     chunks = [np.array([ids[a:b]], dtype=np.int64) for a, b in SMALL.chunks(ids).between(0, len(ids))]
@@ -471,9 +470,9 @@ def test_the_order_chain_keeps_the_bits_when_mlx_evaluates_out_of_order(tmp_path
                 outs.append((rt.last_streams, out))
                 mx.eval(*outs[-1], *[a for c in cache for a in c.state])
         else:
-            monkeypatch.setattr(prefill_hc, "mx", _Lazy(chain))
-            outs = rt.prefill_group(chunks, cache)
-            monkeypatch.setattr(prefill_hc, "mx", mx)
+            monkeypatch.setattr(layer_major, "mx", _Lazy(chain))
+            outs = layer_major.prefill_group(rt, chunks, cache)
+            monkeypatch.setattr(layer_major, "mx", mx)
             mx.eval(*[x for pair in reversed(outs) for x in pair], *[a for c in reversed(cache) for a in c.state])
         error = pool.error
         pool.close()

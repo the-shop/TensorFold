@@ -143,9 +143,10 @@ class Streamer:
             arrays += parts
         self.slot_of = mx.zeros((layers * experts,), dtype=mx.int32)
         # word E past a window call's flags holds its tag (window_tagged): one more word than the flags
-        self.box = mx.zeros((max(box_rows * top_k, experts + 1, 8),), dtype=mx.uint32)
+        self._box = mx.zeros((max(box_rows * top_k, experts + 1, 8),), dtype=mx.uint32)
+        self._tagged: tuple[int, mx.array] | None = None              # (signal, the box once tagged for it)
         self.layer_ids = [mx.array([i] + [0] * 7, dtype=mx.int32) for i in range(layers)]
-        mx.eval(*arrays, self.slot_of, self.box, *self.layer_ids)
+        mx.eval(*arrays, self.slot_of, self._box, *self.layer_ids)
         self.fds = {path: _uncached(path) for path in {s.path for s in found.values()}}
         self.channel = hostsync.Channel()
         self.value = 0
@@ -249,7 +250,7 @@ class Streamer:
                 for e in range(self.experts):
                     src, offset = self.source(self.found, layer, proj, part, e)
                     fds[layer, e, p], offsets[layer, e, p], sizes[p] = self.fds[src.path], offset, src.nbytes
-        server = self.hs.PoolServer(self.channel, self.box, self.slot_of,
+        server = self.hs.PoolServer(self.channel, self._box, self.slot_of,
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
                                     workers, TIMEOUT_MS)
@@ -318,8 +319,15 @@ class Streamer:
     def window_layers(self) -> list[int]:
         return list(self._server.window()) if self._server is not None else list(self.window)
 
+    @property
+    def box(self) -> mx.array:
+        """The routing box a call's kernel writes: after a call, the box tagged for the next one (a GPU write of
+        word E ordered before every kernel that reads it), so the host can tell its flags from a later call's."""
+
+        return self._tagged[1] if self._tagged is not None else self._box
+
     def next_signal(self) -> int:
-        """The signal the next ``marks`` call takes (a window_tagged call's tag, written by its routing kernel)."""
+        """The signal the next ``marks`` call takes."""
 
         return self.value + 1
 
@@ -343,8 +351,14 @@ class Streamer:
              expect: int | None = None) -> mx.array:
         """``token`` once the GPU has signalled this call to the host and the host has answered it (graph marks)."""
 
+        if kind == "window" and self._tagged is not None and self._tagged[0] == self.value + 1:
+            kind = "window_tagged"                   # its routing was written into the box tagged for this signal
         signal, ready = self.marks(kind, layer, rows, guess, expect)
-        return self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
+        out = self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
+        tag = getattr(self.hs, "box_tag", None)
+        if tag is not None:
+            self._tagged = (self.value + 1, tag(self._box, self.experts, (self.value + 1) & 0xFF))
+        return out
 
     def window_views(self) -> dict[str, Slots]:
         """Each projection's window slots [0, E) as stacks of the model's shape: expert e of the loaded layer."""
@@ -388,7 +402,7 @@ class Streamer:
                 if self._log_path:
                     seen, bytes0 = _now_ns(), self.bytes_read
                 if kind == "rows":
-                    ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
+                    ids = np.frombuffer(self.hs.peek(self._box, 0, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
                     self._check(layer, routed)
                     routed_reads = self._resolve(layer, routed)
@@ -407,11 +421,11 @@ class Streamer:
                     self._check(layer, [])
                     self._resolve(layer, [])
                     if kind == "window_tagged":     # the tag before and after the flags: no later call wrote the box
-                        want = signal & 0xFFFFFFFF
-                        before = int(np.frombuffer(self.hs.peek(self.box, 4 * self.experts, 4), dtype=np.uint32)[0])
-                    flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
+                        want = (signal & 0xFF) * 0x01010101
+                        before = int(np.frombuffer(self.hs.peek(self._box, 4 * self.experts, 4), dtype=np.uint32)[0])
+                    flags = np.frombuffer(self.hs.peek(self._box, 0, 4 * self.experts), dtype=np.uint32)
                     if kind == "window_tagged":
-                        after_tag = int(np.frombuffer(self.hs.peek(self.box, 4 * self.experts, 4), dtype=np.uint32)[0])
+                        after_tag = int(np.frombuffer(self.hs.peek(self._box, 4 * self.experts, 4), dtype=np.uint32)[0])
                         if before != want or after_tag != want:
                             raise RuntimeError(f"window call for layer {layer} found another call's routing in the box "
                                                f"(tag {before}/{after_tag}, expected {want})")

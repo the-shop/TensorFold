@@ -595,7 +595,8 @@ def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, p
 
 @pytest.mark.parametrize("native", [True, False])
 def test_a_tagged_window_call_checks_its_tag_in_the_box(hs, tmp_path, native):
-    """window_tagged: box word E must hold the call's signal (low 32 bits); another call's tag fails the call."""
+    """window_tagged: box word E must hold the call's tag (its signal's low byte in all four bytes); another call's
+    tag fails the call."""
 
     write_checkpoint(tmp_path)
     s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
@@ -605,7 +606,7 @@ def test_a_tagged_window_call_checks_its_tag_in_the_box(hs, tmp_path, native):
         for e in ids:
             words[e] = 1
         want = s.next_signal()
-        words.append(want if tag is None else tag)
+        words.append((want & 0xFF) * 0x01010101 if tag is None else tag)      # BoxTag's byte in all four
         hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
         signal, ready = s.marks("window_tagged", layer, 1, expect=want)
         assert signal == want
