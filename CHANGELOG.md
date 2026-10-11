@@ -3,6 +3,22 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Page-cache-safe expert reads** (on by default; `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old reads). On
+  macOS, an `F_NOCACHE` read at an unaligned file offset leaves all but its first MiB in the page cache, so about a
+  third of every expert's bytes stayed there. Unaligned expert parts over about 1 MiB are now read as the
+  page-aligned range around them into an aligned buffer and copied out: the same bytes, counters and output tokens,
+  and nothing cached. Each expert pool reads the variable once, when it is created (server start).
+- **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
+  (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
+  cold benchmarks.
+- **Credits:** [strata-mlx](https://github.com/yibie/strata-mlx) (MIT License, Copyright (c) 2026 yibie) for two
+  ideas: the finding that macOS `F_NOCACHE` reads still fill the page cache (`paged.py`, `ExpertStore.whole`), and
+  the no-sudo eviction technique (`msync(MS_INVALIDATE)` over a shared mapping, `bench/drop_cache.py`) that
+  `tools/page_cache.py evict` uses. No strata-mlx code was copied. The alignment cause (file offset and buffer) and
+  the aligned-superset read are TensorFold's own.
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from

@@ -51,7 +51,7 @@ class FakeSync:
     def write_into(self, a, off, data) -> None:
         self.buf(a)[off:off + len(data)] = np.frombuffer(data, dtype=np.uint8)
 
-    def pread_into(self, a, off, fd, foff, n) -> None:
+    def pread_into(self, a, off, fd, foff, n, aligned=False) -> None:
         self.buf(a)[off:off + n] = np.frombuffer(os.pread(fd, n, foff), dtype=np.uint8)
 
 

@@ -41,6 +41,15 @@ def native_wanted(env: dict | None = None) -> bool:
     return (env.get("TENSORFOLD_POOL_NATIVE", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
 
 
+def aligned_reads(env: dict | None = None) -> bool:
+    """On by default: each unaligned expert part over ~1 MiB is read as a page-aligned superset into an aligned
+    buffer, then copied out: same bytes, but macOS F_NOCACHE then leaves none of them in the page cache (an unaligned
+    read leaves all but its first MiB there). TENSORFOLD_POOL_ALIGNED_READS=0 restores the plain unaligned reads."""
+
+    env = os.environ if env is None else env
+    return (env.get("TENSORFOLD_POOL_ALIGNED_READS", "1") or "1").strip().lower() not in ("0", "off", "no", "false")
+
+
 @dataclass
 class Source:
     """Where expert 0 of one tensor starts in a checkpoint file, and the bytes of one expert."""
@@ -144,6 +153,7 @@ class Streamer:
         self.pack_path: Path | None = None                              # the expert pack the native server reads
         self._error: BaseException | None = None
         self.hits = self.misses = self.bytes_read = 0
+        self.aligned = aligned_reads()
         workers = pool_threads() if workers is None else int(workers)
         self._bytes_lock = threading.Lock()                             # reader threads add to bytes_read
         self._readers = ThreadPoolExecutor(workers, thread_name_prefix="expert-read")
@@ -194,7 +204,7 @@ class Streamer:
         server = self.hs.PoolServer(self.channel, self.box, self.slot_of,
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
-                                    workers, TIMEOUT_MS)
+                                    workers, TIMEOUT_MS, aligned=self.aligned)
         path = packs.choose(self._model_dir(), pack=pack)
         if path is None:
             return server
@@ -518,7 +528,11 @@ class Streamer:
 
     def _read(self, layer: int, proj: str, part: str, expert: int, slot: int) -> None:
         src, offset = self.source(self.found, layer, proj, part, expert)
-        self.hs.pread_into(getattr(self.pool[proj], part), slot * src.nbytes, self.fds[src.path], offset, src.nbytes)
+        args = (getattr(self.pool[proj], part), slot * src.nbytes, self.fds[src.path], offset, src.nbytes)
+        if self.aligned:
+            self.hs.pread_into(*args, aligned=True)
+        else:
+            self.hs.pread_into(*args)
         with self._bytes_lock:
             self.bytes_read += src.nbytes
 
@@ -544,5 +558,5 @@ class Streamer:
         self._readers.shutdown(wait=True)
 
 
-__all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "expert_nbytes", "native_wanted", "pool_threads",
-           "sources"]
+__all__ = ["PARTS", "Pending", "Slots", "Source", "Streamer", "aligned_reads", "expert_nbytes", "native_wanted",
+           "pool_threads", "sources"]

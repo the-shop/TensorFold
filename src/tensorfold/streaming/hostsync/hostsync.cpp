@@ -83,22 +83,6 @@ mx::array mark(const mx::array& x, std::shared_ptr<Channel> channel, uint64_t va
   return mx::array(x.shape(), x.dtype(), std::make_shared<Mark>(s, std::move(channel), value, wait), {x});
 }
 
-// Reads nbytes of fd at file_offset into an evaluated array's buffer at byte_offset (the caller owns the timing).
-void pread_into(mx::array& a, size_t byte_offset, int fd, int64_t file_offset, size_t nbytes) {
-  if (!a.is_available() || byte_offset + nbytes > a.nbytes()) {
-    throw std::out_of_range("pread_into: the array is not evaluated or the range passes its end");
-  }
-  auto* dst = a.data<uint8_t>() + byte_offset;
-  nb::gil_scoped_release release;
-  size_t done = 0;
-  while (done < nbytes) {
-    ssize_t got = pread(fd, dst + done, nbytes - done, file_offset + static_cast<int64_t>(done));
-    if (got < 0 && errno == EINTR) continue;
-    if (got <= 0) throw std::runtime_error(std::string("pread_into: short read: ") + std::strerror(errno));
-    done += static_cast<size_t>(got);
-  }
-}
-
 // Copies bytes into an evaluated array's buffer at byte_offset (host writes the GPU reads after a later wait).
 void write_into(mx::array& a, size_t byte_offset, nb::bytes data) {
   if (!a.is_available() || byte_offset + data.size() > a.nbytes()) {
@@ -132,6 +116,63 @@ static void pread_full(int fd, uint8_t* dst, size_t nbytes, int64_t offset) {
     }
     done += static_cast<size_t>(got);
   }
+}
+
+// An unaligned F_NOCACHE pread on macOS reads its first MiB uncached and leaves every later byte in the page cache;
+// with the file offset and the buffer 4 KiB-aligned (any length) nothing is cached. Parts up to kDirectMax leave at
+// most a page behind and are read directly.
+static constexpr size_t kPageAlign = 4096, kStageAlign = 16384, kDirectMax = (size_t{1} << 20) - kStageAlign;
+
+// A growable kStageAlign-aligned buffer for aligned_pread.
+struct Stage {
+  uint8_t* buf = nullptr;
+  size_t cap = 0;
+  Stage() = default;
+  Stage(const Stage&) = delete;
+  Stage& operator=(const Stage&) = delete;
+  ~Stage() { release(); }
+  void release() {
+    std::free(buf);
+    buf = nullptr;
+    cap = 0;
+  }
+  uint8_t* get(size_t n) {
+    if (n > cap) {
+      release();
+      size_t want = (n + kStageAlign - 1) / kStageAlign * kStageAlign;
+      void* p = nullptr;
+      if (posix_memalign(&p, kStageAlign, want) != 0) throw std::bad_alloc();
+      buf = static_cast<uint8_t*>(p);
+      cap = want;
+    }
+    return buf;
+  }
+};
+
+// pread_full of [offset, offset + nbytes) into dst; with ``aligned`` an unaligned read over kDirectMax reads
+// [offset & ~4095, offset + nbytes) into the stage instead and copies the requested bytes out (same bytes in dst).
+static void aligned_pread(int fd, uint8_t* dst, size_t nbytes, int64_t offset, bool aligned, Stage& stage) {
+  bool direct = ((static_cast<uint64_t>(offset) | reinterpret_cast<uintptr_t>(dst)) & (kPageAlign - 1)) == 0;
+  if (!aligned || direct || nbytes <= kDirectMax) {
+    pread_full(fd, dst, nbytes, offset);
+    return;
+  }
+  int64_t start = offset & ~static_cast<int64_t>(kPageAlign - 1);
+  size_t lead = static_cast<size_t>(offset - start);
+  uint8_t* buf = stage.get(lead + nbytes);
+  pread_full(fd, buf, lead + nbytes, start);
+  std::memcpy(dst, buf + lead, nbytes);
+}
+
+// Reads nbytes of fd at file_offset into an evaluated array's buffer at byte_offset (the caller owns the timing).
+void pread_into(mx::array& a, size_t byte_offset, int fd, int64_t file_offset, size_t nbytes, bool aligned) {
+  if (!a.is_available() || byte_offset + nbytes > a.nbytes()) {
+    throw std::out_of_range("pread_into: the array is not evaluated or the range passes its end");
+  }
+  auto* dst = a.data<uint8_t>() + byte_offset;
+  nb::gil_scoped_release release;
+  thread_local Stage stage;
+  aligned_pread(fd, dst, nbytes, file_offset, aligned, stage);
 }
 
 // A fixed set of reader threads; run() hands them one batch of tasks and returns once every task ended.
@@ -218,10 +259,10 @@ class PoolServer {
  public:
   PoolServer(std::shared_ptr<Channel> channel, mx::array box, mx::array slot_of, std::vector<mx::array> dsts,
              std::vector<size_t> part_nbytes, nb::bytes fds, nb::bytes offsets, int layers, int experts, int top_k,
-             int slots, int workers, uint64_t timeout_ms)
+             int slots, int workers, uint64_t timeout_ms, bool aligned)
       : channel_(std::move(channel)), box_(std::move(box)), slot_of_(std::move(slot_of)), dsts_(std::move(dsts)),
         part_nbytes_(std::move(part_nbytes)), layers_(layers), experts_(experts), top_k_(top_k), slots_(slots),
-        timeout_ms_(timeout_ms) {
+        timeout_ms_(timeout_ms), aligned_(aligned) {
     size_t parts = dsts_.size();
     if (parts == 0 || part_nbytes_.size() != parts || layers <= 0 || experts <= 0 || slots <= experts || workers <= 0) {
       throw std::invalid_argument("PoolServer: bad geometry");
@@ -256,6 +297,7 @@ class PoolServer {
     for (int s = slots - 1; s >= experts; --s) free_.push_back(s);
     readers_ = std::make_unique<Readers>(workers);
     staging_.resize(workers);
+    stages_ = std::vector<Stage>(workers);
     thread_ = std::thread([this] { serve(); });
   }
 
@@ -328,6 +370,7 @@ class PoolServer {
   }
 
   bool packed() const { return pack_fd_ >= 0; }
+  bool aligned() const { return aligned_; }
   int workers() const { return readers_ ? readers_->size() : 0; }
 
   // Serves every queued job whose GPU signal arrives within kCloseGraceMs, releases (without loading) the ones whose
@@ -350,6 +393,7 @@ class PoolServer {
       std::free(buf);
       buf = nullptr;
     }
+    for (auto& stage : stages_) stage.release();
   }
 
  private:
@@ -509,16 +553,17 @@ class PoolServer {
     if (pack_fd_ >= 0) {
       readers_->run(need.size(), [&](size_t i, int worker) { read_packed(layer, need[i].first, need[i].second, worker); });
     } else {
-      readers_->run(need.size() * parts, [&](size_t i, int) {
-        read_part(layer, need[i / parts].first, i % parts, need[i / parts].second);
+      readers_->run(need.size() * parts, [&](size_t i, int worker) {
+        read_part(layer, need[i / parts].first, i % parts, need[i / parts].second, worker);
       });
     }
   }
 
-  void read_part(int layer, int e, size_t p, int slot) {
+  void read_part(int layer, int e, size_t p, int slot, int worker) {
     size_t at = (static_cast<size_t>(layer) * experts_ + e) * dsts_.size() + p;
     if (fds_[at] < 0) throw PoolError("KeyError", "no source for layer " + std::to_string(layer));
-    pread_full(fds_[at], dst_ptrs_[p] + static_cast<size_t>(slot) * part_nbytes_[p], part_nbytes_[p], offsets_[at]);
+    aligned_pread(fds_[at], dst_ptrs_[p] + static_cast<size_t>(slot) * part_nbytes_[p], part_nbytes_[p], offsets_[at],
+                  aligned_, stages_[worker]);
     bytes_read_.fetch_add(part_nbytes_[p]);
     preads_.fetch_add(1);
   }
@@ -550,6 +595,8 @@ class PoolServer {
   std::vector<int64_t> offsets_;
   int layers_, experts_, top_k_, slots_;
   uint64_t timeout_ms_;
+  bool aligned_;                           // unpacked reads through aligned_pread's stage (no page-cache residue)
+  std::vector<Stage> stages_;              // one aligned_pread stage per reader thread
 
   int pack_fd_ = -1;
   std::vector<int64_t> pack_offsets_;
@@ -587,15 +634,16 @@ NB_MODULE(_hostsync, m) {
       .def("wait", &Channel::wait, nb::arg("value"), nb::arg("timeout_ms"));
   m.def("gpu_signal", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, false); });
   m.def("gpu_wait", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, true); });
-  m.def("pread_into", &pread_into);
+  m.def("pread_into", &pread_into, nb::arg("a"), nb::arg("byte_offset"), nb::arg("fd"), nb::arg("file_offset"),
+        nb::arg("nbytes"), nb::arg("aligned") = false);
   m.def("write_into", &write_into);
   m.def("peek", &peek);
   nb::class_<PoolServer>(m, "PoolServer")
       .def(nb::init<std::shared_ptr<Channel>, mx::array, mx::array, std::vector<mx::array>, std::vector<size_t>,
-                    nb::bytes, nb::bytes, int, int, int, int, int, uint64_t>(),
+                    nb::bytes, nb::bytes, int, int, int, int, int, uint64_t, bool>(),
            nb::arg("channel"), nb::arg("box"), nb::arg("slot_of"), nb::arg("dsts"), nb::arg("part_nbytes"),
            nb::arg("fds"), nb::arg("offsets"), nb::arg("layers"), nb::arg("experts"), nb::arg("top_k"),
-           nb::arg("slots"), nb::arg("workers"), nb::arg("timeout_ms"))
+           nb::arg("slots"), nb::arg("workers"), nb::arg("timeout_ms"), nb::arg("aligned") = false)
       .def("set_pack", &PoolServer::set_pack, nb::arg("fd"), nb::arg("offsets"), nb::arg("read_nbytes"),
            nb::arg("part_offsets"), nb::arg("alignment"))
       .def("submit", &PoolServer::submit, nb::arg("kind"), nb::arg("layer"), nb::arg("rows"), nb::arg("signal"),
@@ -606,6 +654,7 @@ NB_MODULE(_hostsync, m) {
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
       .def("packed", &PoolServer::packed)
+      .def("aligned", &PoolServer::aligned)
       .def("workers", &PoolServer::workers)
       .def("close", &PoolServer::close, nb::call_guard<nb::gil_scoped_release>());
 }
