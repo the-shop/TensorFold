@@ -413,6 +413,40 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
 MIN_CHUNK = 256
 
 
+def _declared_model_id(family: Any, model: Any, tokenizer: Any, plan: Any, model_dir: Path, mlx_lm: str,
+                       directories: tuple[Path | None, Path | None], load_options: dict[str, Any] | None = None) -> str:
+    """The snapshot key of a family that declares its numerics: the declared part, the pinned environment and the
+    canary prefilled on this model (cached for this code, environment and ``load_options`` beside the snapshots)."""
+
+    import mlx.core as mx
+
+    from tensorfold import families
+    from tensorfold.engine import numerics
+    from tensorfold.engine.lane_engine import LaneEngine
+    from tensorfold.engine.prefix_snapshots import weights_fingerprint
+
+    kernels = families.kernel_version(family, model)
+    weights = weights_fingerprint(model_dir)
+    if all(d is None for d in directories):
+        value = "unused"                               # nothing is stored or read: no canary to run
+    else:
+        identity = numerics.model_id(model_dir, mlx=mx.__version__, mlx_lm=mlx_lm, kernels=kernels, plan=plan.name,
+                                     weights=weights, canary_value="?")
+
+        def compute() -> str:
+            return numerics.canary_digest(LaneEngine(model, prefill_plan=plan), plan,
+                                          numerics.model_vocab(model, tokenizer))
+
+        try:
+            value = numerics.canary(identity, compute, numerics.cache_file_for(*directories), load_options)
+        except Exception as exc:  # noqa: BLE001 - no canary: key on the exact code instead (never reused across it)
+            print(f"[tensorfold] numerics canary failed ({type(exc).__name__}: {exc}); prompt snapshots key on this "
+                  "exact build instead", flush=True)
+            value = f"code-{numerics.code_fingerprint()}"
+    return numerics.model_id(model_dir, mlx=mx.__version__, mlx_lm=mlx_lm, kernels=kernels, plan=plan.name,
+                             weights=weights, canary_value=value, strict=numerics.strict_requested())
+
+
 def _host_reserve(args: argparse.Namespace) -> int:
     """The process's bytes outside MLX's buffers: PROCESS_BYTES, and the n-gram row cache's arena."""
 
@@ -434,6 +468,9 @@ def _parallel(value: Any) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    from tensorfold.engine import numerics
+
+    numerics.code_fingerprint()         # before the family's modules load, so it names the code this server runs
     from tensorfold import families, hub
 
     if not args.no_update_check:
@@ -525,6 +562,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
                required_files: Any, memory_limit: int, fraction: float = MEMORY_FRACTION) -> int:
     import mlx.core as mx
     from tensorfold import families, hub
+    from tensorfold.engine import numerics
     from tensorfold.engine.lane_engine import LaneEngine
     from tensorfold.engine.prefill_plan import PrefillPlan, message_markers
 
@@ -585,10 +623,19 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         resolve_prefill()  # the prefill mode's self-check runs at startup, before any snapshot key
     from tensorfold.engine.prefix_snapshots import weights_fingerprint
 
-    # Both libraries, the active prompt kernels, how prompts are cut and the weights' bytes determine a snapshot's bits.
-    model_id = (f"{model_dir.resolve()}|mlx={mx.__version__}|mlx_lm={version('mlx-lm')}"
-                f"|kernels={families.kernel_version(family, model)}"
-                f"|prefill={plan.name}|tensorfold={__version__}|weights={weights_fingerprint(model_dir)}")
+    session_dir = None if args.session_dir is None else Path(args.session_dir).expanduser()
+    if numerics.declared(family) is None:
+        # Both libraries, the active prompt kernels, how prompts are cut and the weights' bytes determine a snapshot's
+        # bits; this family keys on its source and the release.
+        model_id = (f"{model_dir.resolve()}|mlx={mx.__version__}|mlx_lm={version('mlx-lm')}"
+                    f"|kernels={families.kernel_version(family, model)}"
+                    f"|prefill={plan.name}|tensorfold={__version__}|weights={weights_fingerprint(model_dir)}")
+    else:
+        # every load option that can pick another compute path: a canary measured under one is not another's
+        load_options = {**options, "memory_limit": memory_limit, "mlx_cache_gib": args.mlx_cache_gib,
+                        "mtp_confidence": args.mtp_confidence, "context": context}
+        model_id = _declared_model_id(family, model, tokenizer, plan, model_dir, version("mlx-lm"),
+                                      (snapshot_dir, session_dir), load_options)
     gib = args.prompt_cache_gib
     if gib is None:
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -615,7 +662,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         fit_context=args.context is None,
         use_proposer=not args.no_drafts,
         snapshot_dir=snapshot_dir, model_id=model_id,
-        session_dir=None if args.session_dir is None else Path(args.session_dir).expanduser(),
+        session_dir=session_dir,
         decode_share=0.25 if args.decode_share is None else float(args.decode_share),
         background_warm=bool(args.background_warm),
         persist_turns=bool(args.persist_turns),

@@ -1,0 +1,163 @@
+"""Prompt snapshots of Flash Next key on its declared numerics and a canary, not its source; this test pins a tiny
+model's prompt-cache bits per declared numerics so an edit that moves them is caught where the canary cannot see.
+
+It prefills a tiny deterministic model (8- and 4-bit, the full-attention layer second so attention output reaches
+the cache) through the canary's reply-cut plan, the selected-blocks attention (DENSE_KEYS patched to 64, and
+unpatched past 4096 keys), chunks of 8192 and 8448 tokens (expert rows at and past MAX_SORTED_ROWS), last chunks of
+1-4 rows (PIPE_ROWS, SCALAR_ROWS) and MLX's matmul route, stores and restores each cache as a snapshot, and compares
+the digests with the ones recorded for this NUMERICS_VERSION and environment (GPU, macOS, MLX, mlx-lm). It covers
+what those cases reach on that model, not every shape a real model takes (other head counts, expert counts or MTP).
+
+A GPU with no records skips. A GPU with records but none for this declared version or environment fails until a
+new entry is recorded. Recording (``TF_RECORD_NUMERICS_GOLDEN=1``) only adds entries: it refuses to change the
+digests of a recorded version and environment, so bits that move need a bump of ``NUMERICS_VERSION`` in
+families/qwen4_exp/__init__.py (or ``ENGINE_NUMERICS`` in engine/numerics.py for shared engine code). Commit
+tests/fixtures/numerics_golden.json, then record tests/test_numerics_reviewed.py's digest.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+mx = pytest.importorskip("mlx.core")
+
+pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GPU")
+
+TESTS = Path(__file__).resolve().parent
+GOLDEN = TESTS / "fixtures" / "numerics_golden.json"
+SCRIPT = TESTS / "numerics_tiny.py"
+
+
+_INSTALLED: list[dict] = []
+
+
+def tiny_report(src: Path | None = None, script: Path | None = None) -> dict:
+    """numerics_tiny.py (or ``script``)'s report in a fresh process, on ``src`` (a package tree's parent) or the
+    installed one (run once per test process)."""
+
+    import tensorfold
+
+    if src is None and script is None and _INSTALLED:
+        return _INSTALLED[0]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(src if src is not None else Path(tensorfold.__file__).resolve().parents[1])
+    env.pop("TF_FLASH_PREFILL", None)
+    done = subprocess.run([sys.executable, str(script or SCRIPT)], env=env, capture_output=True, text=True,
+                          timeout=600, check=False)
+    assert done.returncode == 0, done.stderr[-4000:]
+    report = json.loads(done.stdout.strip().splitlines()[-1])
+    if src is None and script is None:
+        _INSTALLED.append(report)
+    return report
+
+
+def _gpu(environment: str) -> str:
+    return dict(part.split("=", 1) for part in environment.split("|")).get("gpu", "unknown")
+
+
+def verdict(report: dict, golden: dict) -> tuple[str, str]:
+    """("pass" | "skip" | "fail", why) for a report against the recorded digests."""
+
+    declared, environment = report["declared"], report["environment"]
+    recorded = golden.get(declared, {}).get(environment)
+    if recorded is None:
+        here = sorted(f"{d} on {e}" for d, envs in golden.items() for e in envs if _gpu(e) == _gpu(environment))
+        if not here:
+            return "skip", f"no golden digests on this GPU ({_gpu(environment)}): nothing to compare with"
+        return "fail", (
+            f"no golden digests for {declared} on {environment}, though this GPU has records ({', '.join(here)}). "
+            "If the code moved bits, bump NUMERICS_VERSION (families/qwen4_exp/__init__.py) or ENGINE_NUMERICS "
+            "(engine/numerics.py); if only macOS, MLX or mlx-lm changed (or after the bump), record this new entry "
+            "with TF_RECORD_NUMERICS_GOLDEN=1 pytest tests/test_numerics_golden.py, which accepts a new environment "
+            "only for the code recorded as reviewed.")
+    moved = sorted(k for k in set(recorded) | set(report["digests"]) if recorded.get(k) != report["digests"].get(k))
+    if moved:
+        return "fail", (
+            f"prompt-cache bits moved for {moved} under the same declared numerics {declared} on {environment}: "
+            "stored prompt snapshots would be reused with other bits. Bump NUMERICS_VERSION "
+            "(families/qwen4_exp/__init__.py) or ENGINE_NUMERICS (engine/numerics.py), then record the new version "
+            "with TF_RECORD_NUMERICS_GOLDEN=1. A recorded version's digests are never re-recorded.")
+    return "pass", ""
+
+
+def record(report: dict, path: Path, root: Path | None = None) -> None:
+    """Add ``report``'s digests for its declared numerics and environment to ``path``. Refuse to change an entry, and
+    refuse a new environment of an already recorded version unless the code under ``root`` (a repository-like tree;
+    None: this one) is the code recorded as reviewed for that version: a new environment is never a way to re-record
+    moved bits."""
+
+    from tests.test_numerics_reviewed import reviewed_mismatch
+
+    golden = json.loads(path.read_text()) if path.is_file() else {}
+    entry = golden.setdefault(report["declared"], {})
+    known = entry.get(report["environment"])
+    if known is not None and known != report["digests"]:
+        moved = sorted(k for k in set(known) | set(report["digests"]) if known.get(k) != report["digests"].get(k))
+        raise AssertionError(
+            f"refusing to re-record the golden digests of {report['declared']} on {report['environment']}: {moved} "
+            "moved. Changed bits need a NUMERICS_VERSION (or ENGINE_NUMERICS) bump, which records a new entry.")
+    if known is None and entry:
+        why = reviewed_mismatch(root, report["declared"])
+        if why is not None:
+            raise AssertionError(
+                f"refusing to record a new environment {report['environment']} for {report['declared']}: {why}. A new "
+                "environment is recorded only for the code reviewed for that version (tests/fixtures/"
+                "numerics_reviewed.json). If the code moved bits, bump NUMERICS_VERSION (or ENGINE_NUMERICS).")
+    entry[report["environment"]] = report["digests"]
+    path.write_text(json.dumps(golden, indent=1, sort_keys=True) + "\n")
+
+
+def test_prompt_cache_bits_match_the_declared_numerics():
+    report = tiny_report()
+    if os.environ.get("TF_RECORD_NUMERICS_GOLDEN") == "1":
+        record(report, GOLDEN)
+        return
+    state, why = verdict(report, json.loads(GOLDEN.read_text()) if GOLDEN.is_file() else {})
+    if state == "skip":
+        pytest.skip(why)
+    assert state == "pass", why
+
+
+def test_recording_never_rewrites_a_declared_versions_digests(tmp_path, monkeypatch):
+    import tests.test_numerics_reviewed as reviewed
+
+    monkeypatch.setattr(reviewed, "reviewed_mismatch", lambda root, declared: None)   # this code is the reviewed one
+    path = tmp_path / "golden.json"
+    report = {"declared": "qwen4_exp-v1-n1|e1", "environment": "gpu=g|macos=1|mlx=1|mlx_lm=1", "digests": {"a": "1"}}
+    record(report, path)
+    record(report, path)                                                    # the same bits: nothing to refuse
+    moved = {**report, "digests": {"a": "2"}}
+    with pytest.raises(AssertionError, match="NUMERICS_VERSION"):
+        record(moved, path)
+    assert json.loads(path.read_text())["qwen4_exp-v1-n1|e1"]["gpu=g|macos=1|mlx=1|mlx_lm=1"] == {"a": "1"}
+    record({**moved, "declared": "qwen4_exp-v1-n2|e1"}, path)              # a bump records a new entry
+    record({**moved, "environment": "gpu=g|macos=1|mlx=2|mlx_lm=1"}, path)  # so does another MLX, on reviewed code
+    monkeypatch.setattr(reviewed, "reviewed_mismatch", lambda root, declared: "the code differs")
+    with pytest.raises(AssertionError, match="only for the code reviewed"):        # but never on unreviewed code
+        record({**moved, "environment": "gpu=g|macos=9|mlx=1|mlx_lm=1"}, path)
+    record({**moved, "declared": "qwen4_exp-v1-n3|e1"}, path)              # a bump still records
+    assert verdict(moved, json.loads(path.read_text()))[0] == "fail"
+    recorded = json.loads(path.read_text())
+    assert "gpu=g|macos=9|mlx=1|mlx_lm=1" not in recorded["qwen4_exp-v1-n1|e1"]
+    assert verdict({**moved, "environment": "gpu=g|macos=2|mlx=1|mlx_lm=1"}, recorded)[0] == "fail"
+    assert verdict({**moved, "environment": "gpu=other|macos=1|mlx=1|mlx_lm=1"}, recorded)[0] == "skip"
+    assert verdict({**moved, "declared": "qwen4_exp-v1-n2|e1"}, json.loads(path.read_text()))[0] == "pass"
+
+
+def test_the_cases_straddle_every_size_the_prefill_switches_on():
+    from tensorfold.families.qwen4_exp import model as q4
+    from tensorfold.kernels.qwen.flash_next.v1 import gdn, hc, prefill_mm
+    from tests import numerics_tiny as tiny
+
+    top = tiny.TEXT["num_experts_per_tok"]
+    assert tiny.LONG_EVEN * top <= prefill_mm.MAX_SORTED_ROWS < tiny.LONG_SPLIT * top     # one sorted gather, split
+    assert tiny.SPARSE_PROMPT > 64 and min(tiny.LONG_TAIL) > q4.prefill.DENSE_KEYS        # selected-blocks attention
+    assert set(range(1, gdn.PIPE_ROWS + 1)) <= set(tiny.TAILS) and max(tiny.TAILS) > hc.SCALAR_ROWS
+    assert min(tiny.TAILS) <= hc.SCALAR_ROWS
+    assert tiny.TEXT["layer_types"][-1] != "full_attention"       # attention output reaches a later layer's state

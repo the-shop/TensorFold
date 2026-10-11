@@ -1,0 +1,26 @@
+{
+ "qwen4_exp-v1-n1|e1": {
+  "gpu=applegpu_g17s|macos=27.0.1|mlx=0.32.2|mlx_lm=0.31.3": {
+   "q4-canary": "136:76af4d25a3b74487",
+   "q4-long-8192": "0265272ea5953757",
+   "q4-long-8448": "9a9d73e71b349b2b",
+   "q4-mlx-route": "136:23fb5e62d482b0b5",
+   "q4-mlx-route-long-8448": "bd17036b32dd7c5f",
+   "q4-sparse": "0764f9b7859f27f8",
+   "q4-tail-1": "1891124e7ce74064",
+   "q4-tail-2": "d66efe9ef342937f",
+   "q4-tail-3": "0d3b33eccd2b2a92",
+   "q4-tail-4": "c6137b197c6587da",
+   "q8-canary": "136:caf2f4b1d18743c5",
+   "q8-long-8192": "b4cdba78accc59f6",
+   "q8-long-8448": "0119af2ee68bda11",
+   "q8-mlx-route": "136:9433b57a9cbce4ed",
+   "q8-mlx-route-long-8448": "61aea0ceb4511c9f",
+   "q8-sparse": "1b59b0439f0bb7b1",
+   "q8-tail-1": "4a5d1fcfe3dad11e",
+   "q8-tail-2": "ed0c33596d0e8d00",
+   "q8-tail-3": "7a417e5bc1cae0e8",
+   "q8-tail-4": "c19c12aa981ff7de"
+  }
+ }
+}
