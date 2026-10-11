@@ -3,6 +3,14 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Steady KV pricing for Flash Next's sparse indexer.** Index keys and pooled blocks are priced per allocated
+  position, not per valid token, so one short request no longer inflates the admission profile (~+3.9 GiB at a
+  77,824-token prompt) and evicts or refuses later long prompts. Ported from upstream
+  [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (Apache-2.0; see
+  THIRD_PARTY_NOTICES.md). At 84 GiB the startup still picks 2,048-token prompt chunks.
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
