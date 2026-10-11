@@ -9,13 +9,22 @@ GitHub has the full notes and the measurements behind them.
   groups, every chunk through a layer before the next layer, over the same chunk cuts and with the same per-call
   shapes, so replies, caches and saved prompt states are bit for bit those of chunk-by-chunk prefill while the SSD
   expert window is filled once per layer a group instead of once per layer a chunk. Checkpoints inside a group are
-  assembled per layer as each layer passes the cut. A group's carried activations are capped
-  (`TF_PREFILL_GROUP_GIB`, default 1) and counted in admission; a cancelled group keeps no half-filled state.
+  assembled per layer as each layer passes the cut, and kept only once every expert-pool call of the group is
+  answered without an error (a group whose SSD read failed keeps and saves none of them, as chunk-by-chunk prefill
+  keeps nothing past a failed chunk). A group's carried activations are capped (`TF_PREFILL_GROUP_GIB`, default 1)
+  and counted in admission; a cancelled group keeps no half-filled state.
+  Known limit: a prompt cancelled while a group runs loses that whole group's progress (chunk by chunk keeps the
+  last finished chunk), so its retry recomputes the group; bits are unaffected, only the retry is slower.
   Ideas credited: staggered segments and per-chunk state marks of the upstream TensorFold native engine
   (ashhart/TensorFold, `zig/src/core/segments.zig`, `zig/src/flashnext/marks.zig`), expert-major prefill with
   offloaded experts in oMLX, and strata-mlx's planned overlap of next-layer reads with compute. No code copied.
-- **Expert pool tripwire and call log.** A prompt chunk's expert-window call now carries a tag the host checks, so a
-  call that would read another call's routing fails the request instead of loading the wrong experts.
+- **Expert pool tripwire and call log.** Expert-pool calls alternate between two regions of the routing box; the
+  host clears a call's region once read and checks the next call's region is still clear before releasing it, so
+  a call whose routing arrives before the previous call was answered fails the request ("calls ran out of order").
+  A call two ahead shares a region and is not caught by this check; by analysis it ends in a pool timeout error
+  (slow, the request still fails). The engine orders its calls so neither happens; this is a backstop. The Python
+  serve loop now keeps the first pool error (as the native server does) and clears a failed call's region, so the
+  real cause is reported instead of "calls ran out of order".
   `TF_POOL_JOBLOG=path` logs every pool call's host time, GPU gap and bytes (diagnostics, off by default).
 
 ## 0.2.0 (10 Oct 2026)

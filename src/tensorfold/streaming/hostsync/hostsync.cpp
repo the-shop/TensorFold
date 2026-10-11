@@ -329,9 +329,10 @@ class PoolServer {
   }
 
   // Calls alternate between two regions of ``words`` words of the box (0: the whole box, as before). The host clears
-  // a call's region once read, and before releasing a call checks the next call's region is still clear: a later
-  // call's routing written before this call was answered means the GPU ran calls out of order (a failed request,
-  // never wrong experts loaded silently).
+  // a call's region once read, and before releasing a call checks the next call's region is still clear: the next
+  // call's routing written before this call was answered means the GPU ran calls out of order (the call fails). A
+  // call two ahead shares this call's region, so this check misses it; by analysis it ends in a TimeoutError (slow, but
+  // the request still fails). The engine's order chain keeps both from happening; this is the backstop.
   void set_regions(size_t words) {
     if (words * 2 * sizeof(uint32_t) > box_.nbytes() || (words && words < static_cast<size_t>(experts_))) {
       throw std::invalid_argument("set_regions: two regions must fit the box and hold a window's flags");
