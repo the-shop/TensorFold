@@ -3,6 +3,20 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Decode profiler (opt-in).** `TENSORFOLD_DECODE_PROFILE=<path.jsonl>` records, per decode round, host stamps at
+  points the round already passes, each expert-pool call (GPU signal seen, SSD reads, release, misses, bytes) and
+  the GPU start and end of the command buffers that carry the expert marks, with no added MLX op or eval (replies
+  are the same tokens). `TENSORFOLD_DECODE_PROFILE_SYNC=1` adds eval barriers for exact per-part GPU times.
+  `tools/decode_profile_report.py` turns the file into a per-round breakdown (dense GPU, routed-expert GPU, SSD
+  stall, host answer, Python-bound idle, head tail, MTP, gaps) and the TTFT phases of each request;
+  `tools/decode_health_delta.py` reads `/health` counters around requests; `tools/bench_flash_decode_parts.py`
+  measures the parts on random weights of the checkpoint's shapes. The `done` line's `draft=` and `post=` now report
+  settle and after-read time for single-stream rounds. Idea credits (no code copied): the dense-versus-expert
+  bytes-per-token analysis of [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) motivated the breakdown, and
+  [oMLX](https://github.com/jundot/omlx) (Apache-2.0) GPU keep-warm observations shaped the idle probe.
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
