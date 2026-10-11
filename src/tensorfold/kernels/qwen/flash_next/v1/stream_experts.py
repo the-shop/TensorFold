@@ -105,8 +105,10 @@ def down(act: mx.array, picks: mx.array, n_experts: int, pool: Any, slot_of: mx.
     names = ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows", "SLOTOF", "LAYER"]
     if _pool_bits(pool.down, width) != experts.spec(shared):
         raise ValueError("stream_experts: the pool's experts and the shared expert differ in width")
-    run = (kernel("q4_stream_down_y", _down_source, names, ["Y"]) if experts.spec(shared) == 4 else
-           kernel("q8_stream_down_y", lambda: experts.q8(_down_source(), experts._Q8_DOWN), names, ["Y"]))
+    bits = experts.spec(shared)
+    narrow = experts.down_width(width, bits)
+    run = kernel(f"q{bits}_stream_down_y" + ("_narrow" if narrow else ""),
+                 lambda: experts.down_source(_down_source(), narrow, bits), names, ["Y"])
     return run(inputs=[act, picks, pool.down.weight, pool.down.scales, pool.down.biases, shared.weight,
                        shared.scales, shared.biases, count(rows), slot_of, layer],
                template=[("NI", width), ("D", dims), ("TOPK", top_k), ("SG", simdgroups), ("NE", n_experts)],

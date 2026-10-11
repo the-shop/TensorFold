@@ -149,6 +149,34 @@ _Q8_DOWN = (("constexpr int KB = NI / 2;", "constexpr int KB = NI;"),
             ("DBp[at * KG + (32 + lane) / 2]", "DBp[at * KG + (32 + lane) / 4]"))
 
 
+# expert_down_y's lanes cover 16-input chunks l and 32 + l: whole for 32 <= NC <= 64 (512 <= NI <= 1024). Narrower
+# rows (test models) take this variant, which skips a lane's chunks past NC; without it lanes >= NC read other slots'
+# activations and weight rows, and past the end of both buffers (run-to-run garbage). Wider rows are refused.
+_NARROW_DOWN = (("  const float sa = load16(x + lane * 16, xa);",
+                 "  const bool first = int(lane) < NC;\n  const float sa = first ? load16(x + lane * 16, xa) : 0.0f;"),
+                ("    float acc = qdot16(w + lane * 8, xa, float(DSp[at * KG + lane / 2]), float(DBp[at * KG + lane / 2]), sa);",
+                 "    float acc = first ? qdot16(w + lane * 8, xa, float(DSp[at * KG + lane / 2]), "
+                 "float(DBp[at * KG + lane / 2]), sa) : 0.0f;"))
+
+
+def down_width(width: int, bits: int) -> bool:
+    """Whether expert_down_y takes the narrow variant for activation rows of ``width``; refuses widths it can't read."""
+
+    if width % (16 if bits == 4 else 64) or width > 1024:
+        raise ValueError(f"expert_down_y: {bits}-bit activation rows of {width} (needs a multiple of "
+                         f"{16 if bits == 4 else 64}, at most 1024)")
+    return width < 512
+
+
+def down_source(source: str, narrow: bool, bits: int) -> str:
+    """expert_down_y's source (``source``: the 4-bit text): unchanged when 32 to 64 lane chunks cover the row, else
+    with lanes past the row idle; 8-bit (groups of 64) through ``q8``."""
+
+    if narrow:
+        source = q8(source, _NARROW_DOWN)
+    return q8(source, _Q8_DOWN) if bits == 8 else source
+
+
 def q8(source: str, edits: tuple[tuple[str, str], ...]) -> str:
     """A 4-bit group-32 expert kernel's source for 8-bit weights in groups of 64: a lane's 16 inputs take 16 bytes
     of a row (not 8) and share a scale with 3 other lanes (not 1); the loop, picks and sums are unchanged."""
@@ -215,8 +243,10 @@ def expert_down_y(act: mx.array, picks: mx.array, down: Any, shared: Any, *, sim
     top_k = int(picks.shape[-1])
     dims = int(down.weight.shape[1])
     names = ["ACT", "PICK", "DW", "DS", "DB", "SDW", "SDS", "SDB", "rows"]
-    run = (kernel("q4_expert_down_y", _EXPERT_DOWN_Y, names, ["Y"]) if spec(down, shared) == 4 else
-           kernel("q8_expert_down_y", lambda: q8(_EXPERT_DOWN_Y, _Q8_DOWN), names, ["Y"]))
+    bits = spec(down, shared)
+    narrow = down_width(width, bits)
+    run = kernel(f"q{bits}_expert_down_y" + ("_narrow" if narrow else ""),
+                 lambda: down_source(_EXPERT_DOWN_Y, narrow, bits), names, ["Y"])
     return run(inputs=[act, picks, down.weight, down.scales, down.biases, shared.weight, shared.scales,
                           shared.biases, count(rows)],
                   template=[("NI", width), ("D", dims), ("TOPK", top_k), ("SG", simdgroups)],

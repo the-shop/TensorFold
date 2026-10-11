@@ -3,6 +3,14 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Out-of-bounds reads fixed (det).** The Flash-Next expert down kernels (`expert_down_y`, the streamed pool's
+  `down`) read past the activation row for expert widths below 512 and past both buffers above 1,024: test models
+  (width 64 or 128) gave different bits run to run. Narrower rows now take a variant whose idle lanes read nothing;
+  widths above 1,024 or off the group size are refused. Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640)
+  compile from the unchanged source, so their replies are the same tokens. Own work, no third-party code (builds on TensorFold by ashhart).
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
