@@ -333,7 +333,13 @@ class Scheduler(PromptFill):
 
         if self.prompt_memory is not None and self._released_at != self.starts and self._queue.empty():
             self._released_at = self.starts
+            from tensorfold.streaming import profile
+
+            started = profile.now()
             self.prompt_memory.release_freed()
+            prof = profile.ACTIVE
+            if prof is not None:
+                prof.event("release_freed", started, profile.now())
 
     def _preempt_background(self) -> None:
         """Release background work until the next foreground request has both a lane and enough memory."""

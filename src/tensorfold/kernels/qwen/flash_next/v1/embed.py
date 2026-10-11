@@ -7,6 +7,7 @@ from typing import Any
 import mlx.core as mx
 
 from tensorfold.kernels.qwen.flash_next.v1.base import kernel, padded
+from tensorfold.streaming import profile as _profile
 
 _PLE_LOOKUP = r"""
   // Thread (d, h, r): dim d of head h of row r. Row id IDS[r][h] lies in one of 8 table groups (row starts GSTART);
@@ -145,7 +146,11 @@ def ple_lookup(ids: Any, tables: PleTables) -> mx.array:
     ids = np.asarray(ids).reshape(-1, np.asarray(ids).shape[-1])
     rows, heads = ids.shape
     if tables.host is not None:
+        prof = _profile.ACTIVE
+        started = _profile.now() if prof is not None else 0
         words, scales, biases = tables.host.gather(ids)
+        if prof is not None:
+            prof.ple(started)
         run = _row_kernel("ple_rows", _PLE_ROWS, tables.bits, tables.group, ["W", "SC", "BI"])
         return run(inputs=[mx.array(words), mx.array(scales).view(mx.bfloat16), mx.array(biases).view(mx.bfloat16)],
                    template=[("DIMS", tables.dims)], grid=(tables.dims, rows * heads, 1),

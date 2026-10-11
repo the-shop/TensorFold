@@ -615,6 +615,22 @@ class ChatApp(RequestOptions):
             ),
             flush=True,
         )
+        from tensorfold.streaming import profile
+
+        prof = profile.ACTIVE
+        if prof is not None:
+            ns = lambda t: int(t * 1e9) if t else 0                      # noqa: E731  # perf_counter: the same clock
+            try:
+                prof.flush(job=job.job_id, prompt=len(prompt_ids), cached=job.cached_tokens,
+                           tokens=len(collected), sha=_token_sha(collected),
+                           rounds_reported=stream.rounds if stream else 0,
+                           accepted=stream.accepted if stream else 0, drafted=stream.drafted if stream else 0,
+                           t_received=ns(received_at), t_started=ns(job.started_at),
+                           t_prefilled=ns(job.prefilled_at), t_first_token=ns(first_token_at),
+                           t_finished=ns(job.finished_at), t_flush=profile.now(), perf_minus_mono_ns=
+                           int(time.perf_counter() * 1e9) - profile.now())
+            except Exception as error:  # noqa: BLE001  # a diagnostic never fails the reply
+                prof.disable(f"flush failed: {error!r}")
         return reply
 
     def _round_profile(self, stream: Any) -> str:
