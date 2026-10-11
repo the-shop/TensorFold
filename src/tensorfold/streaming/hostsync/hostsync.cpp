@@ -1,5 +1,6 @@
 // The GPU signals and waits for the host inside MLX's command stream through an MTLSharedEvent, never an MLX eval.
 
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -432,6 +433,29 @@ class PoolServer {
     return window_;
   }
 
+  // Calls alternate between two regions of ``words`` words of the box (0: the whole box, as before). The host clears
+  // a call's region once read, and before releasing a call checks the next call's region is still clear: the next
+  // call's routing written before this call was answered means the GPU ran calls out of order (the call fails). A
+  // call two ahead shares this call's region, so this check misses it; by analysis it ends in a TimeoutError (slow, but
+  // the request still fails). The engine's order chain keeps both from happening; this is the backstop.
+  void set_regions(size_t words) {
+    if (words * 2 * sizeof(uint32_t) > box_.nbytes() || (words && words < static_cast<size_t>(experts_))) {
+      throw std::invalid_argument("set_regions: two regions must fit the box and hold a window's flags");
+    }
+    std::lock_guard<std::mutex> lk(state_mu_);
+    regions_ = words;
+  }
+
+  // Per-call timing (diagnostics): (kind, layer, rows, signal seen ns, ready ns, bytes read, preads), uptime clock.
+  void set_log(bool on) { log_on_.store(on); }
+
+  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> take_log() {
+    std::lock_guard<std::mutex> lk(log_mu_);
+    std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> out;
+    out.swap(log_);
+    return out;
+  }
+
   bool packed() const { return pack_fd_ >= 0; }
   bool aligned() const { return aligned_; }
   int workers() const { return readers_ ? readers_->size() : 0; }
@@ -485,6 +509,7 @@ class PoolServer {
       bool prof = job.t_submit != 0 && prof_.load(std::memory_order_relaxed);
       Rec rec{job.kind, job.layer, job.rows, 0, 0, 0, job.signal, job.t_submit, 0, 0, 0, 0};
       cur_ = prof ? &rec : nullptr;
+      uint64_t seen = 0, bytes0 = 0, preads0 = 0;
       try {
         if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing, fail it
           record("RuntimeError", "expert streaming closed before the GPU reached layer " + std::to_string(job.layer));
@@ -492,27 +517,32 @@ class PoolServer {
           continue;
         }
         if (prof) rec.t_sig = now_ns();
+        if (log_on_.load()) {
+          seen = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+          bytes0 = bytes_read_.load();
+          preads0 = preads_.load();
+        }
         std::lock_guard<std::mutex> lk(state_mu_);
+        const uint32_t* box = region(job);
         if (job.kind == 0) {
           size_t n = static_cast<size_t>(job.rows) * top_k_;
-          if (job.rows < 0 || n * sizeof(uint32_t) > box_.nbytes()) {
+          if (job.rows < 0 || n > region_words()) {
             throw PoolError("IndexError", "peek: the array is not evaluated or the range passes its end");
           }
-          const uint32_t* ids = box_.data<uint32_t>();
-          std::vector<int64_t> routed(ids, ids + n);
+          std::vector<int64_t> routed(box, box + n);
           std::sort(routed.begin(), routed.end());
           routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
           if (prof) rec.unique = static_cast<int>(routed.size());
           load(job.layer, routed);
         } else {
-          const uint32_t* flags = box_.data<uint32_t>();
           std::vector<int64_t> present;
           for (int e = 0; e < experts_; ++e) {
-            if (flags[e] != 0) present.push_back(e);
+            if (box[e] != 0) present.push_back(e);
           }
           if (prof) rec.unique = static_cast<int>(present.size());
           fill_window(job.layer, present);
         }
+        check_order(job);
       } catch (const PoolError& e) {
         record(e.kind, e.what());
       } catch (const std::bad_alloc& e) {
@@ -529,6 +559,11 @@ class PoolServer {
         } else {
           ++prof_dropped_;
         }
+      }
+      if (seen) {
+        uint64_t done = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        std::lock_guard<std::mutex> lk(log_mu_);
+        log_.emplace_back(job.kind, job.layer, job.rows, seen, done, bytes_read_.load() - bytes0, preads_.load() - preads0);
       }
       channel_->signal(job.ready);   // the GPU always gets its release; the next Python call raises
     }
@@ -548,6 +583,26 @@ class PoolServer {
       if (channel_->event->waitUntilSignaledValue(job.signal, slice)) return true;
       if (clock::now() >= deadline) {
         throw PoolError("TimeoutError", "no routing from the GPU for layer " + std::to_string(job.layer));
+      }
+    }
+  }
+
+  size_t region_words() const { return regions_ ? regions_ : box_.nbytes() / sizeof(uint32_t); }
+
+  uint32_t* region(const Job& job) {
+    size_t at = regions_ ? ((job.signal - 1) / 2 % 2) * regions_ : 0;
+    return box_.data<uint32_t>() + at;
+  }
+
+  void check_order(const Job& job) {
+    if (!regions_) return;
+    uint32_t* mine = region(job);
+    const uint32_t* next = box_.data<uint32_t>() + (((job.signal - 1) / 2 + 1) % 2) * regions_;
+    std::memset(mine, 0, regions_ * sizeof(uint32_t));
+    for (size_t i = 0; i < regions_; ++i) {
+      if (next[i] != 0) {
+        throw PoolError("RuntimeError", "the expert pool's call after layer " + std::to_string(job.layer) +
+                                            "'s wrote its routing before that call was answered: calls ran out of order");
       }
     }
   }
@@ -705,6 +760,10 @@ class PoolServer {
   std::vector<int> free_, window_;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, bytes_read_{0}, preads_{0};
+  size_t regions_ = 0;                     // words a region (two alternate), 0: one region, the whole box
+  std::atomic<bool> log_on_{false};
+  std::mutex log_mu_;
+  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> log_;
   std::mutex error_mu_;
   std::optional<std::pair<std::string, std::string>> error_;
 
@@ -778,6 +837,9 @@ NB_MODULE(_hostsync, m) {
       .def("lru_items", &PoolServer::lru_items)
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
+      .def("set_regions", &PoolServer::set_regions, nb::arg("words"))
+      .def("set_log", &PoolServer::set_log, nb::arg("on"))
+      .def("take_log", &PoolServer::take_log)
       .def("packed", &PoolServer::packed)
       .def("aligned", &PoolServer::aligned)
       .def("workers", &PoolServer::workers)

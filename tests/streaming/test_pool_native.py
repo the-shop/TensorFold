@@ -110,7 +110,7 @@ def call(hs, s, kind, layer, ids, ok=True):
             words[e] = 1
     else:
         words = list(ids)
-    hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack(f"<{len(words)}I", *words))
     signal, ready = s.marks(kind, layer, len(ids) // TOPK if kind == "rows" else 1)
     s.channel.signal(signal)
     assert s.channel.wait(ready, 10_000)
@@ -316,11 +316,11 @@ def test_the_server_refuses_arrays_of_the_wrong_kind(hs, tmp_path):
     table = (np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int32).tobytes(),
              np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int64).tobytes())
     args = {"layers": LAYERS, "experts": EXPERTS, "top_k": TOPK, "slots": 2 * EXPERTS, "workers": 1, "timeout_ms": 100}
-    bad_box = mx.zeros(s.box.shape, dtype=mx.int32)
+    bad_box = mx.zeros(s.boxes.shape, dtype=mx.int32)
     bad_table = mx.zeros(s.slot_of.shape, dtype=mx.uint32)
     mx.eval(bad_box, bad_table)
-    for box, slot_of, part_sizes in ((bad_box, s.slot_of, sizes), (s.box, bad_table, sizes),
-                                     (s.box, s.slot_of, [n + 2 for n in sizes])):
+    for box, slot_of, part_sizes in ((bad_box, s.slot_of, sizes), (s.boxes, bad_table, sizes),
+                                     (s.boxes, s.slot_of, [n + 2 for n in sizes])):
         with pytest.raises(ValueError):
             hs.PoolServer(s.channel, box, slot_of, dsts, part_sizes, *table, **args)
     s.close()
@@ -343,7 +343,7 @@ def test_close_releases_queued_calls_the_gpu_never_signalled(hs, tmp_path):
 def test_close_still_loads_a_call_whose_signal_arrived(hs, tmp_path):
     truth = write_checkpoint(tmp_path, seed=8)
     s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
-    hs.write_into(s.box, 0, struct.pack("<4I", 2, 5, 5, 2))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack("<4I", 2, 5, 5, 2))
     signal, _ = s.marks("rows", 1, 2)
     _, last = s.marks("rows", 2, 1)                                      # queued behind it, never signalled
     s.channel.signal(signal)
@@ -591,3 +591,67 @@ def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, p
     check_resident(hs, packed, truth)
     for s in (py, plain, packed):
         s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("kind", ["rows", "window"])
+def test_a_call_whose_successor_wrote_its_routing_first_fails(hs, tmp_path, native, kind):
+    """Calls alternate between two box regions; the host clears a call's region once read and, before releasing it,
+    finds the next call's region clear. Routing the next call wrote early (the GPU ran calls out of order) fails the
+    call instead of leaving the next one to read a box someone else may rewrite."""
+
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+    call(hs, s, kind, 1, [1, 2, 3, 3])                 # in order: fine, and its region is clear again
+    assert not any(hs.peek(s.boxes, 4 * s.region_word(s.value - 1), 4 * s.box_words))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 3), struct.pack("<I", 7))     # the call after next, early
+    call(hs, s, kind, 2, [4, 5, 6, 6], ok=False)
+    assert "ran out of order" in str(s.error)
+    with pytest.raises(RuntimeError, match="expert streaming stopped"):
+        s.marks("rows", 0, 1)
+    s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_a_failed_call_keeps_its_error_and_clears_its_region(hs, tmp_path, native):
+    """A call that fails (an id outside the model) with the next call already queued: the pool keeps the first error,
+    not the "ran out of order" a region left uncleared would make the next call raise, and both regions end clear."""
+
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack("<4I", 2, 99, 2, 5))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 3), struct.pack("<4I", 1, 2, 3, 3))   # the next call
+    calls = [s.marks("rows", 1, 2), s.marks("rows", 2, 2)]          # both queued before the first is answered
+    for signal, ready in calls:
+        s.channel.signal(signal)
+        assert s.channel.wait(ready, 10_000)
+    assert isinstance(s.error, ValueError) and "99" in str(s.error)
+    if not native:
+        assert not any(hs.peek(s.boxes, 0, 8 * s.box_words))
+    with pytest.raises(RuntimeError, match="expert streaming stopped"):
+        s.marks("rows", 0, 1)
+    s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_the_call_log_times_every_call_and_its_reads(hs, tmp_path, monkeypatch, native):
+    write_checkpoint(tmp_path)
+    log = tmp_path / "calls.log"
+    monkeypatch.setenv("TF_POOL_JOBLOG", str(log))
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+    call(hs, s, "rows", 0, [1, 2, 3, 3])
+    call(hs, s, "window", 1, [4, 5])
+    s.note("chunk 0")
+    rows = s.take_log()
+    per = pool.expert_nbytes(s.found, 0)
+    assert [(r[0], r[1], r[5]) for r in rows] == [(0, 0, 3 * per), (1, 1, 2 * per)]
+    assert all(r[3] <= r[4] for r in rows)
+    call(hs, s, "window", 2, [4])
+    deadline = time.time() + 5
+    while time.time() < deadline and not (log.exists() and "chunk 0" in log.read_text() and
+                                           len(log.read_text().splitlines()) >= 2):
+        time.sleep(0.1)
+    lines = log.read_text().splitlines()
+    assert any(line.startswith("# ") and line.endswith("chunk 0") for line in lines)
+    assert any(line.split()[:2] == ["1", "2"] for line in lines)
+    s.close()

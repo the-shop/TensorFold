@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
-from functools import partial
+import os
 import time
+from functools import partial
 from typing import Any, Iterator, Sequence
 
-from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares
+from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares, stream_note
 from tensorfold.engine.prefill_plan import PromptChunks
+
+
+def layer_major_wanted(env: dict | None = None) -> bool:
+    """TF_PREFILL_LAYER_MAJOR=1: a prompt's chunks run in layer-major groups where the model can (off by default)."""
+
+    env = os.environ if env is None else env
+    return (env.get("TF_PREFILL_LAYER_MAJOR", "0") or "0").strip().lower() in ("1", "on", "yes", "true")
+
+
+def group_cap_bytes(env: dict | None = None) -> int:
+    """The most a layer-major group may carry between layers: TF_PREFILL_GROUP_GIB (default 1 GiB)."""
+
+    env = os.environ if env is None else env
+    return int(float(env.get("TF_PREFILL_GROUP_GIB", "1") or 1) * 2**30)
 
 
 def drain(steps: Iterator[Any]) -> Any:
@@ -24,6 +39,9 @@ class FamilyPrefill:
     """Prefill for ``FamilyRounds``."""
 
     _prefill_at: int | None = None                     # the prompt position the working cache holds whole
+    # layer-major prompt groups: None follows TF_PREFILL_LAYER_MAJOR; the model must offer prefill_group
+    layer_major: bool | None = None
+    prefill_steps = 0                                  # (layer, chunk) calls of layer-major groups: progress too
 
     def _family_feed(self, tokens: Sequence[int], cache: list[Any], chunks: Sequence[tuple[int, int]],
                      prompt_data: Any = None) -> Any:
@@ -53,6 +71,7 @@ class FamilyPrefill:
             if self.prefill_guard is not None:
                 self.prefill_guard.before_chunk(cache, len(chunk))
             self._prefill_at = None                    # a chunk in flight: the cache holds no prompt prefix whole
+            stream_note(self.model, f"chunk {begin} {end}")
             inputs = mx.array([chunk], dtype=mx.uint32)
             hidden = (self.model.prefill_vision(inputs, cache, prompt_data, begin, end)
                       if prompt_data is not None else feed(inputs, cache))
@@ -69,6 +88,7 @@ class FamilyPrefill:
             reads_last = n + 1 == len(chunks) or (drafting and getattr(self.model, "draft_reads_hidden", True))
             mx.eval(*((last,) if reads_last else ()), *cache_arrays(cache))
             check_expert_stream(self.model)
+            stream_note(self.model, f"chunk-done {begin} {end}")
             self._prefill_at = end
             if self.prefill_guard is not None:
                 self.prefill_guard.after_chunk(cache, len(chunk))
@@ -107,21 +127,25 @@ class FamilyPrefill:
         cached_tokens = self._prefill_at = start
         stream.history_checkpoints = []
         try:
-            fed = False
-            for boundary in sorted({chunks.floor(int(b)) for b in checkpoints_at}):
-                if not start < boundary < len(prompt):
-                    continue
+            if prepared is None and self._groups_chunks():
+                hidden = yield from self._family_prefill_grouped(stream, prompt, work, chunks, start, checkpoints_at)
+            else:
+                fed = False
+                for boundary in sorted({chunks.floor(int(b)) for b in checkpoints_at}):
+                    if not start < boundary < len(prompt):
+                        continue
+                    if fed:
+                        yield
+                    yield from self._family_feed_steps(prompt, work, chunks.between(start, boundary))
+                    fed = True
+                    if self.prefill_guard is None or self.prefill_guard.allow_checkpoint(work):
+                        stream.history_checkpoints.append((list(prompt[:boundary]),
+                                                           drop_spares(self.copy_single_cache(work))))
+                    start = boundary
                 if fed:
                     yield
-                yield from self._family_feed_steps(prompt, work, chunks.between(start, boundary))
-                fed = True
-                if self.prefill_guard is None or self.prefill_guard.allow_checkpoint(work):
-                    stream.history_checkpoints.append((list(prompt[:boundary]),
-                                                       drop_spares(self.copy_single_cache(work))))
-                start = boundary
-            if fed:
-                yield
-            hidden = yield from self._family_feed_steps(prompt, work, chunks.between(start, len(prompt)), prepared)
+                hidden = yield from self._family_feed_steps(prompt, work, chunks.between(start, len(prompt)),
+                                                            prepared)
         except BaseException:
             at = self._prefill_at                      # stopped between chunks: keep the progress, a taken prefix too
             kept = [len(tokens) for tokens, _ in stream.history_checkpoints]
@@ -133,6 +157,142 @@ class FamilyPrefill:
         check_expert_stream(self.model)
         self._family_commit_first(stream, first)
         return work
+
+    def _groups_chunks(self) -> bool:
+        wanted = layer_major_wanted() if self.layer_major is None else bool(self.layer_major)
+        if not wanted:
+            return False
+        from tensorfold.engine import layer_major
+
+        return layer_major.supports(self.model)
+
+    def _family_prefill_grouped(self, stream: Any, prompt: Sequence[int], work: list[Any], chunks: Any, start: int,
+                                checkpoints_at: Sequence[int]) -> Iterator[None]:
+        """The prompt's chunks from ``start`` in layer-major groups (the same chunks, calls and bits as one by one);
+        a checkpoint inside a group is assembled from each layer's state as the layer passes it. A chunk of at most
+        ``fused_rows`` rows (the fused decode path) and a group that would be one chunk run alone. Yields only
+        between groups, every call of the group evaluated."""
+
+        cuts = sorted({f for f in (chunks.floor(int(b)) for b in checkpoints_at) if start < f < len(prompt)})
+        todo = list(chunks.between(start, len(prompt)))
+        hidden = None
+        fed = False
+        while todo:
+            group = self._next_group(todo, work)
+            if fed:
+                yield
+            fed = True
+            if len(group) == 1:
+                hidden = yield from self._family_feed_steps(prompt, work, group)
+            else:
+                hidden = self._family_feed_group(stream, prompt, work, group, cuts)
+            end = group[-1][1]
+            if end in cuts and (self.prefill_guard is None or self.prefill_guard.allow_checkpoint(work)):
+                stream.history_checkpoints.append((list(prompt[:end]), drop_spares(self.copy_single_cache(work))))
+        return hidden
+
+    def _next_group(self, todo: list[tuple[int, int]], work: list[Any]) -> list[tuple[int, int]]:
+        """Take the next group off ``todo``: consecutive chunks of more than ``fused_rows`` rows whose carried
+        activations stay under the group cap and fit the memory budget now (halved until they do; one chunk runs
+        alone)."""
+
+        small = int(getattr(self.model, "fused_rows", 16))
+        if todo[0][1] - todo[0][0] <= small:
+            return [todo.pop(0)]
+        from tensorfold.engine import layer_major
+
+        per = layer_major.frontier_bytes_per_token(self.model)
+        cap = group_cap_bytes()
+        group, rows = [todo[0]], todo[0][1] - todo[0][0]
+        for begin, end in todo[1:]:
+            if end - begin <= small or (rows + end - begin) * per > cap:
+                break
+            group.append((begin, end))
+            rows += end - begin
+        while len(group) > 1 and self.prefill_guard is not None and not self.prefill_guard.frontier_fits(
+                work, rows * per):
+            group = group[:(len(group) + 1) // 2]
+            rows = sum(end - begin for begin, end in group)
+        del todo[:len(group)]
+        return group
+
+    def _family_feed_group(self, stream: Any, prompt: Sequence[int], work: list[Any], group: list[tuple[int, int]],
+                           cuts: Sequence[int]) -> Any:
+        """One layer-major group: its chunks' forwards, the draft head's absorbs in chunk order, and every inner
+        checkpoint; the last chunk's hidden state [1, R, D] (evaluated). The working cache holds no prompt prefix
+        whole until the group ends. Inner checkpoints are kept only once every call of the group is answered without
+        a pool error: a failed group keeps none of its own, and a cancel while its calls run loses its progress (a
+        retry reruns the group from the last kept state)."""
+
+        import mlx.core as mx
+        import numpy as np
+
+        from tensorfold.engine import layer_major
+
+        guard = self.prefill_guard
+        model = self.model
+        layers = int(model.layer_count)
+        rows = sum(end - begin for begin, end in group)
+        if guard is not None:
+            guard.carry_frontier(rows * layer_major.frontier_bytes_per_token(model))
+        try:
+            if guard is not None:
+                guard.before_chunk(work, group[0][1] - group[0][0])
+            self._prefill_at = None
+            stream_note(model, f"group {group[0][0]} {group[-1][1]} chunks={len(group)}")
+            # inner checkpoints: each layer's state copied as the layer passes the cut, the draft head's after
+            marks: dict[int, list[Any]] = {end: [None] * layers for _, end in group[:-1] if end in cuts}
+            ahead = getattr(model, "prefetch_prompt", None)
+            ple = next((i for i, layer in enumerate(model.layers) if "ple" in layer), None)
+            if ahead is not None:
+                for begin, end in group[:2]:
+                    ahead(prompt, begin, end)
+
+            def before(i: int, j: int) -> None:
+                if j == 0 and guard is not None:
+                    guard.cancellation.check()           # between calls: the queued ones run to their end
+
+            def after(i: int, j: int) -> None:
+                self.prefill_steps += 1
+                end = group[j][1]
+                if end in marks:
+                    marks[end][i] = self.copy_single_cache([work[i]])[0]
+                if i == ple and ahead is not None and j + 2 < len(group):
+                    ahead(prompt, *group[j + 2])
+
+            inputs = [np.array([[int(t) for t in prompt[begin:end]]], dtype=np.int64) for begin, end in group]
+            outs = layer_major.prefill_group(model, inputs, work, before=before, after=after)
+            # every pool call is answered now; one that failed must leave no inner checkpoint (the serial path checks
+            # before it keeps a chunk's), or the scheduler would store and save a state built on stale experts
+            check_expert_stream(model)
+            drafting = getattr(model, "mtp", None) is not None
+            last = None
+            for j, ((begin, end), (streams, hidden)) in enumerate(zip(group, outs)):
+                layer_major.adopt_streams(model, streams)
+                if drafting:
+                    nxt = [int(t) for t in prompt[begin + 1:end + 1]]
+                    if nxt:
+                        model.absorb_draft_context(hidden[:, :len(nxt)], mx.array(nxt, dtype=mx.uint32), work,
+                                                   start=0)
+                last = hidden[:, -1:]
+                reads_last = j + 1 == len(group) or (drafting and getattr(model, "draft_reads_hidden", True))
+                mx.eval(*((last,) if reads_last else ()), *cache_arrays(work[layers:]))
+                if end in marks:
+                    taken = marks.pop(end) + self.copy_single_cache(work[layers:])
+                    if guard is None or guard.allow_checkpoint(taken, current=work + taken):
+                        stream.history_checkpoints.append((list(prompt[:end]), drop_spares(taken)))
+            mx.eval(*cache_arrays(work))
+            check_expert_stream(model)
+            stream_note(model, f"group-done {group[0][0]} {group[-1][1]}")
+            self._fed_rows = group[-1][1] - group[-1][0]
+            self.prefill_chunks += len(group)
+        finally:
+            if guard is not None:
+                guard.carry_frontier(0)
+        self._prefill_at = group[-1][1]
+        if guard is not None:
+            guard.after_chunk(work, group[-1][1] - group[-1][0])
+        return last
 
     def _family_first(self, stream: Any, work: list[Any], hidden: Any, cached_tokens: int, row: int) -> Any:
         """Draw or force the first token before the draft head or the next forward reads it."""

@@ -102,7 +102,7 @@ def call(s, fake, kind, layer, ids):
             words[e] = 1
     else:
         words = list(ids)
-    fake.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+    fake.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack(f"<{len(words)}I", *words))
     signal, ready = s.marks(kind, layer, len(ids) // TOPK if kind == "rows" else 1)
     s.channel.signal(signal)
     assert s.channel.wait(ready, 5000) and s.error is None

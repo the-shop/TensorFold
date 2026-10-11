@@ -86,6 +86,7 @@ class PromptMemory:
         self.observed_work = 0
         self.workspace_profiled = False
         self.prompt = self.reply = 0
+        self.frontier = 0              # a layer-major prompt group's carried activations, while one runs
         self._memory_lock = RLock()
         # host bytes outside MLX's counters that no reclaim frees (snapshot copies queued for disk, --persist-turns)
         self.pending_bytes: Callable[[], int] = lambda: 0
@@ -155,6 +156,7 @@ class PromptMemory:
 
     def projected(self, prompt: int, *, current_cache: Any = None, extra_bytes: int = 0) -> int:
         current = cache_nbytes(current_cache) if current_cache is not None else 0
+        extra_bytes = int(extra_bytes) + int(self.frontier)
         resident = max(0, self._used() - current)
         if self.profile is None:
             return resident + int(extra_bytes) + self.bootstrap
@@ -224,6 +226,18 @@ class PromptMemory:
                             "prompt or max_tokens (the reply is reserved in full), or start the server with a smaller "
                             "--context so clients compact sooner; --drafter none, a smaller or more quantized "
                             "checkpoint, or a Mac with more RAM leaves more room.")
+
+    def frontier_fits(self, cache: Any, nbytes: int) -> bool:
+        """Whether a layer-major group carrying ``nbytes`` between layers fits beside the prompt as it stands,
+        freeing only MLX's cached buffers (never a retained prefix: a group too large runs smaller instead)."""
+
+        with self._memory_lock:
+            if self.profile is None:
+                return False
+            if self.projected(self.prompt, current_cache=cache, extra_bytes=nbytes) <= self.budget:
+                return True
+            self.runtime.clear_cache()
+            return self.projected(self.prompt, current_cache=cache, extra_bytes=nbytes) <= self.budget
 
     def before_chunk(self, cache: Any, rows: int) -> None:
         self.require(cache if self.profile is not None else None)
@@ -366,11 +380,11 @@ class PromptMemory:
                 return False
         return True
 
-    def allow_checkpoint(self, cache: Any) -> bool:
+    def allow_checkpoint(self, cache: Any, current: Any = None) -> bool:
         size = cache_nbytes(cache)
         if self.store is None or self._over_store_budget(size):
             return False
-        return self._make_room(size, cache)
+        return self._make_room(size, cache if current is None else current)
 
     def room_for(self, size: int, *, tokens: int = 0, reply: int = 0, current_cache: Any = None) -> bool:
         """Whether ``size`` more bytes (a host copy for disk) fit, evicting nothing, beside what is resident and a

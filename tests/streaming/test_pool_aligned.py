@@ -90,7 +90,7 @@ def call(hs, s, kind, layer, ids):
         words = [1 if e in ids else 0 for e in range(EXPERTS)]
     else:
         words = list(ids)
-    hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack(f"<{len(words)}I", *words))
     signal, ready = s.marks(kind, layer, len(ids) // TOPK if kind == "rows" else 1)
     s.channel.signal(signal)
     assert s.channel.wait(ready, 20_000)

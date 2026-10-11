@@ -7,6 +7,7 @@ import queue
 import struct
 import sys
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_all
@@ -33,6 +34,17 @@ def pool_threads(env: dict | None = None) -> int:
 
     env = os.environ if env is None else env
     return min(256, max(1, int(env.get("TENSORFOLD_POOL_THREADS", "8") or 8)))
+
+
+def job_log_path(env: dict | None = None) -> str:
+    """TF_POOL_JOBLOG=path appends one line per pool call (diagnostics): kind layer rows seen_ns ready_ns bytes preads."""
+
+    env = os.environ if env is None else env
+    return (env.get("TF_POOL_JOBLOG", "") or "").strip()
+
+
+def _now_ns() -> int:
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) if hasattr(time, "CLOCK_UPTIME_RAW") else time.monotonic_ns()
 
 
 def native_wanted(env: dict | None = None) -> bool:
@@ -140,9 +152,15 @@ class Streamer:
             self.pool[proj] = Slots(*parts)
             arrays += parts
         self.slot_of = mx.zeros((layers * experts,), dtype=mx.int32)
-        self.box = mx.zeros((max(box_rows * top_k, experts, 8),), dtype=mx.uint32)
+        # calls alternate between two regions of the box; the host checks the next one is clear before releasing a
+        # call: the next call's routing written before this one was answered fails it ("calls ran out of order").
+        # A call two ahead shares this region and is not seen here; by analysis it ends in a pool timeout. Either
+        # way the request fails; the engine's order chain keeps both from happening
+        self.box_words = max(box_rows * top_k, experts, 8)
+        self.boxes = mx.zeros((2 * self.box_words,), dtype=mx.uint32)
+        self._clear = bytes(4 * self.box_words)                         # what a read region is reset to
         self.layer_ids = [mx.array([i] + [0] * 7, dtype=mx.int32) for i in range(layers)]
-        mx.eval(*arrays, self.slot_of, self.box, *self.layer_ids)
+        mx.eval(*arrays, self.slot_of, self.boxes, *self.layer_ids)
         self.fds = {path: _uncached(path) for path in {s.path for s in found.values()}}
         self.channel = hostsync.Channel()
         self.value = 0
@@ -177,22 +195,29 @@ class Streamer:
         self._prof_cur: dict | None = None
         self._prof_mu = threading.Lock()
         self._prof_dropped = 0
+        self._log_path = job_log_path()
+        self._log: list[tuple] = []
+        self._notes: list[str] = []
+        self._log_lock = threading.Lock()
         if native is None:
             native = native_wanted()
         if native and not self.decode_prefetch and not self.prompt_seed and hasattr(hostsync, "PoolServer"):
             self._readers.shutdown(wait=False)
             try:
                 self._server = self._native(slots, workers, pack)
+                self._server.set_regions(self.box_words)
             except BaseException:
                 for fd in self.fds.values():
                     os.close(fd)
                 raise
             self._thread = None
+            self._start_log()
             if _profile.ACTIVE is not None:
                 _profile.ACTIVE.attach(self)
             return
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
+        self._start_log()
         if _profile.ACTIVE is not None:
             _profile.ACTIVE.attach(self)
 
@@ -228,6 +253,45 @@ class Streamer:
             dropped, self._prof_dropped = self._prof_dropped, 0
         return got, dropped
 
+    def _start_log(self) -> None:
+        if not self._log_path:
+            return
+        if self._server is not None:
+            self._server.set_log(True)
+        threading.Thread(target=self._write_log, name="expert-joblog", daemon=True).start()
+
+    def take_log(self) -> list[tuple]:
+        """Pool calls logged since the last take: (kind, layer, rows, seen_ns, ready_ns, bytes, preads)."""
+
+        if self._server is not None:
+            return [tuple(int(v) for v in row) for row in self._server.take_log()]
+        with self._log_lock:
+            out, self._log = self._log, []
+        return out
+
+    def note(self, text: str) -> None:
+        """A marker line in the call log (when TF_POOL_JOBLOG is set), at the uptime clock's now."""
+
+        if self._log_path:
+            with self._log_lock:
+                self._notes.append(f"# {_now_ns()} {text}")
+
+    def _write_log(self) -> None:
+        while True:
+            time.sleep(1.0)
+            rows = self.take_log()
+            with self._log_lock:
+                notes, self._notes = self._notes, []
+            lines = [" ".join(str(v) for v in row) for row in rows]
+            # notes and calls interleaved by time; a note is "# ns text", a call "kind layer rows seen ready ..."
+            merged = sorted([(int(n.split()[1]), n) for n in notes] + [(int(r[3]), line) for r, line in zip(rows, lines)])
+            if merged:
+                try:
+                    with open(self._log_path, "a") as f:
+                        f.write("".join(line + "\n" for _, line in merged))
+                except OSError:
+                    pass
+
     def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
         """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
 
@@ -242,7 +306,7 @@ class Streamer:
                 for e in range(self.experts):
                     src, offset = self.source(self.found, layer, proj, part, e)
                     fds[layer, e, p], offsets[layer, e, p], sizes[p] = self.fds[src.path], offset, src.nbytes
-        server = self.hs.PoolServer(self.channel, self.box, self.slot_of,
+        server = self.hs.PoolServer(self.channel, self.boxes, self.slot_of,
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
                                     workers, TIMEOUT_MS, aligned=self.aligned)
@@ -311,6 +375,18 @@ class Streamer:
     def window_layers(self) -> list[int]:
         return list(self._server.window()) if self._server is not None else list(self.window)
 
+    @property
+    def box(self) -> mx.array:
+        """The routing box region the next call's kernel writes (calls alternate between two)."""
+
+        at = self.region_word(self.value + 1)
+        return self.boxes[at:at + self.box_words]
+
+    def region_word(self, signal: int) -> int:
+        """Where in the box the call of ``signal`` finds its routing (a word offset)."""
+
+        return (signal - 1) // 2 % 2 * self.box_words
+
     def marks(self, kind: str, layer: int, rows: int, guess: int = 0) -> tuple[int, int]:
         """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags
         (or counts); ``guess`` > 0: rows x guess ids for layer + 1 wait in the guess box."""
@@ -371,13 +447,19 @@ class Streamer:
                 rec = dict.fromkeys(self._PROF_KEYS, 0)
                 rec.update(kind=_KINDS[kind], layer=layer, rows=rows, signal=signal, t_submit=submitted)
             self._prof_cur = rec
+            seen = 0
             try:
                 if not self.channel.wait(signal, TIMEOUT_MS):
                     raise TimeoutError(f"no routing from the GPU for layer {layer}")
                 if rec is not None:
                     rec["t_sig"] = _profile.now()
+                if self._log_path:
+                    seen, bytes0 = _now_ns(), self.bytes_read
                 if kind == "rows":
-                    ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
+                    if rows * self.top_k > self.box_words:
+                        raise IndexError("peek: the array is not evaluated or the range passes its end")
+                    at = 4 * self.region_word(signal)
+                    ids = np.frombuffer(self.hs.peek(self.boxes, at, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
                     if rec is not None:
                         rec["unique"] = len(routed)
@@ -397,7 +479,8 @@ class Streamer:
                 else:
                     self._check(layer, [])
                     self._resolve(layer, [])
-                    flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
+                    at = 4 * self.region_word(signal)
+                    flags = np.frombuffer(self.hs.peek(self.boxes, at, 4 * self.experts), dtype=np.uint32)
                     if rec is not None:
                         rec["unique"] = int(np.count_nonzero(flags))
                     if self.prompt_counts is not None:
@@ -405,7 +488,12 @@ class Streamer:
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
             except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
-                self.error = error
+                self._record(error)
+            finally:
+                try:                                   # a failed call's region is cleared too: the one two later
+                    self._check_order(signal, layer)   # checks it is
+                except BaseException as error:  # noqa: BLE001
+                    self._record(error)
             if rec is not None:
                 rec["t_ready"] = _profile.now()
                 self._prof_cur = None
@@ -416,6 +504,9 @@ class Streamer:
                         self._prof.append(rec)
                     else:
                         self._prof_dropped += 1
+            if seen:
+                with self._log_lock:
+                    self._log.append((_KINDS[kind], layer, rows, seen, _now_ns(), self.bytes_read - bytes0, 0))
             self.channel.signal(ready)
             for step, *args in after:             # speculative reads start once the GPU runs on
                 if self.error is not None:
@@ -423,7 +514,22 @@ class Streamer:
                 try:
                     step(*args)
                 except BaseException as error:  # noqa: BLE001  # recorded; the next call raises it
-                    self.error = error
+                    self._record(error)
+
+    def _record(self, error: BaseException) -> None:
+        """Keep the first error (as the native server does): later failures are its consequences."""
+
+        if self.error is None:
+            self.error = error
+
+    def _check_order(self, signal: int, layer: int) -> None:
+        """This call's region cleared; the next call's must still be clear (the native server checks the same)."""
+
+        size = 4 * self.box_words
+        self.hs.write_into(self.boxes, 4 * self.region_word(signal), self._clear)
+        if np.frombuffer(self.hs.peek(self.boxes, 4 * self.region_word(signal + 2), size), dtype=np.uint8).any():
+            raise RuntimeError(f"the expert pool's call after layer {layer}'s wrote its routing before that call was "
+                               "answered: calls ran out of order")
 
     def _check(self, layer: int, routed: list[int]) -> None:
         """A call's layer and (sorted) routed ids inside the model, before anything changes (the native check too)."""
