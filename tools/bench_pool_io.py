@@ -55,27 +55,10 @@ class Bench:
         """Map every source page's page-cache residency (mincore), so ``--cold`` samples only experts none of whose
         bytes are cached: F_NOCACHE skips caching new reads but still serves pages already resident."""
 
-        import ctypes
+        from tensorfold.streaming.page_cache import PAGE, pages
 
-        libc = ctypes.CDLL(None, use_errno=True)
-        libc.mmap.restype = ctypes.c_void_p
-        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                              ctypes.c_longlong]
-        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-        self.page = os.sysconf("SC_PAGE_SIZE")
-        self.cached = {}
-        for path in {s.path for s in self.found.values()}:
-            n = os.path.getsize(path)
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                addr = libc.mmap(None, n, 1, 1, fd, 0)
-                vec = ctypes.create_string_buffer((n + self.page - 1) // self.page)
-                libc.mincore(addr, n, vec)
-                libc.munmap(addr, n)
-            finally:
-                os.close(fd)
-            self.cached[path] = np.frombuffer(vec.raw, dtype=np.uint8) & 1
+        self.page = PAGE
+        self.cached = {path: pages(path) for path in {s.path for s in self.found.values()}}
 
     def is_cold(self, layer: int, e: int) -> bool:
         for proj, part in self.order:
