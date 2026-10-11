@@ -99,3 +99,59 @@ def test_copied_drafts_stop_before_an_id_past_the_vocab():
     assert rounds._copy_proposal(stream([5, 248045, 7])) == []          # under two tokens: no copy
     rounds.model = None                                                  # no vocabulary known: unchanged
     assert rounds._copy_proposal(stream([5, 6, 248045])) == [5, 6, 248045]
+
+
+@pytest.mark.parametrize("vocab", [100, None])
+def test_copied_drafts_stop_before_a_negative_id(vocab):
+    from tensorfold.engine.lane_family import FamilyRounds
+
+    rounds = object.__new__(FamilyRounds)
+    rounds.model = None if vocab is None else types.SimpleNamespace(args=types.SimpleNamespace(vocab_size=vocab))
+    rounds.max_copy = 8
+
+    def stream(copied):
+        proposer = types.SimpleNamespace(propose=lambda context, n: copied, last_match=9)
+        return types.SimpleNamespace(proposer=proposer, force=[], context=[1, 2], draft_room=9)
+
+    assert rounds._copy_proposal(stream([5, 6, -1, 7])) == [5, 6]
+    assert rounds._copy_proposal(stream([-3, 5, 6])) == []
+    assert rounds._copy_proposal(stream([5, 6, 7])) == [5, 6, 7]
+
+
+def test_synthetic_probe_ids_stay_inside_the_vocab():
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    from tensorfold.engine import prefill_step
+
+    fed = []
+
+    class Engine:
+        model = types.SimpleNamespace()
+
+        def prefill_prefix(self, tokens, cache=None, cached_tokens=0):
+            fed.append(list(tokens))
+            kv = KVCache()
+            kv.update_and_fetch(mx.zeros((1, 1, len(tokens), 8)), mx.zeros((1, 1, len(tokens), 8)))
+            return [kv]
+
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [], vocab=97)
+    assert len(fed[-1]) == 256 + 64 and max(fed[-1]) < 97 and min(fed[-1]) >= 0
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [])        # no vocabulary known: as before
+    assert fed[-1] == [1000 + i for i in range(256 + 64)]
+    prefill_step.choose(lambda grid: Engine(), (512, 256), 1 << 40, [], vocab=248320)
+    assert fed[-1] == [1000 + i for i in range(256 + 64)]                     # a real vocabulary: unchanged ids
+
+
+def test_admission_probe_synthetic_ids_stay_inside_the_vocab():
+    from tests.test_prompt_memory import ProbeEngine, Runtime, controller
+
+    runtime = Runtime()
+    memory = controller(runtime=runtime)
+    engine = ProbeEngine(runtime)
+    memory.profile_probe(engine, None, 97)
+    assert len(engine.fed) == 256 + 64 and max(engine.fed) < 97 and min(engine.fed) >= 0
+    memory.profile_probe(engine)
+    assert engine.fed == [1000 + i for i in range(256 + 64)]
+    memory.sized(engine, lambda: "admission", None, 97)
+    assert max(engine.fed) < 97

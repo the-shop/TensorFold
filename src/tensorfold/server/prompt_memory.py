@@ -261,13 +261,15 @@ class PromptMemory:
             self.carry = max(self.carry, held)
         self.require(cache)
 
-    def profile_probe(self, engine: Any, tokens: Any = None) -> None:
-        """Size the cache, a full chunk's workspace and what a prompt holds between chunks with one probe prompt."""
+    def profile_probe(self, engine: Any, tokens: Any = None, vocab: int = 0) -> None:
+        """Size the cache, a full chunk's workspace and what a prompt holds between chunks with one probe prompt
+        (synthetic ids inside ``vocab``, 0: unknown, when ``tokens`` has none)."""
 
+        from tensorfold.engine.prefill_step import synthetic_probe
         from tensorfold.server.cancellation import Cancellation, PrefillGuard
 
         # real text: a mixture of experts routes it as it routes a prompt (synthetic ids reach fewer experts)
-        text = [int(t) for t in tokens or ()] or [1000 + i for i in range(self.chunk_rows + 64)]
+        text = [int(t) for t in tokens or ()] or synthetic_probe(self.chunk_rows + 64, vocab)
         probe = (text * (-(-(self.chunk_rows + 64) // len(text))))[:self.chunk_rows + 64]
         previous, engine.prefill_guard = engine.prefill_guard, PrefillGuard(Cancellation(), self)
         self.runtime.clear_cache()
@@ -278,7 +280,7 @@ class PromptMemory:
             engine.prefill_guard, self._probe_base = previous, None
             self.runtime.clear_cache()
 
-    def sized(self, engine: Any, probes: Any, tokens: Any = None) -> Any:
+    def sized(self, engine: Any, probes: Any, tokens: Any = None, vocab: int = 0) -> Any:
         """Run ``probes`` (the concurrency measurement), then this admission's own probe on ``tokens``; their result."""
 
         import gc
@@ -291,7 +293,7 @@ class PromptMemory:
             if release is not None:
                 release()                      # the probes' last shared round: no stream keeps rows of it
             gc.collect()                       # arrays the probes left in reference cycles, before anything is sized
-            self.profile_probe(engine, tokens)
+            self.profile_probe(engine, tokens, vocab)
         except RequestError:
             raise ValueError(self._no_room()) from None
         gc.collect()

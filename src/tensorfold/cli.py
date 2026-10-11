@@ -562,8 +562,9 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     # prompt chunks start where replies begin too, so a follow-up resumes where its latest reply began
     openers, assistant = message_markers(tokenizer)
     steps = engine_kwargs.pop("prefill_steps", None) or (LaneEngine.prefill_step,)
+    vocab = model_vocab(model)
     step = prefill_step.choose(lambda grid: LaneEngine(model, prefill_plan=PrefillPlan(grid)), steps,
-                               memory_limit - reserve, probe_tokens(tokenizer, model_vocab(model)), context)
+                               memory_limit - reserve, probe_tokens(tokenizer, vocab), context, vocab)
     plan = PrefillPlan(step, openers, MIN_CHUNK, assistant)
     print(f"[tensorfold] prompt chunks of up to {step:,} tokens, cut at replies {plan.min_chunk:,}+ tokens apart",
           flush=True)

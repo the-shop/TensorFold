@@ -8,15 +8,16 @@ GitHub has the full notes and the measurements behind them.
 - **Out-of-bounds reads fixed (det).** The Flash-Next expert down kernels (`expert_down_y`, the streamed pool's
   `down`) read past the activation row for expert widths below 512 and past both buffers above 1,024: test models
   (width 64 or 128) gave different bits run to run. Narrower rows now take a variant whose idle lanes read nothing;
-  widths above 1,024 or off the group size are refused. Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640)
-  compile from the unchanged source, so their replies are the same tokens. Own work, no third-party code (builds
-  on TensorFold by ashhart).
+  widths above 1,024 or not a whole number of quantization groups (32 inputs at 4 bits, 64 at 8) are refused.
+  Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640) compile from the unchanged source, so their replies are the
+  same tokens. Own work, no third-party code (builds on TensorFold by ashhart).
 - **Token ids past the embedding are refused.** A rendered prompt holding an id the model's embedding lacks (a
   tokenizer larger than the checkpoint's vocabulary, e.g. a tiny test model) gets HTTP 400 (in a stream, an
   `invalid_request_error` event) instead of reading memory past the table; the server warns at load when the
-  tokenizer has more ids than the embedding, and the Qwen4Exp forward checks ids itself. The start-up memory probe
-  and copied drafts leave such ids out, so a mismatched pair still starts. Own work, no third-party code (builds on
-  TensorFold by ashhart).
+  tokenizer has more ids than the embedding, and the Qwen4Exp prompt forward checks ids itself. The start-up memory
+  probes (real text or their synthetic fallback), copied drafts (also negative ids) and MTP drafts leave such ids
+  out, so a mismatched pair still starts and drafts. Own work, no third-party code (builds on TensorFold by
+  ashhart).
 
 ## 0.2.0 (10 Oct 2026)
 

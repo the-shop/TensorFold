@@ -58,11 +58,10 @@ class FlashNext:
             # TF_FLASH_DRAFT_VOCAB=0 scores the full vocabulary; TF_FLASH_QUEUED=0 reads each chained draft immediately.
             self._draft_ids = self._draft_head = None
             if os.environ.get("TF_FLASH_DRAFT_VOCAB", "1") != "0":
-                from tensorfold.families.qwen4_exp.draft_head import cut_head, draft_ids
+                from tensorfold.families.qwen4_exp.draft_head import draft_head_for
 
-                ids = draft_ids()
-                self._draft_ids = mx.array(ids)
-                self._draft_head = cut_head(model.lm_head, ids)
+                ids, self._draft_head = draft_head_for(model.lm_head, self.args.vocab_size)
+                self._draft_ids = None if ids is None else mx.array(ids)
             self.queued_chains = os.environ.get("TF_FLASH_QUEUED", "1") != "0"
             self.mtp_step_ms = self._time_mtp_step()
 

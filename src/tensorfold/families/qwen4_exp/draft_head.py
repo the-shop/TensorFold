@@ -12,18 +12,34 @@ import numpy as np
 VOCAB_FILE = Path(__file__).with_name("cuda") / "draft_vocab.txt"
 
 
-def draft_ids(path: Path = VOCAB_FILE, multiple: int = 64) -> np.ndarray:
-    """Sort ids to break ties by token id, padding with the smallest unlisted ids to a multiple of ``multiple``."""
+def draft_ids(path: Path = VOCAB_FILE, multiple: int = 64, vocab: int = 0) -> np.ndarray:
+    """Sort ids to break ties by token id, padding with the smallest unlisted ids to a multiple of ``multiple``;
+    ids at or past ``vocab`` (0: no limit) are left out: a draft is embedded next, and the gather has no bound check."""
 
     listed = {int(line) for line in Path(path).read_text().split() if line.strip()}
+    if vocab:
+        listed = {t for t in listed if 0 <= t < vocab}
     if not listed:
-        raise ValueError(f"{path}: no token ids")
+        raise ValueError(f"{path}: no token ids" + (f" below {vocab}" if vocab else ""))
     extra, candidate = [], 0
     while (len(listed) + len(extra)) % multiple:
+        if vocab and candidate >= vocab:
+            raise ValueError(f"{path}: {vocab} token ids can't fill a multiple of {multiple}")
         if candidate not in listed:
             extra.append(candidate)
         candidate += 1
     return np.array(sorted(listed | set(extra)), dtype=np.uint32)
+
+
+def draft_head_for(lm_head: Any, vocab: int, path: Path = VOCAB_FILE) -> tuple[Any, Any]:
+    """The listed draft ids the model can embed and score (below ``vocab`` and the head's rows) and their cut head;
+    (None, None) when no such subset fills a multiple of 64 rows: drafts then score the whole head."""
+
+    try:
+        ids = draft_ids(path, vocab=min(int(vocab), int(lm_head.weight.shape[0])))
+    except ValueError:
+        return None, None
+    return ids, cut_head(lm_head, ids)
 
 
 def cut_head(lm_head: Any, ids: np.ndarray) -> nn.QuantizedLinear:
