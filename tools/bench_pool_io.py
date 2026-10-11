@@ -1,6 +1,7 @@
 """Time the SSD expert pool's miss reads: the Python path, the native server unpacked, and the native server packed.
 
     python tools/bench_pool_io.py MODEL_DIR [--experts 512] [--per-call 16] [--threads 4,8,16,32] [--pack PATH]
+                                  [--cold] [--aligned 0|1]
 
 Each run reads ``--experts`` random (layer, expert) pairs (a fresh sample per run, so no run reads another's bytes)
 into a small pool, ``--per-call`` experts a call, as decode misses arrive: (a) python: the Streamer's reads (a
@@ -26,14 +27,14 @@ import mlx.core as mx
 import numpy as np
 
 from tensorfold.streaming import pack as packs
-from tensorfold.streaming.pool import _DTYPES, PARTS, Streamer, _uncached, sources
+from tensorfold.streaming.pool import _DTYPES, PARTS, Streamer, _uncached, aligned_reads, sources
 
 
 class Bench:
     """A virtual model: layer v of the bench has ``per_call`` experts, each a random real (layer, expert)."""
 
-    def __init__(self, model_dir: Path, hs, per_call: int, pack: Path | None) -> None:
-        self.hs, self.per_call = hs, per_call
+    def __init__(self, model_dir: Path, hs, per_call: int, pack: Path | None, aligned: bool = False) -> None:
+        self.hs, self.per_call, self.aligned = hs, per_call, aligned
         names, self.experts = packs.model_experts(model_dir)
         self.found, shapes = sources(model_dir, names)
         self.layers = sorted({key[0] for key in self.found})
@@ -90,7 +91,8 @@ class Bench:
                 def read(item):
                     p, layer, e, slot = item
                     src, offset = Streamer.source(self.found, layer, *self.order[p], e)
-                    self.hs.pread_into(self.dsts[p], slot * src.nbytes, self.fds[src.path], offset, src.nbytes)
+                    self.hs.pread_into(self.dsts[p], slot * src.nbytes, self.fds[src.path], offset, src.nbytes,
+                                       aligned=self.aligned)
 
                 list(readers.map(read, reads))
             return time.perf_counter() - start
@@ -111,7 +113,8 @@ class Bench:
         mx.eval(slot_of)
         channel = self.hs.Channel()
         server = self.hs.PoolServer(channel, self.box, slot_of, self.dsts, self.sizes, fds.tobytes(), offsets.tobytes(),
-                                    calls, self.per_call, 1, 2 * self.per_call, threads, 60_000)
+                                    calls, self.per_call, 1, 2 * self.per_call, threads, 60_000,
+                                    aligned=self.aligned)
         if packed:
             server.set_pack(self.pack_fd, records.tobytes(), self.lay.stride, self.lay.part_offsets,
                             self.lay.alignment)
@@ -146,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--modes", default="python,native,packed")
     ap.add_argument("--json", type=Path, default=None, help="also write the results here")
     ap.add_argument("--cold", action="store_true", help="sample only experts with no page-cache-resident bytes")
+    ap.add_argument("--aligned", choices=("0", "1"), default=None,
+                    help="unpacked reads as page-aligned supersets (default: TENSORFOLD_POOL_ALIGNED_READS, else 0)")
     args = ap.parse_args(argv)
     from tensorfold.streaming.build import load
 
@@ -155,10 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     if "packed" in modes and not packs.index_path(pack).is_file():
         print(f"no expert pack at {pack}: skipping packed runs (build it with tools/pack_experts.py)", file=sys.stderr)
         modes.remove("packed")
-    bench = Bench(model_dir, load(), args.per_call, pack if "packed" in modes else None)
+    aligned = aligned_reads() if args.aligned is None else args.aligned == "1"
+    bench = Bench(model_dir, load(), args.per_call, pack if "packed" in modes else None, aligned)
     if args.cold:
         bench.resident()
-    print(f"{bench.expert_bytes / 2**20:.2f} MiB an expert, {args.experts} experts a run "
+    print(f"{bench.expert_bytes / 2**20:.2f} MiB an expert, {args.experts} experts a run, aligned reads {int(aligned)} "
           f"({args.experts * bench.expert_bytes / 2**30:.2f} GiB), {args.per_call} a call")
     results, seed = [], 0
     for threads in [int(t) for t in args.threads.split(",")]:
@@ -171,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 took, preads = bench.native(picks, threads, mode == "packed")
             gbs = len(picks) * bench.expert_bytes / took / 1e9
             per_call = took / -(-len(picks) // args.per_call) * 1e3
-            results.append({"mode": mode, "threads": threads, "seconds": round(took, 4), "GB_s": round(gbs, 3),
+            results.append({"mode": mode, "threads": threads, "aligned": int(aligned), "seconds": round(took, 4), "GB_s": round(gbs, 3),
                             "ms_per_call": round(per_call, 3), "preads": int(preads)})
             print(f"{mode:>7} threads={threads:<3} {gbs:6.2f} GB/s  {per_call:7.2f} ms a call  {preads} preads",
                   flush=True)

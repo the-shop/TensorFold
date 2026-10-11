@@ -89,10 +89,10 @@ def evict(path: str | Path) -> None:
 
 
 def model_files(model_dir: Path) -> list[Path]:
-    """The checkpoint shards and expert pack of ``model_dir``."""
+    """The checkpoint shards and expert pack of ``model_dir`` (regular files only: mmap refuses anything else)."""
 
     model_dir = Path(model_dir)
-    return sorted([*model_dir.glob("*.safetensors"), *model_dir.glob("experts.pack")])
+    return sorted(p for p in [*model_dir.glob("*.safetensors"), *model_dir.glob("experts.pack")] if p.is_file())
 
 
 def expert_ranges(model_dir: Path) -> dict[Path, list[tuple[int, int]]]:

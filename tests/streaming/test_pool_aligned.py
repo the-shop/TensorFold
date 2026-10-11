@@ -207,9 +207,19 @@ def test_a_part_cut_short_by_the_end_of_file_fails(hs, tmp_path, monkeypatch):
 
 
 def test_aligned_reads_switch(monkeypatch):
-    assert pool.aligned_reads({}) is False
-    assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": "1"}) is True
-    assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": "off"}) is False
+    assert isinstance(pool.aligned_reads({}), bool)                       # the default may be either
+    for on in ("1", "on", "yes", "true", " TRUE "):
+        assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": on}) is True
+    for off in ("0", "off", "no", "false"):
+        assert pool.aligned_reads({"TENSORFOLD_POOL_ALIGNED_READS": off}) is False
+
+
+@darwin
+def test_page_cache_skips_what_is_not_a_regular_file(tmp_path):
+    write_checkpoint(tmp_path)
+    (tmp_path / "stray.safetensors").mkdir()                              # mmap of a directory: EINVAL
+    assert [p.name for p in page_cache.model_files(tmp_path)] == ["model-00001-of-00001.safetensors"]
+    assert page_cache.main(["evict", str(tmp_path)]) == 0
 
 
 # -- the page-cache tool ----------------------------------------------------------------------------------------
