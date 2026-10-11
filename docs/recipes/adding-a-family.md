@@ -21,6 +21,15 @@ Optional declarations include `DRAFTER`, `MLX_ENV`, `check`, `engine_settings`, 
 `check` must reject unsupported configuration before downloading weights, then validate the weight index
 when available. List shared kernel modules in `KERNEL_DEPENDENCIES` so snapshot keys include them.
 
+Prompt snapshots key on that source by default, so any edit to it, even a comment, discards saved states. A
+family can declare `NUMERICS_VERSION = 1` instead (Flash Next does): the key then holds the declared version,
+the pinned environment (model path and weights, MLX and mlx-lm, prompt plan, prefill route) and the digest of a
+short canary prompt prefilled on the loaded model at start-up (`engine/numerics.py`; rerun when the installed
+code, OS, GPU or `TF_*`/`MLX_*` variables change, cached beside the snapshots otherwise). Bump the version
+whenever a change moves the bits of a prompt's cache, and pin them with a golden test like
+`tests/test_numerics_golden.py`, which fails when they move without a bump. `TF_SNAPSHOT_KEY=strict` adds the
+exact code fingerprint to the key.
+
 `weight_bytes(model_dir, ple_on_ssd)` can provide a conservative resident-weight estimate for MLX startup
 admission. Without it, the CLI counts every safetensors file's size. Read headers only, use the loader's
 placement decision, and exclude only tensor bytes kept on the host (file mappings, or the SSD reads of

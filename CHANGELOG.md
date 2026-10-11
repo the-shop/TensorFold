@@ -3,6 +3,18 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **Prompt snapshots survive bit-identical updates (Flash Next).** The snapshot key no longer hashes the family's
+  source or names the release: it holds a declared `NUMERICS_VERSION`, the pinned environment (model path and
+  weights, MLX and mlx-lm, prompt plan, prefill route) and the digest of a short canary prompt prefilled on the
+  loaded model at start-up. A refactor, comment or release that computes the same bits keeps saved system blocks
+  and conversations; a change that moves the canary's bits, or a version bump, never reads them. The canary
+  reruns when the installed code, OS, GPU or `TF_*`/`MLX_*` variables change (cached beside the snapshots
+  otherwise), and `tests/test_numerics_golden.py` fails when a tiny model's prompt-cache bits move without a bump.
+  `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0 are not loaded (one re-prefill).
+  Own work, building on TensorFold by ashhart.
+
 ## 0.2.0 (10 Oct 2026)
 
 Saved prompt states survive restarts and crashes, and an optional RAM cache sits in front of n-gram rows read from
