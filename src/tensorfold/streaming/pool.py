@@ -143,9 +143,12 @@ class Streamer:
             arrays += parts
         self.slot_of = mx.zeros((layers * experts,), dtype=mx.int32)
         # calls alternate between two regions of the box; the host checks the next one is clear before releasing a
-        # call (a later call's routing written before this one was answered: calls out of order, the request fails)
+        # call: the next call's routing written before this one was answered fails it ("calls ran out of order").
+        # A call two ahead shares this region and is not seen here; by analysis it ends in a pool timeout. Either
+        # way the request fails; the engine's order chain keeps both from happening
         self.box_words = max(box_rows * top_k, experts, 8)
         self.boxes = mx.zeros((2 * self.box_words,), dtype=mx.uint32)
+        self._clear = bytes(4 * self.box_words)                         # what a read region is reset to
         self.layer_ids = [mx.array([i] + [0] * 7, dtype=mx.int32) for i in range(layers)]
         mx.eval(*arrays, self.slot_of, self.boxes, *self.layer_ids)
         self.fds = {path: _uncached(path) for path in {s.path for s in found.values()}}
@@ -422,9 +425,13 @@ class Streamer:
                         self.prompt_counts[layer] += flags
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
-                self._check_order(signal, layer)
             except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
-                self.error = error
+                self._record(error)
+            finally:
+                try:                                   # a failed call's region is cleared too: the one two later
+                    self._check_order(signal, layer)   # checks it is
+                except BaseException as error:  # noqa: BLE001
+                    self._record(error)
             if seen:
                 with self._log_lock:
                     self._log.append((_KINDS[kind], layer, rows, seen, _now_ns(), self.bytes_read - bytes0, 0))
@@ -435,14 +442,20 @@ class Streamer:
                 try:
                     step(*args)
                 except BaseException as error:  # noqa: BLE001  # recorded; the next call raises it
-                    self.error = error
+                    self._record(error)
+
+    def _record(self, error: BaseException) -> None:
+        """Keep the first error (as the native server does): later failures are its consequences."""
+
+        if self.error is None:
+            self.error = error
 
     def _check_order(self, signal: int, layer: int) -> None:
         """This call's region cleared; the next call's must still be clear (the native server checks the same)."""
 
         size = 4 * self.box_words
-        self.hs.write_into(self.boxes, 4 * self.region_word(signal), bytes(size))
-        if any(self.hs.peek(self.boxes, 4 * self.region_word(signal + 2), size)):
+        self.hs.write_into(self.boxes, 4 * self.region_word(signal), self._clear)
+        if np.frombuffer(self.hs.peek(self.boxes, 4 * self.region_word(signal + 2), size), dtype=np.uint8).any():
             raise RuntimeError(f"the expert pool's call after layer {layer}'s wrote its routing before that call was "
                                "answered: calls ran out of order")
 

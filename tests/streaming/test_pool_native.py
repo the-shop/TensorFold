@@ -613,6 +613,27 @@ def test_a_call_whose_successor_wrote_its_routing_first_fails(hs, tmp_path, nati
 
 
 @pytest.mark.parametrize("native", [True, False])
+def test_a_failed_call_keeps_its_error_and_clears_its_region(hs, tmp_path, native):
+    """A call that fails (an id outside the model) with the next call already queued: the pool keeps the first error,
+    not the "ran out of order" a region left uncleared would make the next call raise, and both regions end clear."""
+
+    write_checkpoint(tmp_path)
+    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack("<4I", 2, 99, 2, 5))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 3), struct.pack("<4I", 1, 2, 3, 3))   # the next call
+    calls = [s.marks("rows", 1, 2), s.marks("rows", 2, 2)]          # both queued before the first is answered
+    for signal, ready in calls:
+        s.channel.signal(signal)
+        assert s.channel.wait(ready, 10_000)
+    assert isinstance(s.error, ValueError) and "99" in str(s.error)
+    if not native:
+        assert not any(hs.peek(s.boxes, 0, 8 * s.box_words))
+    with pytest.raises(RuntimeError, match="expert streaming stopped"):
+        s.marks("rows", 0, 1)
+    s.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
 def test_the_call_log_times_every_call_and_its_reads(hs, tmp_path, monkeypatch, native):
     write_checkpoint(tmp_path)
     log = tmp_path / "calls.log"
