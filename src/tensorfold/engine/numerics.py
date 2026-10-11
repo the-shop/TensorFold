@@ -1,4 +1,5 @@
-"""Snapshot identity for families that declare their numerics: kept across bit-identical code, never across bit changes.
+"""Snapshot identity for families that declare their numerics: kept across code edits that keep the declared
+numerics and the canary's bits, refused across a declared bump or a canary change.
 
 A stored prompt state is reusable only by code that would compute the same bytes for the same tokens. Hashing the
 source refuses that across every comment, refactor or release; trusting a version number alone trusts every
@@ -7,12 +8,19 @@ developer to bump it. A family that declares ``NUMERICS_VERSION`` gets a key of 
 * what is pinned verbatim: the model path and weights, MLX and mlx-lm versions, the prompt plan and prefill route
   (as before);
 * what is declared: the family's ``NUMERICS_VERSION`` and this module's ``ENGINE_NUMERICS``, bumped whenever a change
-  moves bits (tests/test_numerics_golden.py fails until they are);
-* what is measured: the digest of a short canary prompt prefilled on the loaded model through the production plan,
-  so an undeclared change on any path the canary reaches still moves the key.
+  moves bits;
+* what is measured: the digest of a short canary prompt (two plan chunks and an 8-row tail) prefilled on the loaded
+  model through the production plan, so an undeclared change on a path the canary reaches still moves the key.
+
+The canary does not reach every path a real prompt takes (chunks of thousands of rows, tails of 1-4 rows, more than
+DENSE_KEYS keys): an edit that moves bits only there keeps the key unless the declared part is bumped. Two tests
+make that bump a checked decision rather than a memory: tests/test_numerics_golden.py pins a tiny model's prompt
+caches on cases past each of those thresholds, and tests/test_numerics_reviewed.py fails on any code edit to the
+family or its kernels until the bump is made or the edit is recorded as reviewed (after the golden passes).
 
 The canary is recomputed whenever the installed code (every file of the package, comments included), the
-environment (TF_*/MLX_* variables, GPU, OS, Python) or the declared part changes, and cached otherwise.
+environment (TF_*/MLX_* variables, GPU, OS, Python), the load options (SSD experts, PLE, drafts, kernels, lanes,
+memory) or the declared part changes, and cached otherwise.
 """
 
 from __future__ import annotations
@@ -20,13 +28,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import sys
 import time
-from typing import Any, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Bump when shared engine code changes the bits of a prompt's cache (chunk feeding, resume, state copies).
 ENGINE_NUMERICS = 1
@@ -49,10 +60,26 @@ def declared(family: Any) -> str | None:
 
 
 def code_fingerprint(root: Path | None = None) -> str:
-    """sha256 of every file of the installed package (relative path and bytes), compiled caches aside."""
+    """sha256 of every file of the installed package (relative path and bytes), compiled caches aside.
+
+    The installed package's is taken once and kept: call it before the family's modules are imported (``serve``
+    does) so it names the code that runs; ``code_on_disk`` reads the files again."""
 
     if root is None and _CODE:
         return _CODE[0]
+    value = _fingerprint(root)
+    if root is None:
+        _CODE.append(value)
+    return value
+
+
+def code_on_disk() -> str:
+    """The installed package's fingerprint read now, not the one kept since start-up."""
+
+    return _fingerprint(None)
+
+
+def _fingerprint(root: Path | None) -> str:
     base = Path(root) if root is not None else Path(__file__).resolve().parents[1]
     digest = hashlib.sha256()
     for path in sorted(p for p in base.rglob("*") if p.is_file()):
@@ -62,10 +89,7 @@ def code_fingerprint(root: Path | None = None) -> str:
         digest.update(rel.as_posix().encode() + b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-    value = digest.hexdigest()[:16]
-    if root is None:
-        _CODE.append(value)
-    return value
+    return digest.hexdigest()[:16]
 
 
 def environment_fingerprint() -> str:
@@ -146,16 +170,33 @@ def canary_digest(engine: Any, plan: Any, vocab: int) -> str:
             release()
 
 
-def _load_cache(path: Path) -> dict[str, Any]:
+def _entry_ok(entry: Any) -> bool:
+    return (isinstance(entry, dict) and isinstance(entry.get("canary"), str)
+            and isinstance(entry.get("saved"), (int, float)) and not isinstance(entry.get("saved"), bool))
+
+
+def _load_cache(path: Path) -> tuple[dict[str, Any], bool]:
+    """The cache file's well-formed entries, and whether it held anything else (then it is rewritten)."""
+
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}, False
+    except OSError:
+        return {}, True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, True
+    if not isinstance(data, dict):
+        return {}, True
+    entries = {k: v for k, v in data.items() if isinstance(k, str) and _entry_ok(v)}
+    return entries, len(entries) != len(data)
 
 
 def _store_cache(path: Path, entries: dict[str, Any]) -> None:
-    newest = sorted(entries.items(), key=lambda item: float(item[1].get("saved", 0)), reverse=True)
+    newest = sorted(((k, v) for k, v in entries.items() if _entry_ok(v)), key=lambda item: float(item[1]["saved"]),
+                    reverse=True)
     data = dict(newest[:_CACHE_ENTRIES])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,20 +207,39 @@ def _store_cache(path: Path, entries: dict[str, Any]) -> None:
         print(f"[tensorfold] could not record the numerics canary in {path}: {exc}", flush=True)
 
 
-def canary(identity: str, compute: Callable[[], str], cache_file: Path | None) -> str:
-    """The canary digest for ``identity`` (the declared key) on this code and environment, computed on a miss."""
+def options_fingerprint(options: dict[str, Any] | None) -> str:
+    """The load options that pick compute paths (SSD experts, PLE on SSD, drafts, lane kernels, lanes, memory), in a
+    canonical form."""
 
-    lookup = hashlib.sha256(f"{identity}\0{code_fingerprint()}\0{environment_fingerprint()}".encode()).hexdigest()
-    entries = _load_cache(cache_file) if cache_file is not None else {}
+    return json.dumps(options or {}, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def canary(identity: str, compute: Callable[[], str], cache_file: Path | None,
+           options: dict[str, Any] | None = None) -> str:
+    """The canary digest for ``identity`` (the declared key) on this code, environment and load options, computed on
+    a miss. A cache file holding anything but well-formed entries is rewritten."""
+
+    code = code_fingerprint()
+    lookup = hashlib.sha256(f"{identity}\0{code}\0{environment_fingerprint()}\0{options_fingerprint(options)}"
+                            .encode()).hexdigest()
+    entries, corrupt = _load_cache(cache_file) if cache_file is not None else ({}, False)
+    if corrupt:
+        print(f"[tensorfold] the numerics canary cache {cache_file} held malformed entries; rewriting it", flush=True)
     known = entries.get(lookup)
-    if isinstance(known, dict) and isinstance(known.get("canary"), str):
+    if known is not None:
+        if corrupt:
+            _store_cache(cache_file, entries)
         return known["canary"]
     started = time.perf_counter()
     value = compute()
     print(f"[tensorfold] numerics canary {value} for this build in {time.perf_counter() - started:.1f}s "
           "(prompt snapshots carry it: a build that computes other bits never reads them)", flush=True)
     if cache_file is not None:
-        entries = _load_cache(cache_file)               # another server may have written meanwhile
+        if code_on_disk() != code:
+            print("[tensorfold] the installed code changed while this server started: its numerics canary is not "
+                  "recorded", flush=True)
+            return value
+        entries, _ = _load_cache(cache_file)            # another server may have written meanwhile
         entries[lookup] = {"canary": value, "saved": time.time()}
         _store_cache(cache_file, entries)
     return value
@@ -222,5 +282,5 @@ def cache_file_for(*directories: Path | None) -> Path | None:
 
 
 __all__ = ["CANARY_FILE", "ENGINE_NUMERICS", "cache_digest", "cache_file_for", "canary", "canary_digest",
-           "canary_tokens", "code_fingerprint", "declared", "environment_fingerprint", "model_id", "model_vocab",
-           "strict_requested"]
+           "canary_tokens", "code_fingerprint", "code_on_disk", "declared", "environment_fingerprint", "model_id",
+           "model_vocab", "options_fingerprint", "strict_requested"]

@@ -1,10 +1,13 @@
-"""Flash Next's snapshot key: kept across bit-identical code, moved by anything that changes a prompt cache's bits."""
+"""Flash Next's snapshot key: each pinned part, the declared numerics and the canary move it; comments, refactors
+and releases keep it; the canary's cache is looked up per code, environment and load options and survives malformed
+files. Bits that move only on paths the canary does not reach keep the key: tests/test_numerics_golden.py and
+tests/test_numerics_reviewed.py are what catch those edits."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,19 +20,19 @@ FAMILY = families.families()["qwen4_exp"]
 
 
 def _key(**changes) -> str:
-    parts = dict(mlx="0.32.2", mlx_lm="0.31.3", kernels="qwen4_exp-v1-n1|prompt_attention=1|flash-prefill=fast",
-                 plan="grid2048+msg256:1:2.3", weights="w0", canary_value="520:aaaa")
+    parts = {"mlx": "0.32.2", "mlx_lm": "0.31.3", "kernels": "qwen4_exp-v1-n1|prompt_attention=1|flash-prefill=fast",
+             "plan": "grid2048+msg256:1:2.3", "weights": "w0", "canary_value": "520:aaaa"}
     parts.update(changes)
     return numerics.model_id(Path("/models/q8"), **parts)
 
 
 def test_every_pinned_part_moves_the_key():
     base = _key()
-    for change in (dict(mlx="0.33.0"), dict(mlx_lm="0.31.4"), dict(plan="grid4096+msg256:1:2.3"),
-                   dict(weights="w1"), dict(canary_value="520:bbbb"),
-                   dict(kernels="qwen4_exp-v1-n2|prompt_attention=1|flash-prefill=fast"),
-                   dict(kernels="qwen4_exp-v1-n1|prompt_attention=0|flash-prefill=fast"),
-                   dict(kernels="qwen4_exp-v1-n1|prompt_attention=1|flash-prefill=mlx")):
+    for change in ({"mlx": "0.33.0"}, {"mlx_lm": "0.31.4"}, {"plan": "grid4096+msg256:1:2.3"},
+                   {"weights": "w1"}, {"canary_value": "520:bbbb"},
+                   {"kernels": "qwen4_exp-v1-n2|prompt_attention=1|flash-prefill=fast"},
+                   {"kernels": "qwen4_exp-v1-n1|prompt_attention=0|flash-prefill=fast"},
+                   {"kernels": "qwen4_exp-v1-n1|prompt_attention=1|flash-prefill=mlx"}):
         assert _key(**change) != base, change
     assert base.split("|")[0] == str(Path("/models/q8").resolve())          # blocks still group by model path
     assert "tensorfold=" not in base and f"|numerics=e{numerics.ENGINE_NUMERICS}|" in base
@@ -107,9 +110,11 @@ def served(monkeypatch, tmp_path):
     model = SimpleNamespace(layers=[], args=SimpleNamespace(vocab_size=1000), prefill_key="flash-prefill=fast")
     plan = PrefillPlan(2048, (7,), 256, (7, 9))
     blocks = tmp_path / "blocks"
+    # the files on disk are the code this server runs, unless a test says otherwise
+    monkeypatch.setattr(numerics, "code_on_disk", numerics.code_fingerprint)
 
-    def build(directories=(blocks, None), plan=plan):
-        return cli._declared_model_id(FAMILY, model, None, plan, model_dir, "0.31.3", directories)
+    def build(directories=(blocks, None), plan=plan, options=None):
+        return cli._declared_model_id(FAMILY, model, None, plan, model_dir, "0.31.3", directories, options)
 
     return SimpleNamespace(build=build, engine=engine, blocks=blocks, model_dir=model_dir)
 
@@ -156,17 +161,27 @@ def test_serve_keys_a_declared_family_without_the_release(monkeypatch, tmp_path)
         raise Captured
 
     monkeypatch.setattr(app, "ChatApp", capture)
+    options = []
+
+    def canary(identity, compute, cache_file, load_options=None):
+        options.append(load_options)
+        return "136:fake"
+
+    monkeypatch.setattr(numerics, "canary", canary)
     monkeypatch.setattr(families, "kernel_version", lambda *args: "qwen4_exp-v1-n1")
     monkeypatch.setattr(metadata, "version", lambda name: "0.31.3")
     package = SimpleNamespace(load=lambda *a, **k: (None, None), NUMERICS_VERSION=1, KERNEL_VERSION="v1")
     family = SimpleNamespace(title="fake", model_type="fake", package=package)
     args = cli.build_parser().parse_args(["serve", str(tmp_path), "--no-drafts", "--prompt-cache-gib", "0",
-                                          "--snapshot-dir", str(tmp_path / "blocks")])
+                                          "--lane-kernels", "off", "--snapshot-dir", str(tmp_path / "blocks")])
     with pytest.raises(Captured):
         cli._serve_mlx(args, family, tmp_path, 0, [], 1 << 30)
     key = captured[0]
     assert "|tensorfold=" not in key and "|kernels=qwen4_exp-v1-n1|" in key and "|canary=" in key
     assert f"|numerics=e{numerics.ENGINE_NUMERICS}|" in key and "|weights=" in key
+    assert "|canary=136:fake|" in key
+    assert options[0]["lane_kernels"] == "off" and options[0]["drafter"] == "" and options[0]["memory_limit"] == 1 << 30
+    assert {"parallel", "drafter_bits", "mlx_cache_gib", "mtp_confidence"} <= set(options[0])
 
 
 def test_a_moved_canary_moves_the_key(monkeypatch, served):
@@ -174,6 +189,49 @@ def test_a_moved_canary_moves_the_key(monkeypatch, served):
     served.engine.scale = 3                                                   # the next build computes other bits
     monkeypatch.setattr(numerics, "_CODE", ["changed-arithmetic"])
     assert served.build() != first
+
+
+def test_load_options_are_part_of_the_canary_lookup(served):
+    resident = served.build(options={"lane_kernels": "auto", "parallel": 1})
+    assert served.engine.calls == 1
+    assert served.build(options={"parallel": 1, "lane_kernels": "auto"}) == resident and served.engine.calls == 1
+    for n, change in enumerate(({"ssd_experts": 60.0}, {"ple_on_ssd": True}, {"ple_cache_mib": 512},
+                                {"mtp_drafts": 2}, {"lane_kernels": "off"}, {"parallel": 2}), start=2):
+        options = {"lane_kernels": "auto", "parallel": 1, **change}
+        assert served.build(options=options) == resident and served.engine.calls == n, change   # measured again
+    assert served.build(options={"lane_kernels": "auto", "parallel": 1, "ssd_experts": 60.0}) == resident
+    assert served.engine.calls == 7                                           # and cached per options
+
+
+@pytest.mark.parametrize("content", ['{"x": 5}', '{"x": {"saved": "zz"}}', '{"x": {"canary": "1:a", "saved": "zz"}}',
+                                     '{"x": {"canary": 1, "saved": 1}}', '{"x": {"canary": "1:a", "saved": true}}',
+                                     "[1, 2]", "null", "{not json", ""])
+def test_a_malformed_canary_cache_is_rewritten(served, content):
+    served.blocks.mkdir(parents=True)
+    path = served.blocks / numerics.CANARY_FILE
+    path.write_text(content)
+    first = served.build()
+    assert served.engine.calls == 1 and "|canary=code-" not in first
+    entries = json.loads(path.read_text())
+    assert list(entries) != ["x"] and len(entries) == 1
+    assert all(isinstance(e["canary"], str) and isinstance(e["saved"], float) for e in entries.values())
+    assert served.build() == first and served.engine.calls == 1               # and read back next start
+
+
+def test_a_hit_beside_malformed_entries_rewrites_the_file(served):
+    served.build()
+    path = served.blocks / numerics.CANARY_FILE
+    entries = json.loads(path.read_text())
+    path.write_text(json.dumps({**entries, "junk": {"saved": "zz"}, "more": 5}))
+    served.build()
+    assert served.engine.calls == 1 and json.loads(path.read_text()) == entries
+
+
+def test_code_edited_while_starting_is_not_recorded(monkeypatch, served):
+    monkeypatch.setattr(numerics, "code_on_disk", lambda: "edited-since-import")
+    first = served.build()
+    assert served.engine.calls == 1 and not (served.blocks / numerics.CANARY_FILE).exists()
+    assert served.build() == first and served.engine.calls == 2               # measured again, never cached
 
 
 def test_without_stored_snapshots_no_canary_runs(served):

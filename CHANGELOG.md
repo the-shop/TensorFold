@@ -10,10 +10,16 @@ GitHub has the full notes and the measurements behind them.
   weights, MLX and mlx-lm, prompt plan, prefill route) and the digest of a short canary prompt prefilled on the
   loaded model at start-up. A refactor, comment or release that computes the same bits keeps saved system blocks
   and conversations; a change that moves the canary's bits, or a version bump, never reads them. The canary
-  reruns when the installed code, OS, GPU or `TF_*`/`MLX_*` variables change (cached beside the snapshots
-  otherwise), and `tests/test_numerics_golden.py` fails when a tiny model's prompt-cache bits move without a bump.
-  `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0 are not loaded (one re-prefill).
-  Own work, building on TensorFold by ashhart.
+  reruns when the installed code, OS, GPU, `TF_*`/`MLX_*` variables or load options (`--ssd-experts`,
+  `--ple-on-ssd`, `--ple-cache-mib`, drafts, `--lane-kernels`, `--parallel`, memory) change, cached beside the
+  snapshots otherwise; a malformed cache file is rewritten, and a canary measured while the code changed on disk
+  is not recorded. The canary does not reach every path (long chunks, 1-4 row tails, sparse attention past 4096
+  keys), so two tests make each edit a checked decision: `tests/test_numerics_golden.py` pins a tiny model's
+  prompt-cache bits on cases across each of those sizes and fails when they move without a bump, and
+  `tests/test_numerics_reviewed.py` fails on any code edit to the family or its kernels (comments and docstrings
+  aside) until `NUMERICS_VERSION` is bumped or, with the golden passing unchanged, the edit is recorded with
+  `TF_RECORD_NUMERICS_REVIEWED=1`. `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0
+  are not loaded (one re-prefill). Own work, building on TensorFold by ashhart.
 
 ## 0.2.0 (10 Oct 2026)
 
