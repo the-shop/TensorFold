@@ -23,7 +23,7 @@ from tensorfold.streaming.checkpoint import headers
 PARTS = ("weight", "scales", "biases")
 _DTYPES = {"U32": mx.uint32, "BF16": mx.bfloat16, "F16": mx.float16, "F32": mx.float32}
 TIMEOUT_MS = 60_000          # a layer's loads finish long before this; past it the forward fails
-_KINDS = {"rows": 0, "window": 1, "window_tagged": 2}
+_KINDS = {"rows": 0, "window": 1}
 _ERRORS = {"TimeoutError": TimeoutError, "ValueError": ValueError, "MemoryError": MemoryError,
            "IndexError": IndexError, "KeyError": KeyError, "RuntimeError": RuntimeError}
 
@@ -142,11 +142,12 @@ class Streamer:
             self.pool[proj] = Slots(*parts)
             arrays += parts
         self.slot_of = mx.zeros((layers * experts,), dtype=mx.int32)
-        # word E past a window call's flags holds its tag (window_tagged): one more word than the flags
-        self._box = mx.zeros((max(box_rows * top_k, experts + 1, 8),), dtype=mx.uint32)
-        self._tagged: tuple[int, mx.array] | None = None              # (signal, the box once tagged for it)
+        # calls alternate between two regions of the box; the host checks the next one is clear before releasing a
+        # call (a later call's routing written before this one was answered: calls out of order, the request fails)
+        self.box_words = max(box_rows * top_k, experts, 8)
+        self.boxes = mx.zeros((2 * self.box_words,), dtype=mx.uint32)
         self.layer_ids = [mx.array([i] + [0] * 7, dtype=mx.int32) for i in range(layers)]
-        mx.eval(*arrays, self.slot_of, self._box, *self.layer_ids)
+        mx.eval(*arrays, self.slot_of, self.boxes, *self.layer_ids)
         self.fds = {path: _uncached(path) for path in {s.path for s in found.values()}}
         self.channel = hostsync.Channel()
         self.value = 0
@@ -186,6 +187,7 @@ class Streamer:
             self._readers.shutdown(wait=False)
             try:
                 self._server = self._native(slots, workers, pack)
+                self._server.set_regions(self.box_words)
             except BaseException:
                 for fd in self.fds.values():
                     os.close(fd)
@@ -250,7 +252,7 @@ class Streamer:
                 for e in range(self.experts):
                     src, offset = self.source(self.found, layer, proj, part, e)
                     fds[layer, e, p], offsets[layer, e, p], sizes[p] = self.fds[src.path], offset, src.nbytes
-        server = self.hs.PoolServer(self.channel, self._box, self.slot_of,
+        server = self.hs.PoolServer(self.channel, self.boxes, self.slot_of,
                                     [getattr(self.pool[proj], part) for proj, part in order], sizes,
                                     fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
                                     workers, TIMEOUT_MS)
@@ -321,25 +323,23 @@ class Streamer:
 
     @property
     def box(self) -> mx.array:
-        """The routing box a call's kernel writes: after a call, the box tagged for the next one (a GPU write of
-        word E ordered before every kernel that reads it), so the host can tell its flags from a later call's."""
+        """The routing box region the next call's kernel writes (calls alternate between two)."""
 
-        return self._tagged[1] if self._tagged is not None else self._box
+        at = self.region_word(self.value + 1)
+        return self.boxes[at:at + self.box_words]
 
-    def next_signal(self) -> int:
-        """The signal the next ``marks`` call takes."""
+    def region_word(self, signal: int) -> int:
+        """Where in the box the call of ``signal`` finds its routing (a word offset)."""
 
-        return self.value + 1
+        return (signal - 1) // 2 % 2 * self.box_words
 
-    def marks(self, kind: str, layer: int, rows: int, guess: int = 0, expect: int | None = None) -> tuple[int, int]:
+    def marks(self, kind: str, layer: int, rows: int, guess: int = 0) -> tuple[int, int]:
         """(signal, ready) for one MoE call: "rows" reads rows x top_k ids from the box, "window" E presence flags
         (or counts); ``guess`` > 0: rows x guess ids for layer + 1 wait in the guess box."""
 
         if self.error is not None:
             raise RuntimeError("expert streaming stopped") from self.error
         signal, ready = self.value + 1, self.value + 2
-        if expect is not None and signal != expect:
-            raise RuntimeError(f"pool call signal {signal} is not the tagged {expect}: calls were built out of order")
         self.value = ready
         if self._server is not None:
             self._server.submit(_KINDS[kind], layer, rows, signal, ready)
@@ -347,18 +347,11 @@ class Streamer:
         self._jobs.put((kind, layer, rows, signal, ready, guess))
         return signal, ready
 
-    def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0,
-             expect: int | None = None) -> mx.array:
+    def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0) -> mx.array:
         """``token`` once the GPU has signalled this call to the host and the host has answered it (graph marks)."""
 
-        if kind == "window" and self._tagged is not None and self._tagged[0] == self.value + 1:
-            kind = "window_tagged"                   # its routing was written into the box tagged for this signal
-        signal, ready = self.marks(kind, layer, rows, guess, expect)
-        out = self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
-        tag = getattr(self.hs, "box_tag", None)
-        if tag is not None:
-            self._tagged = (self.value + 1, tag(self._box, self.experts, (self.value + 1) & 0xFF))
-        return out
+        signal, ready = self.marks(kind, layer, rows, guess)
+        return self.hs.gpu_wait(self.hs.gpu_signal(token, self.channel, signal), self.channel, ready)
 
     def window_views(self) -> dict[str, Slots]:
         """Each projection's window slots [0, E) as stacks of the model's shape: expert e of the loaded layer."""
@@ -402,7 +395,10 @@ class Streamer:
                 if self._log_path:
                     seen, bytes0 = _now_ns(), self.bytes_read
                 if kind == "rows":
-                    ids = np.frombuffer(self.hs.peek(self._box, 0, 4 * rows * self.top_k), dtype=np.uint32)
+                    if rows * self.top_k > self.box_words:
+                        raise IndexError("peek: the array is not evaluated or the range passes its end")
+                    at = 4 * self.region_word(signal)
+                    ids = np.frombuffer(self.hs.peek(self.boxes, at, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
                     self._check(layer, routed)
                     routed_reads = self._resolve(layer, routed)
@@ -420,19 +416,13 @@ class Streamer:
                 else:
                     self._check(layer, [])
                     self._resolve(layer, [])
-                    if kind == "window_tagged":     # the tag before and after the flags: no later call wrote the box
-                        want = (signal & 0xFF) * 0x01010101
-                        before = int(np.frombuffer(self.hs.peek(self._box, 4 * self.experts, 4), dtype=np.uint32)[0])
-                    flags = np.frombuffer(self.hs.peek(self._box, 0, 4 * self.experts), dtype=np.uint32)
-                    if kind == "window_tagged":
-                        after_tag = int(np.frombuffer(self.hs.peek(self._box, 4 * self.experts, 4), dtype=np.uint32)[0])
-                        if before != want or after_tag != want:
-                            raise RuntimeError(f"window call for layer {layer} found another call's routing in the box "
-                                               f"(tag {before}/{after_tag}, expected {want})")
+                    at = 4 * self.region_word(signal)
+                    flags = np.frombuffer(self.hs.peek(self.boxes, at, 4 * self.experts), dtype=np.uint32)
                     if self.prompt_counts is not None:
                         self.prompt_counts[layer] += flags
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
+                self._check_order(signal, layer)
             except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
                 self.error = error
             if seen:
@@ -446,6 +436,15 @@ class Streamer:
                     step(*args)
                 except BaseException as error:  # noqa: BLE001  # recorded; the next call raises it
                     self.error = error
+
+    def _check_order(self, signal: int, layer: int) -> None:
+        """This call's region cleared; the next call's must still be clear (the native server checks the same)."""
+
+        size = 4 * self.box_words
+        self.hs.write_into(self.boxes, 4 * self.region_word(signal), bytes(size))
+        if any(self.hs.peek(self.boxes, 4 * self.region_word(signal + 2), size)):
+            raise RuntimeError(f"the expert pool's call after layer {layer}'s wrote its routing before that call was "
+                               "answered: calls ran out of order")
 
     def _check(self, layer: int, routed: list[int]) -> None:
         """A call's layer and (sorted) routed ids inside the model, before anything changes (the native check too)."""

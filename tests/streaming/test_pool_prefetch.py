@@ -35,7 +35,7 @@ def call(s, fake, kind, layer, ids, guesses=()):
         words = [0] * EXPERTS
         for e in ids:
             words[e] += 1
-    fake.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+    fake.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack(f"<{len(words)}I", *words))
     rows = len(ids) // TOPK if kind == "rows" else 1
     k = len(guesses) // rows if guesses else 0
     if guesses:

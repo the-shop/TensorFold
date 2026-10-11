@@ -17,7 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-from tensorfold.engine import layer_major  # noqa: E402
+from tensorfold.engine import layer_major as groups  # noqa: E402
 from tensorfold.engine.lane_engine import LaneEngine, LaneStream  # noqa: E402
 from tensorfold.engine.prefill_plan import PrefillPlan  # noqa: E402
 from tensorfold.families.qwen4_exp import model as q4  # noqa: E402
@@ -248,7 +248,7 @@ def test_groups_split_at_the_cap_and_where_memory_has_no_room(monkeypatch):
     rt = runtime(tiny(), monkeypatch, drafts=False)
     ids = prompt(8200)
     rows = [b - a for a, b in PLAN.chunks(ids).between(0, len(ids))]
-    per = layer_major.frontier_bytes_per_token(rt)
+    per = groups.frontier_bytes_per_token(rt)
     assert per == 2 * (4 * 512 + 512 + 4)
     asked: list[int] = []
 
@@ -338,7 +338,7 @@ def test_off_by_default_and_never_without_the_fast_prefill(monkeypatch):
     monkeypatch.setenv("TF_PREFILL_LAYER_MAJOR", "1")
     assert e._groups_chunks() is True
     monkeypatch.setenv("TF_FLASH_PREFILL", "0")
-    assert layer_major.supports(rt) is False and e._groups_chunks() is False
+    assert groups.supports(rt) is False and e._groups_chunks() is False
 
 
 def test_the_n_gram_read_ahead_asks_for_every_chunk_once_in_order(monkeypatch):
@@ -452,8 +452,8 @@ class _Lazy:
 @pytest.mark.parametrize("native", ["1", "0"])
 def test_the_order_chain_keeps_the_bits_when_mlx_evaluates_out_of_order(tmp_path, monkeypatch, native, hostsync):
     """Every call of a group evaluated at once, outputs and caches last chunk first: MLX may then encode the window
-    calls out of program order. The chain keeps them in order (equal bits); without it the routing box's tags catch
-    a call that read another's routing, and the request fails instead of reading the wrong experts."""
+    calls out of program order. The chain keeps them in order (equal bits); without it the pool sees a call's routing
+    written before the previous call was answered, and the request fails instead of reading the wrong experts."""
 
     monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", native)
     ids = prompt(192)
@@ -470,9 +470,9 @@ def test_the_order_chain_keeps_the_bits_when_mlx_evaluates_out_of_order(tmp_path
                 outs.append((rt.last_streams, out))
                 mx.eval(*outs[-1], *[a for c in cache for a in c.state])
         else:
-            monkeypatch.setattr(layer_major, "mx", _Lazy(chain))
-            outs = layer_major.prefill_group(rt, chunks, cache)
-            monkeypatch.setattr(layer_major, "mx", mx)
+            monkeypatch.setattr(groups, "mx", _Lazy(chain))
+            outs = groups.prefill_group(rt, chunks, cache)
+            monkeypatch.setattr(groups, "mx", mx)
             mx.eval(*[x for pair in reversed(outs) for x in pair], *[a for c in reversed(cache) for a in c.state])
         error = pool.error
         pool.close()
@@ -490,7 +490,7 @@ def test_the_order_chain_keeps_the_bits_when_mlx_evaluates_out_of_order(tmp_path
     wrong: list[str] = []
     same_cache(ref_cache, cache, "cache", wrong)
     assert error is not None, f"an unchained group went unnoticed ({len(wrong)} cache fields differ)"
-    assert "another call's routing" in str(error)
+    assert "ran out of order" in str(error)
 
 
 def test_layer_major_prefill_copies_marks_of_the_same_shape(monkeypatch):
@@ -505,3 +505,35 @@ def test_layer_major_prefill_copies_marks_of_the_same_shape(monkeypatch):
     shapes = [[tuple(c.keys.shape) for c in cache if isinstance(c, q4.AttentionCache) and c.keys is not None]
               for _, cache in (s1.history_checkpoints[0], s2.history_checkpoints[0])]
     assert shapes[0] == shapes[1] and shapes[0]
+
+
+@pytest.mark.parametrize("layer_major", [True, False])
+def test_streamed_prefills_on_two_threads_share_the_pool(tmp_path, monkeypatch, hostsync, layer_major):
+    """The server sizes memory on one thread and serves on another: the routing box tagged after a call here must
+    still serve a call built on the scheduler's thread (an MLX array's stream belongs to its thread)."""
+
+    import threading
+
+    model, pool = streamed(tmp_path)
+    rt = runtime(model, monkeypatch, drafts=False)
+    ids = prompt(4200)
+    here = prefill(engine(rt, layer_major), ids)
+    there: dict = {}
+
+    def run():
+        try:
+            out = prefill(engine(rt, layer_major), ids)
+            stream, work = out
+            caches = [work] + [cache for _, cache in stream.history_checkpoints]
+            mx.eval(*[v for cache in caches for c in cache for v in vars(c).values() if isinstance(v, mx.array)])
+            there["out"] = out                  # evaluated here: the main thread has no stream for this one's
+        except BaseException as error:  # noqa: BLE001  # reported below
+            there["error"] = error
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    error = pool.error
+    pool.close()
+    assert "error" not in there, there.get("error")
+    assert error is None and not compare(here, there["out"], "threads")

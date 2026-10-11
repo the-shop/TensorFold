@@ -110,7 +110,7 @@ def call(hs, s, kind, layer, ids, ok=True):
             words[e] = 1
     else:
         words = list(ids)
-    hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack(f"<{len(words)}I", *words))
     signal, ready = s.marks(kind, layer, len(ids) // TOPK if kind == "rows" else 1)
     s.channel.signal(signal)
     assert s.channel.wait(ready, 10_000)
@@ -316,11 +316,11 @@ def test_the_server_refuses_arrays_of_the_wrong_kind(hs, tmp_path):
     table = (np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int32).tobytes(),
              np.zeros(LAYERS * EXPERTS * len(order), dtype=np.int64).tobytes())
     args = {"layers": LAYERS, "experts": EXPERTS, "top_k": TOPK, "slots": 2 * EXPERTS, "workers": 1, "timeout_ms": 100}
-    bad_box = mx.zeros(s.box.shape, dtype=mx.int32)
+    bad_box = mx.zeros(s.boxes.shape, dtype=mx.int32)
     bad_table = mx.zeros(s.slot_of.shape, dtype=mx.uint32)
     mx.eval(bad_box, bad_table)
-    for box, slot_of, part_sizes in ((bad_box, s.slot_of, sizes), (s.box, bad_table, sizes),
-                                     (s.box, s.slot_of, [n + 2 for n in sizes])):
+    for box, slot_of, part_sizes in ((bad_box, s.slot_of, sizes), (s.boxes, bad_table, sizes),
+                                     (s.boxes, s.slot_of, [n + 2 for n in sizes])):
         with pytest.raises(ValueError):
             hs.PoolServer(s.channel, box, slot_of, dsts, part_sizes, *table, **args)
     s.close()
@@ -343,7 +343,7 @@ def test_close_releases_queued_calls_the_gpu_never_signalled(hs, tmp_path):
 def test_close_still_loads_a_call_whose_signal_arrived(hs, tmp_path):
     truth = write_checkpoint(tmp_path, seed=8)
     s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
-    hs.write_into(s.box, 0, struct.pack("<4I", 2, 5, 5, 2))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 1), struct.pack("<4I", 2, 5, 5, 2))
     signal, _ = s.marks("rows", 1, 2)
     _, last = s.marks("rows", 2, 1)                                      # queued behind it, never signalled
     s.channel.signal(signal)
@@ -594,40 +594,21 @@ def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, p
 
 
 @pytest.mark.parametrize("native", [True, False])
-def test_a_tagged_window_call_checks_its_tag_in_the_box(hs, tmp_path, native):
-    """window_tagged: box word E must hold the call's tag (its signal's low byte in all four bytes); another call's
-    tag fails the call."""
+@pytest.mark.parametrize("kind", ["rows", "window"])
+def test_a_call_whose_successor_wrote_its_routing_first_fails(hs, tmp_path, native, kind):
+    """Calls alternate between two box regions; the host clears a call's region once read and, before releasing it,
+    finds the next call's region clear. Routing the next call wrote early (the GPU ran calls out of order) fails the
+    call instead of leaving the next one to read a box someone else may rewrite."""
 
     write_checkpoint(tmp_path)
     s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
-
-    def tagged(layer, ids, tag=None):
-        words = [0] * EXPERTS
-        for e in ids:
-            words[e] = 1
-        want = s.next_signal()
-        words.append((want & 0xFF) * 0x01010101 if tag is None else tag)      # BoxTag's byte in all four
-        hs.write_into(s.box, 0, struct.pack(f"<{len(words)}I", *words))
-        signal, ready = s.marks("window_tagged", layer, 1, expect=want)
-        assert signal == want
-        s.channel.signal(signal)
-        assert s.channel.wait(ready, 10_000)
-
-    tagged(1, [4, 5])
-    assert s.error is None and s.window_layers()[4] == 1 and s.window_layers()[5] == 1
-    tagged(2, [4], tag=12345)
-    assert s.window_layers()[4] == 1                       # nothing loaded from the wrong call's flags
-    assert isinstance(s.error, RuntimeError) and "another call's routing" in str(s.error)
+    call(hs, s, kind, 1, [1, 2, 3, 3])                 # in order: fine, and its region is clear again
+    assert not any(hs.peek(s.boxes, 4 * s.region_word(s.value - 1), 4 * s.box_words))
+    hs.write_into(s.boxes, 4 * s.region_word(s.value + 3), struct.pack("<I", 7))     # the call after next, early
+    call(hs, s, kind, 2, [4, 5, 6, 6], ok=False)
+    assert "ran out of order" in str(s.error)
     with pytest.raises(RuntimeError, match="expert streaming stopped"):
-        s.marks("window_tagged", 0, 1)
-    s.close()
-
-
-def test_a_call_built_out_of_order_is_refused(hs, tmp_path):
-    write_checkpoint(tmp_path)
-    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=True)
-    with pytest.raises(RuntimeError, match="out of order"):
-        s.marks("window_tagged", 0, 1, expect=s.next_signal() + 2)
+        s.marks("rows", 0, 1)
     s.close()
 
 

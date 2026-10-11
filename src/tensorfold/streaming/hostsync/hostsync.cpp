@@ -79,42 +79,6 @@ class Mark : public mx::UnaryPrimitive {
   bool wait_;
 };
 
-// The routing box itself (sharing its buffer), once the GPU has filled its word ``word`` with byte ``tag`` (a blit
-// before every kernel that reads the result): a window call's tag, written before its routing kernel writes flags.
-class BoxTag : public mx::UnaryPrimitive {
- public:
-  BoxTag(mx::Stream s, size_t word, uint8_t tag) : mx::UnaryPrimitive(s), word_(word), tag_(tag) {}
-  void eval_cpu(const std::vector<mx::array>&, mx::array&) override {
-    throw std::runtime_error("hostsync box tags run on the GPU stream only");
-  }
-  void eval_gpu(const std::vector<mx::array>& inputs, mx::array& out) override {
-    out.copy_shared_buffer(inputs[0]);
-    auto& enc = mx::metal::get_command_encoder(stream());
-    enc.end_encoding();
-    auto* buffer = static_cast<MTL::Buffer*>(const_cast<void*>(out.buffer().ptr()));
-    auto* blit = enc.get_command_buffer()->blitCommandEncoder();
-    blit->fillBuffer(buffer, NS::Range(out.offset() + word_ * sizeof(uint32_t), sizeof(uint32_t)), tag_);
-    blit->endEncoding();
-  }
-  const char* name() const override { return "BoxTag"; }
-  bool is_equivalent(const mx::Primitive& other) const override {
-    auto* o = dynamic_cast<const BoxTag*>(&other);
-    return o && o->word_ == word_ && o->tag_ == tag_;
-  }
-
- private:
-  size_t word_;
-  uint8_t tag_;
-};
-
-mx::array box_tag(const mx::array& box, size_t word, uint8_t tag) {
-  if (box.dtype() != mx::uint32 || word >= static_cast<size_t>(box.size())) {
-    throw std::out_of_range("box_tag: the box must be uint32 with the word inside it");
-  }
-  auto s = mx::default_stream(mx::Device::gpu);
-  return mx::array(box.shape(), box.dtype(), std::make_shared<BoxTag>(s, word, tag), {box});
-}
-
 mx::array mark(const mx::array& x, std::shared_ptr<Channel> channel, uint64_t value, bool wait) {
   auto s = mx::default_stream(mx::Device::gpu);
   return mx::array(x.shape(), x.dtype(), std::make_shared<Mark>(s, std::move(channel), value, wait), {x});
@@ -328,8 +292,7 @@ class PoolServer {
     }
   }
 
-  // One MoE call: kind 0 = decode rows (rows x top_k ids in the box), 1 = window (E presence flags), 2 = window
-  // whose box carries its call's tag (word E = the signal's low byte in all four bytes, written before the flags).
+  // One MoE call: kind 0 = decode rows (rows x top_k ids in the box), 1 = window (E presence flags).
   void submit(int kind, int layer, int rows, uint64_t signal, uint64_t ready) {
     {
       std::lock_guard<std::mutex> lk(jobs_mu_);
@@ -363,6 +326,18 @@ class PoolServer {
   std::vector<int> window() {
     std::lock_guard<std::mutex> lk(state_mu_);
     return window_;
+  }
+
+  // Calls alternate between two regions of ``words`` words of the box (0: the whole box, as before). The host clears
+  // a call's region once read, and before releasing a call checks the next call's region is still clear: a later
+  // call's routing written before this call was answered means the GPU ran calls out of order (a failed request,
+  // never wrong experts loaded silently).
+  void set_regions(size_t words) {
+    if (words * 2 * sizeof(uint32_t) > box_.nbytes() || (words && words < static_cast<size_t>(experts_))) {
+      throw std::invalid_argument("set_regions: two regions must fit the box and hold a window's flags");
+    }
+    std::lock_guard<std::mutex> lk(state_mu_);
+    regions_ = words;
   }
 
   // Per-call timing (diagnostics): (kind, layer, rows, signal seen ns, ready ns, bytes read, preads), uptime clock.
@@ -430,36 +405,24 @@ class PoolServer {
           preads0 = preads_.load();
         }
         std::lock_guard<std::mutex> lk(state_mu_);
+        const uint32_t* box = region(job);
         if (job.kind == 0) {
           size_t n = static_cast<size_t>(job.rows) * top_k_;
-          if (job.rows < 0 || n * sizeof(uint32_t) > box_.nbytes()) {
+          if (job.rows < 0 || n > region_words()) {
             throw PoolError("IndexError", "peek: the array is not evaluated or the range passes its end");
           }
-          const uint32_t* ids = box_.data<uint32_t>();
-          std::vector<int64_t> routed(ids, ids + n);
+          std::vector<int64_t> routed(box, box + n);
           std::sort(routed.begin(), routed.end());
           routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
           load(job.layer, routed);
         } else {
-          const volatile uint32_t* flags = box_.data<uint32_t>();
-          const bool tagged = job.kind == 2;
-          const uint32_t want = (job.signal & 0xFFu) * 0x01010101u;   // BoxTag's byte in all four
-          if (tagged && box_.nbytes() < static_cast<size_t>(experts_ + 1) * sizeof(uint32_t)) {
-            throw PoolError("IndexError", "peek: the array is not evaluated or the range passes its end");
-          }
-          uint32_t before = tagged ? flags[experts_] : want;
           std::vector<int64_t> present;
           for (int e = 0; e < experts_; ++e) {
-            if (flags[e] != 0) present.push_back(e);
-          }
-          uint32_t after = tagged ? flags[experts_] : want;
-          if (before != want || after != want) {   // another call's routing is in the box: prompt calls out of order
-            throw PoolError("RuntimeError", "window call for layer " + std::to_string(job.layer) +
-                                                " found another call's routing in the box (tag " + std::to_string(before) +
-                                                "/" + std::to_string(after) + ", expected " + std::to_string(want) + ")");
+            if (box[e] != 0) present.push_back(e);
           }
           fill_window(job.layer, present);
         }
+        check_order(job);
       } catch (const PoolError& e) {
         record(e.kind, e.what());
       } catch (const std::bad_alloc& e) {
@@ -490,6 +453,26 @@ class PoolServer {
       if (channel_->event->waitUntilSignaledValue(job.signal, slice)) return true;
       if (clock::now() >= deadline) {
         throw PoolError("TimeoutError", "no routing from the GPU for layer " + std::to_string(job.layer));
+      }
+    }
+  }
+
+  size_t region_words() const { return regions_ ? regions_ : box_.nbytes() / sizeof(uint32_t); }
+
+  uint32_t* region(const Job& job) {
+    size_t at = regions_ ? ((job.signal - 1) / 2 % 2) * regions_ : 0;
+    return box_.data<uint32_t>() + at;
+  }
+
+  void check_order(const Job& job) {
+    if (!regions_) return;
+    uint32_t* mine = region(job);
+    const uint32_t* next = box_.data<uint32_t>() + (((job.signal - 1) / 2 + 1) % 2) * regions_;
+    std::memset(mine, 0, regions_ * sizeof(uint32_t));
+    for (size_t i = 0; i < regions_; ++i) {
+      if (next[i] != 0) {
+        throw PoolError("RuntimeError", "the expert pool's call after layer " + std::to_string(job.layer) +
+                                            "'s wrote its routing before that call was answered: calls ran out of order");
       }
     }
   }
@@ -634,6 +617,7 @@ class PoolServer {
   std::vector<int> free_, window_;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, bytes_read_{0}, preads_{0};
+  size_t regions_ = 0;                     // words a region (two alternate), 0: one region, the whole box
   std::atomic<bool> log_on_{false};
   std::mutex log_mu_;
   std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> log_;
@@ -661,7 +645,6 @@ NB_MODULE(_hostsync, m) {
       .def("wait", &Channel::wait, nb::arg("value"), nb::arg("timeout_ms"));
   m.def("gpu_signal", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, false); });
   m.def("gpu_wait", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, true); });
-  m.def("box_tag", &box_tag, nb::arg("box"), nb::arg("word"), nb::arg("tag"));
   m.def("pread_into", &pread_into);
   m.def("write_into", &write_into);
   m.def("peek", &peek);
@@ -680,6 +663,7 @@ NB_MODULE(_hostsync, m) {
       .def("lru_items", &PoolServer::lru_items)
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
+      .def("set_regions", &PoolServer::set_regions, nb::arg("words"))
       .def("set_log", &PoolServer::set_log, nb::arg("on"))
       .def("take_log", &PoolServer::take_log)
       .def("packed", &PoolServer::packed)
