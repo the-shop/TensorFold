@@ -179,13 +179,14 @@ class Scheduler(PromptFill):
         import faulthandler
         import sys
 
-        mark: tuple[int, int, int, int, bool] | None = None
+        mark: tuple[int, int, int, int, int, bool] | None = None
         since = time.perf_counter()
         dumped = False
         while not self._stop.wait(1.0):
             waiting = self._queue.qsize() + (self._held is not None) + len(self._jobs) + (self._starting is not None)
             starting = self._starting is not None
-            now_mark = (self.rounds, self.starts, self.completed, getattr(self.engine, "prefill_chunks", 0), starting)
+            now_mark = (self.rounds, self.starts, self.completed, getattr(self.engine, "prefill_chunks", 0),
+                        getattr(self.engine, "prefill_steps", 0), starting)
             now = time.perf_counter()
             if now_mark != mark or not waiting:
                 mark, since, dumped = now_mark, now, False

@@ -62,6 +62,23 @@ class PrefillGuard:
             self.memory.after_chunk(cache, tokens)
         self.cancellation.check()
 
-    def allow_checkpoint(self, cache: Any) -> bool:
+    def frontier_fits(self, cache: Any, nbytes: int) -> bool:
+        """Room for a layer-major group's carried activations (``nbytes``) without evicting anything."""
+
+        fits = getattr(self.memory, "frontier_fits", None)
+        return fits is None or fits(cache, nbytes)
+
+    def carry_frontier(self, nbytes: int) -> None:
+        """Count ``nbytes`` of group activations in every admission check until it is set back to 0."""
+
+        if self.memory is not None:
+            self.memory.frontier = int(nbytes)
+
+    def allow_checkpoint(self, cache: Any, current: Any = None) -> bool:
+        """``current``: what the copy's room is measured beside, when not the cache being copied (a checkpoint a
+        layer-major group assembled: the working cache and the copy)."""
+
         self.cancellation.check()
-        return self.memory is None or self.memory.allow_checkpoint(cache)
+        if self.memory is None:
+            return True
+        return self.memory.allow_checkpoint(cache) if current is None else self.memory.allow_checkpoint(cache, current)
