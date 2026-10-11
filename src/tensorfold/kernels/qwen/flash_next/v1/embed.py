@@ -145,7 +145,13 @@ def ple_lookup(ids: Any, tables: PleTables) -> mx.array:
     ids = np.asarray(ids).reshape(-1, np.asarray(ids).shape[-1])
     rows, heads = ids.shape
     if tables.host is not None:
+        from tensorfold.streaming import profile
+
+        prof = profile.ACTIVE
+        started = profile.now() if prof is not None else 0
         words, scales, biases = tables.host.gather(ids)
+        if prof is not None:
+            prof.ple(started)
         run = _row_kernel("ple_rows", _PLE_ROWS, tables.bits, tables.group, ["W", "SC", "BI"])
         return run(inputs=[mx.array(words), mx.array(scales).view(mx.bfloat16), mx.array(biases).view(mx.bfloat16)],
                    template=[("DIMS", tables.dims)], grid=(tables.dims, rows * heads, 1),

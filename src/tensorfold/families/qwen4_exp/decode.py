@@ -12,6 +12,7 @@ import numpy as np
 from tensorfold.families.qwen3_5 import tensor_units
 from tensorfold.kernels.qwen.dense.v1 import lane_qmm, simd_qmm
 from tensorfold.kernels.qwen.flash_next.v1 import attention, base, embed, experts, gdn, hc, rows
+from tensorfold.streaming import profile as _profile
 
 
 def _stacked(linears: list[Any]) -> tuple[nn.QuantizedLinear, list[int]]:
@@ -319,6 +320,9 @@ class FusedDecode:
 
         model = self.model
         self._last_heads = [cache[0]] if cache else []
+        prof = _profile.ACTIVE
+        if prof is not None:
+            return self._run_profiled(prof, h, tokens, cache)
         pending: tuple[str, tuple[mx.array, ...], mx.array | None] = ("none", (), None)
         for i, layer in enumerate(model.layers):
             c = cache[i]
@@ -345,6 +349,62 @@ class FusedDecode:
         hn, ssp = hc.hc_norm(h, streams=self.streams, write_back=kind, branch=branch, inject=inject)
         self.last_streams = hn                                    # [R, S*D] before the final mixer (the MTP reads it)
         return hc_project(hn, ssp, mix.down, mix.up, mix.scale, eps=self.eps, streams=self.streams, low=mix.low)[0][None]
+
+    def _run_profiled(self, prof: Any, h: mx.array, tokens: np.ndarray | None, cache: list[Any]) -> mx.array:
+        """``run`` with the decode profiler's stamps: Mode A stamps each layer's queue time (no op, no eval added);
+        Mode B (prof.sync) also evaluates each layer's parts in turn and stamps after each (the same ops)."""
+
+        model = self.model
+        sync = prof.sync
+        run = prof.begin_run(len(model.layers), int(h.shape[0]))
+        stamp = _profile.now
+        pending: tuple[str, tuple[mx.array, ...], mx.array | None] = ("none", (), None)
+        for i, layer in enumerate(model.layers):
+            c = cache[i]
+            if sync:
+                t0 = stamp()
+            if "ple" in layer:
+                h = self._write_back(h, pending)
+                pending = ("none", (), None)
+                h = h + self._ple(layer.ple, h, tokens.reshape(1, -1), c)
+            entry = self.layers[i]
+            ahc = entry["attn_hc"]
+            kind, branch, inject = pending
+            hn, ssp = hc.hc_norm(h, streams=self.streams, write_back=kind, branch=branch, inject=inject)
+            mixed, inj = hc_project(hn, ssp, ahc.down, ahc.up, ahc.scale, eps=self.eps, streams=self.streams, low=ahc.low)
+            if sync:
+                mx.eval(hn, mixed, inj)
+                t1 = stamp()
+            out = self._gdn(i, mixed, c) if layer.is_linear else self._attention(i, mixed, c)
+            if sync:
+                mx.eval(out)
+                t2 = stamp()
+            mhc = entry["mlp_hc"]
+            hm, ssp = hc.hc_norm(hn, streams=self.streams, write_back="plain", branch=(out,), inject=inj)
+            mixed, inj2 = hc_project(hm, ssp, mhc.down, mhc.up, mhc.scale, eps=self.eps, streams=self.streams, low=mhc.low)
+            if sync:
+                mx.eval(hm, mixed, inj2)
+                t3 = stamp()
+            h = hm
+            kind, branch = self._moe(i, mixed)
+            pending = (kind, branch, inj2)
+            if sync:
+                mx.eval(*pending[1])
+                run["b"].append((t0, t1, t2, t3, stamp()))
+            if self.eval_every and (i + 1) % self.eval_every == 0:
+                mx.async_eval(h, *pending[1])
+            run["q"].append(stamp())
+        kind, branch, inject = pending
+        mix = self.mixer
+        hn, ssp = hc.hc_norm(h, streams=self.streams, write_back=kind, branch=branch, inject=inject)
+        self.last_streams = hn                                    # [R, S*D] before the final mixer (the MTP reads it)
+        out = hc_project(hn, ssp, mix.down, mix.up, mix.scale, eps=self.eps, streams=self.streams, low=mix.low)[0][None]
+        if sync:
+            t0 = stamp()
+            mx.eval(out, hn)
+            run["mixer_ns"] = stamp() - t0
+        prof.end_run(run)
+        return out
 
     def _ple(self, ple: Any, h: mx.array, tokens: np.ndarray, cache: Any) -> mx.array:
         """model.PLELayer on rows h [R, S*D], its projections through ``project`` (row-invariant)."""

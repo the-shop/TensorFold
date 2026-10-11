@@ -9,6 +9,7 @@ from tensorfold.engine.family_common import _PROFILE, _ROUND_LOG, drop_spares
 from tensorfold.engine.family_depth import DraftDepth, extend_costs
 from tensorfold.engine.family_prefill import FamilyPrefill
 from tensorfold.engine.family_shared import SharedRounds
+from tensorfold.streaming import profile as _dprof
 
 
 class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
@@ -94,11 +95,16 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
                 landed[stream_id] = landed.get(stream_id, []) + got
         else:
             for stream, cache in live:
+                prof = _dprof.ACTIVE
+                prec = prof.begin_round(position=stream.cache_len, round=stream.rounds) if prof is not None else None
                 started = time.perf_counter()
+                self._last_phases = (0.0, 0.0)
                 if (self.family_mtp and stream.drafts) or not self.pipelined:
                     got, rows, keep = self._family_round(stream, cache)
                 else:
                     got, rows, keep = self._pipelined_round(stream, cache)
+                if prec is not None:
+                    prof.end_round(prec, rows=rows, keep=keep, committed=len(got))
                 landed[stream.stream_id] = landed.get(stream.stream_id, []) + got
                 stream.min_rows = rows if not stream.min_rows else min(stream.min_rows, rows)
                 ms = (time.perf_counter() - started) * 1e3
@@ -107,7 +113,7 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
                 self.round_stats.append(RoundStats(
                     streams=1, width=rows, rows=rows, ragged=False, rollbacks=int(0 < keep < rows),
                     committed=len(got), forward_ms=ms, finalize_ms=0.0, rollback_ms=0.0, total_ms=ms,
-                    started_at=started))
+                    draft_ms=self._last_phases[0], post_ms=self._last_phases[1], started_at=started))
         for stream, cache in self._live:
             if stream.finished:
                 stream.finished_at = time.perf_counter()
@@ -327,34 +333,56 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
             plan = [stream, cache, position, kind, drafts, forced, parents]
             self._allocate([plan])
             kind, drafts, parents = plan[3], plan[4], plan[6]
+        prof = _dprof.ACTIVE
+        if prof is not None:
+            prof.mark("t_plan")
+            if prof.cur is not None:
+                prof.cur["kind"] = kind
         inputs = self._window_tokens(stream, drafts)
         rows = int(inputs.shape[0])
         rows_parents = self._row_parents(rows, parents)
         depths = tree_paths(rows_parents)[0]
         tree = {} if parents is None else {"parents": rows_parents}
         hidden = model.hidden(inputs.reshape(1, rows), cache, **tree)
+        if prof is not None:
+            prof.mark("t_hidden")
         logits = model.head(hidden)
         logits = logits.reshape(logits.shape[1:])            # [R, V] as a view (MLX's [0] is a gather)
         tokens = self._draw(logits, stream.sampling, [position + 1 + d for d in depths])
+        if prof is not None and prof.sync:
+            mx.eval(tokens)
+            prof.mark("t_head")
         speculate = (self.family_mtp and stream.drafts and kind != "forced" and self.speculate_early
                      and parents is None)
         parts = [tokens]
         if speculate:
             # the head's first draft for every row, queued behind the verify before anything is read
             parts.append(model.speculate(cache, tokens, position, stream.sampling).astype(tokens.dtype))
+            if prof is not None and prof.sync:
+                mx.eval(parts[-1])
+                prof.mark("t_spec")
         if isinstance(drafts, mx.array):
             parts.append(drafts.astype(tokens.dtype))
         built = time.perf_counter()
+        if prof is not None:
+            prof.mark("t_built")
         values = [int(t) for t in (mx.concatenate(parts) if len(parts) > 1 else tokens).tolist()]
         read = time.perf_counter()
+        if prof is not None:
+            prof.mark("t_read")
         sampled = values[:rows]
         firsts = values[rows:2 * rows] if speculate else []
         proposed = values[-(rows - 1):] if isinstance(drafts, mx.array) and rows > 1 else [int(t) for t in drafts]
         window = [int(stream.pending[-1]), *proposed]          # the rows' tokens, the pending one first
         got, path, cut, follow = self._conclude(stream, kind, forced, sampled, window, rows_parents)
         keep = len(path)
+        if prof is not None:
+            prof.mark("t_concluded")
         if keep < rows or parents is not None:      # a tree commits in keep_rows, even one kept whole
             model.keep_rows(cache, rows, keep if self._is_prefix(path) else path)
+        settle_at = time.perf_counter()
+        if prof is not None:
+            prof.mark("t_kept")
         if self.family_mtp and stream.drafts:
             if speculate and cut is None:
                 self._next[stream.stream_id] = model.settle(cache, keep, firsts[path[-1]], stream.cache_len + 1,
@@ -367,9 +395,22 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
             if kind == "head":
                 self._observe_cost(len(proposed), (time.perf_counter() - started) * 1e3,
                                    initializing=stream.rounds == 1)
+        settled = time.perf_counter()
+        if prof is not None:
+            prof.mark("t_settled")
+            if prof.cur is not None:
+                queued = self._next.get(stream.stream_id) if self.family_mtp and stream.drafts else None
+                prof.cur["depth"] = (int(queued.shape[0]) if isinstance(queued, mx.array)
+                                     else len(queued) if isinstance(queued, list) else 0)
+            if prof.sync:
+                queued = self._next.get(stream.stream_id)
+                if isinstance(queued, mx.array):
+                    mx.eval(queued)
+                prof.mark("t_chain")
         if _PROFILE:
             self._profile(rows, built - started, read - built, time.perf_counter() - read)
         ms = (time.perf_counter() - started) * 1e3
+        self._last_phases = ((settled - settle_at) * 1e3, (time.perf_counter() - read) * 1e3)
         if kind == "head":
             self._observe_overhead(1, rows, ms)
         if _ROUND_LOG:

@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from tensorfold.server.cancellation import PrefillGuard, RequestCancelled
+from tensorfold.streaming import profile as _dprof
 from tensorfold.server.errors import RequestError
 
 
@@ -38,6 +39,8 @@ class PromptFill:
 
         filling = self._filling
         started = self.clock()
+        prof = _dprof.ACTIVE
+        chunk_at = _dprof.now() if prof is not None else 0
         self.engine.prefill_guard = PrefillGuard(filling.job.cancellation, self.prompt_memory)
         try:
             if abort is None:
@@ -50,6 +53,8 @@ class PromptFill:
             self._end_fill(filling.job, filling.shared_at, exc)
         finally:
             self.engine.prefill_guard = None
+            if prof is not None:
+                prof.chunk(chunk_at, _dprof.now(), job=filling.job.job_id)
         # a debt of the last round carries over, an unspent credit does not
         self._credit = min(self._credit, 0.0) + self.decode_share * (self.clock() - started)
         self._rounds_left = self.fill_rounds

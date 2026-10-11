@@ -17,6 +17,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from tensorfold.streaming import profile as _profile
 from tensorfold.streaming.checkpoint import headers
 
 PARTS = ("weight", "scales", "biases")
@@ -162,6 +163,8 @@ class Streamer:
         self._prompted = False                                          # window calls since the last seed
         self._seeders = ThreadPoolExecutor(2, thread_name_prefix="expert-seed") if self.prompt_seed else None
         self._jobs: queue.Queue = queue.Queue()
+        self._prof: list | None = None                                  # the Python serve loop's call records
+        self._prof_cur: dict | None = None
         if native is None:
             native = native_wanted()
         if native and not self.decode_prefetch and not self.prompt_seed and hasattr(hostsync, "PoolServer"):
@@ -173,9 +176,40 @@ class Streamer:
                     os.close(fd)
                 raise
             self._thread = None
+            if _profile.ACTIVE is not None:
+                _profile.ACTIVE.attach(self)
             return
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
+        if _profile.ACTIVE is not None:
+            _profile.ACTIVE.attach(self)
+
+    # -- decode profiler (streaming/profile.py) ---------------------------------------------------------------------
+    _PROF_KEYS = ("kind", "layer", "rows", "unique", "misses", "bytes", "signal", "t_submit", "t_sig", "t_read0",
+                  "t_read1", "t_ready")
+
+    def profile_on(self) -> None:
+        if self._server is not None:
+            self._server.profile(True)
+        else:
+            self._prof = []
+
+    def profile_off(self) -> None:
+        if self._server is not None:
+            self._server.profile(False)
+        else:
+            self._prof = None
+
+    def profile_drain(self) -> tuple[list[dict], int]:
+        """Each call since the last drain: kind (0 rows, 1 window), layer, rows, unique experts, misses (expert
+        reads), bytes read, the signal value and the host stamps (ns: submitted, signalled, reads start and end,
+        released)."""
+
+        if self._server is not None:
+            got, dropped = self._server.drain_profile()
+            return [dict(zip(self._PROF_KEYS, (int(v) for v in rec))) for rec in got], int(dropped)
+        got, self._prof = (self._prof or []), ([] if self._prof is not None else None)
+        return got, 0
 
     def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
         """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
@@ -271,7 +305,7 @@ class Streamer:
         if self._server is not None:
             self._server.submit(_KINDS[kind], layer, rows, signal, ready)
             return signal, ready
-        self._jobs.put((kind, layer, rows, signal, ready, guess))
+        self._jobs.put((kind, layer, rows, signal, ready, guess, _profile.now() if self._prof is not None else 0))
         return signal, ready
 
     def hold(self, token: mx.array, kind: str, layer: int, rows: int, guess: int = 0) -> mx.array:
@@ -313,14 +347,23 @@ class Streamer:
             job = self._jobs.get()
             if job is None:
                 return
-            kind, layer, rows, signal, ready, guess = job
+            kind, layer, rows, signal, ready, guess, submitted = job
             after: list = []
+            rec = None
+            if submitted and self._prof is not None:
+                rec = dict.fromkeys(self._PROF_KEYS, 0)
+                rec.update(kind=_KINDS[kind], layer=layer, rows=rows, signal=signal, t_submit=submitted)
+            self._prof_cur = rec
             try:
                 if not self.channel.wait(signal, TIMEOUT_MS):
                     raise TimeoutError(f"no routing from the GPU for layer {layer}")
+                if rec is not None:
+                    rec["t_sig"] = _profile.now()
                 if kind == "rows":
                     ids = np.frombuffer(self.hs.peek(self.box, 0, 4 * rows * self.top_k), dtype=np.uint32)
                     routed = sorted({int(e) for e in ids})
+                    if rec is not None:
+                        rec["unique"] = len(routed)
                     self._check(layer, routed)
                     routed_reads = self._resolve(layer, routed)
                     self._load(layer, routed)
@@ -338,12 +381,19 @@ class Streamer:
                     self._check(layer, [])
                     self._resolve(layer, [])
                     flags = np.frombuffer(self.hs.peek(self.box, 0, 4 * self.experts), dtype=np.uint32)
+                    if rec is not None:
+                        rec["unique"] = int(np.count_nonzero(flags))
                     if self.prompt_counts is not None:
                         self.prompt_counts[layer] += flags
                         self._prompted = True
                     self._fill_window(layer, np.flatnonzero(flags).tolist())
             except BaseException as error:  # noqa: BLE001  # the GPU still gets its release; the next call raises
                 self.error = error
+            if rec is not None:
+                rec["t_ready"] = _profile.now()
+                self._prof_cur = None
+                if self._prof is not None:
+                    self._prof.append(rec)
             self.channel.signal(ready)
             for step, *args in after:             # speculative reads start once the GPU runs on
                 if self.error is not None:
@@ -503,8 +553,16 @@ class Streamer:
         raise MemoryError("the expert pool is smaller than one call's experts")
 
     def _read_all(self, layer: int, need: list[tuple[int, int]]) -> None:
+        rec = self._prof_cur
+        if rec is not None:
+            rec["misses"] = len(need)
+            rec["bytes"] = len(need) * expert_nbytes(self.found, layer)
+            if need:
+                rec["t_read0"] = _profile.now()
         reads = [(proj, part, e, slot) for e, slot in need for proj in self.pool for part in PARTS]
         list(self._readers.map(lambda item: self._read(layer, *item), reads))
+        if rec is not None and need:
+            rec["t_read1"] = _profile.now()
 
     @staticmethod
     def source(found: dict, layer: int, proj: str, part: str, expert: int) -> tuple[Source, int]:

@@ -48,6 +48,22 @@ struct Channel {
   }
 };
 
+static int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Decode profiler (TENSORFOLD_DECODE_PROFILE): with it on, each mark's command buffer reports its GPU start and end
+// (host-time domain, the same clock as steady_clock here) through a passive completion handler. Off: one relaxed load.
+struct GpuTimes {
+  std::atomic<bool> on{false};
+  std::atomic<uint64_t> handlers{0};       // completion handlers ever added (tests: none while off)
+  std::mutex mu;
+  std::vector<std::tuple<uint64_t, int, uint64_t, int64_t, int64_t>> recs;   // value, wait, buffer, start, end ns
+  uint64_t dropped = 0;
+  static constexpr size_t kCap = 1 << 18;
+};
+static GpuTimes g_gpu;
+
 // Passes its input through; on the GPU it first ends the compute encoder, then waits for or signals the channel.
 class Mark : public mx::UnaryPrimitive {
  public:
@@ -64,6 +80,20 @@ class Mark : public mx::UnaryPrimitive {
       enc.get_command_buffer()->encodeWait(channel_->event.get(), value_);
     } else {
       enc.get_command_buffer()->encodeSignalEvent(channel_->event.get(), value_);
+    }
+    if (g_gpu.on.load(std::memory_order_relaxed)) {
+      g_gpu.handlers.fetch_add(1, std::memory_order_relaxed);
+      uint64_t value = value_;
+      int wait = wait_ ? 1 : 0;
+      enc.get_command_buffer()->addCompletedHandler([value, wait](MTL::CommandBuffer* cb) {
+        auto start = static_cast<int64_t>(cb->GPUStartTime() * 1e9), end = static_cast<int64_t>(cb->GPUEndTime() * 1e9);
+        std::lock_guard<std::mutex> lk(g_gpu.mu);
+        if (g_gpu.recs.size() >= GpuTimes::kCap) {
+          ++g_gpu.dropped;
+          return;
+        }
+        g_gpu.recs.emplace_back(value, wait, reinterpret_cast<uint64_t>(cb), start, end);
+      });
     }
   }
   const char* name() const override { return wait_ ? "HostWait" : "HostSignal"; }
@@ -296,9 +326,42 @@ class PoolServer {
     {
       std::lock_guard<std::mutex> lk(jobs_mu_);
       if (closed_) throw std::runtime_error("PoolServer: closed");
-      jobs_.push_back(Job{kind, layer, rows, signal, ready, false});
+      jobs_.push_back(Job{kind, layer, rows, signal, ready, false, prof_.load(std::memory_order_relaxed) ? now_ns() : 0});
     }
     jobs_cv_.notify_all();
+  }
+
+  // The decode profiler's per-call records: on allocates the buffer, off frees it; drain takes what was recorded.
+  void profile(bool on) {
+    std::lock_guard<std::mutex> lk(prof_mu_);
+    if (on) {
+      recs_.reserve(kProfCap);
+    } else {
+      std::vector<Rec>().swap(recs_);
+    }
+    prof_.store(on);
+  }
+
+  // (kind, layer, rows, unique, misses, bytes, signal, t_submit, t_sig, t_read0, t_read1, t_ready) per call, oldest
+  // first, and how many calls did not fit.
+  std::pair<std::vector<std::tuple<int, int, int, int, int, uint64_t, uint64_t, int64_t, int64_t, int64_t, int64_t,
+                                   int64_t>>, uint64_t> drain_profile() {
+    std::vector<Rec> got;
+    uint64_t dropped;
+    {
+      std::lock_guard<std::mutex> lk(prof_mu_);
+      got.swap(recs_);
+      if (prof_.load()) recs_.reserve(kProfCap);
+      dropped = prof_dropped_;
+      prof_dropped_ = 0;
+    }
+    std::vector<std::tuple<int, int, int, int, int, uint64_t, uint64_t, int64_t, int64_t, int64_t, int64_t, int64_t>> out;
+    out.reserve(got.size());
+    for (auto& r : got) {
+      out.emplace_back(r.kind, r.layer, r.rows, r.unique, r.misses, r.bytes, r.signal, r.t_submit, r.t_sig, r.t_read0,
+                       r.t_read1, r.t_ready);
+    }
+    return {out, dropped};
   }
 
   std::optional<std::pair<std::string, std::string>> error() {
@@ -340,7 +403,7 @@ class PoolServer {
       closed_ = true;
       close_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCloseGraceMs);
       closing_ = true;
-      jobs_.push_back(Job{0, 0, 0, 0, 0, true});
+      jobs_.push_back(Job{0, 0, 0, 0, 0, true, 0});
     }
     jobs_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
@@ -357,6 +420,12 @@ class PoolServer {
     int kind, layer, rows;
     uint64_t signal, ready;
     bool stop;
+    int64_t t_submit;
+  };
+  struct Rec {
+    int kind, layer, rows, unique, misses;
+    uint64_t bytes, signal;
+    int64_t t_submit, t_sig, t_read0, t_read1, t_ready;
   };
 
   void serve() {
@@ -369,12 +438,16 @@ class PoolServer {
         jobs_.pop_front();
       }
       if (job.stop) break;
+      bool prof = job.t_submit != 0 && prof_.load(std::memory_order_relaxed);
+      Rec rec{job.kind, job.layer, job.rows, 0, 0, 0, job.signal, job.t_submit, 0, 0, 0, 0};
+      cur_ = prof ? &rec : nullptr;
       try {
         if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing, fail it
           record("RuntimeError", "expert streaming closed before the GPU reached layer " + std::to_string(job.layer));
           channel_->signal(job.ready);
           continue;
         }
+        if (prof) rec.t_sig = now_ns();
         std::lock_guard<std::mutex> lk(state_mu_);
         if (job.kind == 0) {
           size_t n = static_cast<size_t>(job.rows) * top_k_;
@@ -385,6 +458,7 @@ class PoolServer {
           std::vector<int64_t> routed(ids, ids + n);
           std::sort(routed.begin(), routed.end());
           routed.erase(std::unique(routed.begin(), routed.end()), routed.end());
+          if (prof) rec.unique = static_cast<int>(routed.size());
           load(job.layer, routed);
         } else {
           const uint32_t* flags = box_.data<uint32_t>();
@@ -392,6 +466,7 @@ class PoolServer {
           for (int e = 0; e < experts_; ++e) {
             if (flags[e] != 0) present.push_back(e);
           }
+          if (prof) rec.unique = static_cast<int>(present.size());
           fill_window(job.layer, present);
         }
       } catch (const PoolError& e) {
@@ -400,6 +475,16 @@ class PoolServer {
         record("MemoryError", e.what());
       } catch (const std::exception& e) {
         record("RuntimeError", e.what());
+      }
+      if (prof) {
+        rec.t_ready = now_ns();
+        cur_ = nullptr;
+        std::lock_guard<std::mutex> lk(prof_mu_);
+        if (recs_.size() < kProfCap) {
+          recs_.push_back(rec);
+        } else {
+          ++prof_dropped_;
+        }
       }
       channel_->signal(job.ready);   // the GPU always gets its release; the next Python call raises
     }
@@ -504,7 +589,17 @@ class PoolServer {
   }
 
   void read_all(int layer, const std::vector<std::pair<int, int>>& need) {
+    if (cur_ != nullptr) {
+      cur_->misses = static_cast<int>(need.size());
+      cur_->bytes = need.size() * expert_nbytes_;
+    }
     if (need.empty()) return;
+    if (cur_ != nullptr) cur_->t_read0 = now_ns();
+    read_all_(layer, need);
+    if (cur_ != nullptr) cur_->t_read1 = now_ns();
+  }
+
+  void read_all_(int layer, const std::vector<std::pair<int, int>>& need) {
     size_t parts = dsts_.size();
     if (pack_fd_ >= 0) {
       readers_->run(need.size(), [&](size_t i, int worker) { read_packed(layer, need[i].first, need[i].second, worker); });
@@ -577,6 +672,13 @@ class PoolServer {
   std::atomic<bool> closing_{false};
   std::chrono::steady_clock::time_point close_deadline_{};
   std::thread thread_;
+
+  static constexpr size_t kProfCap = 1 << 16;
+  std::atomic<bool> prof_{false};
+  std::mutex prof_mu_;
+  std::vector<Rec> recs_;
+  uint64_t prof_dropped_ = 0;
+  Rec* cur_ = nullptr;                      // the serve thread's record of the call it is answering (profiling)
 };
 
 NB_MODULE(_hostsync, m) {
@@ -588,6 +690,29 @@ NB_MODULE(_hostsync, m) {
   m.def("gpu_signal", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, false); });
   m.def("gpu_wait", [](const mx::array& x, std::shared_ptr<Channel> c, uint64_t v) { return mark(x, c, v, true); });
   m.def("pread_into", &pread_into);
+  m.def("clock_ns", &now_ns);
+  m.def("gpu_profile", [](bool on) {
+    std::lock_guard<std::mutex> lk(g_gpu.mu);
+    if (on) {
+      g_gpu.recs.reserve(GpuTimes::kCap);
+    } else {
+      std::vector<std::tuple<uint64_t, int, uint64_t, int64_t, int64_t>>().swap(g_gpu.recs);
+    }
+    g_gpu.on.store(on);
+  });
+  m.def("gpu_drain", [] {
+    std::vector<std::tuple<uint64_t, int, uint64_t, int64_t, int64_t>> got;
+    uint64_t dropped;
+    {
+      std::lock_guard<std::mutex> lk(g_gpu.mu);
+      got.swap(g_gpu.recs);
+      if (g_gpu.on.load()) g_gpu.recs.reserve(GpuTimes::kCap);
+      dropped = g_gpu.dropped;
+      g_gpu.dropped = 0;
+    }
+    return std::make_pair(got, dropped);
+  });
+  m.def("gpu_handlers", [] { return g_gpu.handlers.load(); });
   m.def("write_into", &write_into);
   m.def("peek", &peek);
   nb::class_<PoolServer>(m, "PoolServer")
@@ -607,5 +732,7 @@ NB_MODULE(_hostsync, m) {
       .def("window", &PoolServer::window)
       .def("packed", &PoolServer::packed)
       .def("workers", &PoolServer::workers)
+      .def("profile", &PoolServer::profile, nb::arg("on"))
+      .def("drain_profile", &PoolServer::drain_profile)
       .def("close", &PoolServer::close, nb::call_guard<nb::gil_scoped_release>());
 }
