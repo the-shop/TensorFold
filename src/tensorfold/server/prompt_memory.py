@@ -51,15 +51,17 @@ def attention_geometry(model: Any) -> tuple[int, int]:
     return (max(fallback) if fallback else 0 if configurations else -1), rows
 
 
-def probe_tokens(tokenizer: Any) -> list[int]:
-    """Real text for the admission's probe: this module's source, as the model's tokenizer reads it."""
+def probe_tokens(tokenizer: Any, vocab: int = 0) -> list[int]:
+    """Real text for the admission's probe: this module's source, as the model's tokenizer reads it; ids the model's
+    embedding lacks (``vocab``, 0: no limit) are left out, the probe measures memory, not replies."""
 
     from pathlib import Path
 
     try:
-        return [int(t) for t in tokenizer.encode(Path(__file__).read_text(), add_special_tokens=False)]
+        ids = [int(t) for t in tokenizer.encode(Path(__file__).read_text(), add_special_tokens=False)]
     except Exception:  # noqa: BLE001 - a tokenizer that can't: the probe falls back to synthetic ids
         return []
+    return [t for t in ids if 0 <= t < vocab] if vocab else ids
 
 
 class PromptMemory:

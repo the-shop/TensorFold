@@ -65,6 +65,8 @@ def warn_vocab_mismatch(tokenizer: Any, vocab: int) -> None:
 
     if not vocab:
         return
+    if not hasattr(type(tokenizer), "__len__"):            # mlx-lm's wrapper: the HF tokenizer counts added tokens
+        tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
     try:
         size = len(tokenizer)
     except TypeError:
@@ -187,7 +189,7 @@ class ChatApp(RequestOptions):
         measure = lambda: (concurrency(self.engine, self.prompt_memory, float(memory_fraction), int(lanes),
                                        self.default_max_tokens) if memory_fraction and lanes > 1 else None)
         admission = measure() if self.prompt_memory is None else self.prompt_memory.sized(
-            self.engine, measure, probe_tokens(tokenizer))
+            self.engine, measure, probe_tokens(tokenizer, self.model_vocab))
         if self.prompt_memory is not None:
             self.context_window, self.context_fitted = self.prompt_memory.fit_window(self.context_window, fit_context)
         self.scheduler = Scheduler(

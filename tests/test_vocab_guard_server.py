@@ -66,3 +66,36 @@ def test_load_warning_only_when_tokenizer_exceeds_vocab(capsys):
     warn_vocab_mismatch(Sized(), 65536)
     out = capsys.readouterr().out
     assert "warning" in out and "248,077" in out and "65,536" in out and "HTTP 400" in out
+
+    class Wrapper:                                  # mlx-lm's TokenizerWrapper: no len(), vocab_size without added
+        vocab_size = 248044
+        _tokenizer = Sized()
+
+    warn_vocab_mismatch(Wrapper(), 65536)
+    assert "248,077" in capsys.readouterr().out
+
+
+def test_probe_tokens_leave_out_ids_past_the_vocab():
+    from tensorfold.server.prompt_memory import probe_tokens
+
+    tok = types.SimpleNamespace(encode=lambda text, add_special_tokens: [5, 70000, 9, 248045])
+    assert probe_tokens(tok) == [5, 70000, 9, 248045]
+    assert probe_tokens(tok, 65536) == [5, 9]
+
+
+def test_copied_drafts_stop_before_an_id_past_the_vocab():
+    from tensorfold.engine.lane_family import FamilyRounds
+
+    rounds = object.__new__(FamilyRounds)
+    rounds.model = types.SimpleNamespace(args=types.SimpleNamespace(vocab_size=100))
+    rounds.max_copy = 8
+
+    def stream(copied):
+        proposer = types.SimpleNamespace(propose=lambda context, n: copied, last_match=9)
+        return types.SimpleNamespace(proposer=proposer, force=[], context=[1, 2], draft_room=9)
+
+    assert rounds._copy_proposal(stream([5, 6, 7, 8])) == [5, 6, 7, 8]
+    assert rounds._copy_proposal(stream([5, 6, 7, 248045, 8])) == [5, 6, 7]
+    assert rounds._copy_proposal(stream([5, 248045, 7])) == []          # under two tokens: no copy
+    rounds.model = None                                                  # no vocabulary known: unchanged
+    assert rounds._copy_proposal(stream([5, 6, 248045])) == [5, 6, 248045]

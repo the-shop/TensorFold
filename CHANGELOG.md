@@ -14,8 +14,9 @@ GitHub has the full notes and the measurements behind them.
 - **Token ids past the embedding are refused.** A rendered prompt holding an id the model's embedding lacks (a
   tokenizer larger than the checkpoint's vocabulary, e.g. a tiny test model) gets HTTP 400 (in a stream, an
   `invalid_request_error` event) instead of reading memory past the table; the server warns at load when the
-  tokenizer has more ids than the embedding, and the Qwen4Exp forward checks ids itself. Own work, no third-party
-  code (builds on TensorFold by ashhart).
+  tokenizer has more ids than the embedding, and the Qwen4Exp forward checks ids itself. The start-up memory probe
+  and copied drafts leave such ids out, so a mismatched pair still starts. Own work, no third-party code (builds on
+  TensorFold by ashhart).
 
 ## 0.2.0 (10 Oct 2026)
 
