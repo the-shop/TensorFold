@@ -17,6 +17,26 @@ identifiers. Copyright 2026 The Qwen Team and The HuggingFace Inc. team, Apache 
 See [the license text](LICENSES/Apache-2.0.txt). The same helpers appear in mlx-vlm's
 `models/qwen4_exp/language.py`, MIT License, Copyright © 2025 Prince Canuma.
 
+## Upstream TensorFold (Apache-2.0)
+
+The auxiliary pricing in `CacheMemory.from_cache` (`src/tensorfold/server/memory_budget.py`: index keys and
+pooled blocks priced per allocated position, not per valid token) and the test
+`tests/test_memory_budget.py::test_sparse_indexer_price_is_steady_not_inflated_by_a_short_request` are from
+[ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (after 0.6.0), Copyright 2026
+TensorFold contributors, Apache License 2.0. See [the license text](LICENSES/Apache-2.0.txt). Modified: line
+offsets only. Upstream's NOTICE file reads:
+
+```
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+THIRD_PARTY_NOTICES.md.
+```
+
 ## GLM-5.3-Flash on Apple Silicon
 
 The MLX engine of `glm5_next` (`src/tensorfold/families/glm5_next/`: the forward pass in `model.py`, `kda.py`,

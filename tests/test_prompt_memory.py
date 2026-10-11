@@ -741,3 +741,17 @@ def test_a_growing_conversation_keeps_each_turns_prompt_up_to_the_fitted_window(
         memory.end()
     assert len(kept) > 8
     assert all(kept) if counted else not kept[-1]                   # uncounted, the window's top can't be kept
+
+
+def test_a_short_sparse_attention_request_does_not_inflate_the_sticky_profile():
+    # observe_cache keeps the largest price it has seen, so one short fresh request must not raise it
+    def layer(capacity, offset):
+        return SimpleNamespace(keys=Array((1, 2, capacity, 256)), values=Array((1, 2, capacity, 256)),
+                               index_keys=Array((1, capacity, 128)), pooled=Array((1, capacity // 4, 128)),
+                               offset=offset)
+
+    steady = 2 * 2 * 256 * 2 + 128 * 2 + (128 * 2) // 4
+    memory = controller()
+    memory.observe_cache([layer(256, 15)], workspace=False)
+    memory.observe_cache([layer(2304, 2112)], workspace=False)
+    assert memory.profile.bytes_per_token == steady
