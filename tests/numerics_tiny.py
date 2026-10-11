@@ -21,8 +21,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# FlashNext's load-time window check (runtime.check_windows) prefills fixed probe ids up to 50999: the embedding must
+# hold them, or the GPU gather reads past the table (no bounds check) and the run depends on whatever memory follows
+VOCAB = 51_200
 TEXT = {
-    "hidden_size": 512, "num_hidden_layers": 4, "vocab_size": 128, "rms_norm_eps": 1e-6,
+    "hidden_size": 512, "num_hidden_layers": 4, "vocab_size": VOCAB, "rms_norm_eps": 1e-6,
     "layer_types": ["linear_attention", "full_attention", "linear_attention", "linear_attention"],
     "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 256,
     "rope_parameters": {"rope_theta": 10000, "partial_rotary_factor": 0.25, "mrope_section": [2, 1, 1]},
