@@ -3,14 +3,15 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
-## 0.3.0 (MLXFW, the-shop fork) — unreleased draft
+## 0.3.0 (12 Oct 2026, MLXFW, the-shop fork)
 
 Faster prompts for Qwen3.8 Flash Next with SSD experts, the same tokens. Install with
 `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"`.
 
 Measured on an M5 Max (128 GB) serving the 8-bit Flash Next checkpoint (`--ssd-experts 60 --ple-on-ssd --context
 77824 --parallel 1 --persist-turns --checkpoint-last-user`, 84 GiB budget), 0.2.0 and 0.3.0 back to back, two runs
-each, page cache evicted before every start, `TF_PREFILL_LAYER_MAJOR=1` on both (0.2.0 ignores it):
+each, page cache evicted before every start. All 0.3.0 numbers below were measured with `TF_PREFILL_LAYER_MAJOR=1`
+(opt-in, off by default; 0.2.0 ignores it):
 - **Cold 24K-token prompt:** first token in 292-323 s on 0.2.0, 33-39 s on 0.3.0; expert bytes read 1,452 GB to
   136 GB. This needs `TF_PREFILL_LAYER_MAJOR=1` (off by default). A separate 0.3.0 run with layer-major prompt
   groups and window reuse both off took 152.8 s; the default settings' cold time was not measured.
@@ -18,9 +19,11 @@ each, page cache evicted before every start, `TF_PREFILL_LAYER_MAJOR=1` on both 
   resuming a 21.8K-token system block from disk took 4.85 s. A turn adding 1.5K tokens: 27.2-29.9 s to 7.3-8.1 s.
 - **Decode** (256-token replies): flat to +19% (15.00 to 14.95, 19.70 to 23.35, 21.55 to 22.85 tok/s).
 - **Page cache:** after a cold prompt the expert files keep ~18 GB cached on 0.2.0, 25 MB on 0.3.0.
-- **Memory:** peak process footprint 87.9 GB (81.8 GiB) against 87.1 GB on 0.2.0, 2.3 GB under the 84 GiB
-  (90.19 GB) budget; swap did not grow (0.2.0: +0.2 to +0.9 GB).
-- **Bits:** every reply's token hash equal across both builds and every configuration (45 of 45).
+- **Memory:** peak process footprint 87.7 GB sampled (87.1 GB on 0.2.0); the kernel's lifetime peak, which also
+  catches spikes between samples, was 87.9 GB (81.8 GiB). That is 2.3-2.5 GB under the 84 GiB (90.19 GB) budget;
+  swap did not grow (0.2.0: +0.2 to +0.9 GB).
+- **Bits:** every request with a reference token hash matched it on both builds (45 of 45); the one prompt without
+  a reference gave the same hash on every run of both builds.
 
 Upgrading: prompt snapshots written by 0.2.0 are not loaded (one re-prefill per saved system block or
 conversation). The first start compiles the expert pool's host extension again.
@@ -138,9 +141,12 @@ conversation). The first start compiles the expert pool's host extension again.
 - The Flash Next recipe lists every new variable (`TF_PREFILL_LAYER_MAJOR`, `TF_PREFILL_GROUP_GIB`,
   `TENSORFOLD_POOL_ALIGNED_READS`, `TENSORFOLD_POOL_WINDOW_REUSE`, `TENSORFOLD_DECODE_PROFILE*`, `TF_POOL_JOBLOG`)
   and the 0.3.0 measurements; older tables are marked as measured before 0.3.0.
-- **Licensing.** THIRD_PARTY_NOTICES.md now also lists the refused-checkpoint handling that 0.2.0 ported from
-  upstream ashhart/TensorFold commit e2a9ab01 (Apache-2.0), beside 0.3.0's 17e6390f port. The package metadata says
-  `MIT AND Apache-2.0`; the fork's own code stays MIT.
+- **Licensing.** THIRD_PARTY_NOTICES.md now credits the two ports from upstream ashhart/TensorFold after its
+  Apache-2.0 relicense that 0.2.0 shipped without a notice: the refused-checkpoint handling (commit e2a9ab01) and
+  the cleanup of unfinished snapshot writes (commit 05b25ea5, by Isham Rashik). 0.3.0's own port, the sparse-indexer
+  pricing (commit 17e6390f), is listed beside them, and each ported region carries a comment naming its upstream
+  commit. These are the ports an exact-line comparison against upstream's post-relicense history found. The package
+  metadata says `MIT AND Apache-2.0`; the fork's own code stays MIT.
 
 The out-of-bounds, token-id and snapshot-key changes are own work, with no third-party code; all of 0.3.0 builds on
 TensorFold by ashhart.
@@ -204,7 +210,12 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
 - **Recipe:** [Running it on a 128 GB M5 Mac](docs/recipes/qwen3.8-flash-next.md#running-it-on-a-128-gb-m5-mac),
   with a 60 GiB pool recommended (40 GiB as the lighter option) and measured results for 40, 60 and 70 GiB pools.
 
-## 0.3.6.3 (29 Sep 2026)
+# Upstream ashhart/TensorFold history
+
+The sections below are upstream [ashhart/TensorFold](https://github.com/ashhart/TensorFold)'s own releases up to
+0.3.6.3, the version this fork's 0.1.0 is based on. Their version numbers are upstream's, not this fork's.
+
+## Upstream ashhart/TensorFold 0.3.6.3 (29 Sep 2026)
 
 - **Images in, on Macs and Sparks.** `--vision` lets Qwen3.8-27B read up to four images a request, as data URLs or,
   with `--vision-urls`, HTTPS links. Image replies keep drafting and equal `"draft": false` ones (77.6 against 37.3
@@ -254,7 +265,7 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
 - **MLX stays at 0.32.2 for now.** MLX 0.32.3 changed a kernel our prompt kernels build on, so fresh installs fell
   back to slower prompts with one log line; the next release follows the new kernel. Thanks to @ecohash-co (#88).
 
-## 0.3.6.2 (28 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.6.2 (28 Sep 2026)
 
 - **EXL3 replies stop at the end of the turn.** Flash Next and 27B EXL3 packs list `<|im_end|>` only in
   `generation_config.json`, so replies ran past their turn and leaked tool calls and think tags. The CUDA engine now
@@ -288,14 +299,14 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
 - **M1-M4:** a prompt split into parts attends exactly as it does in one piece at every length; two 8,192-key cases
   rounded differently in 0.3.6.
 
-## 0.3.6.1 (28 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.6.1 (28 Sep 2026)
 
 - **CUDA builds inside NVIDIA's containers again.** Their `TORCH_CUDA_ARCH_LIST` names every architecture back to
   sm_80, so the kernels' thread-block clusters and FP8 MMA failed to compile for GPUs that lack them. Every extension
   now builds for the GPU that is present, and a GPU older than compute capability 9.0 gets a clear message. Thanks to
   @ss-cong for the report and the exact errors (#56).
 
-## 0.3.6 (28 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.6 (28 Sep 2026)
 
 - **GLM-5.3-Flash on Macs** with 256 GB, drafted replies equal to serial ones. Prompts process at or above mlx-vlm
   from 2k to 32k tokens on an M3 Ultra, and tool calls parse in both servers. Thanks to @chadhurley25075-png (#9,
@@ -320,14 +331,14 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
   because the chunk size follows the memory budget. Within one server, drafted replies always equal serial ones and
   resumed prompts equal fresh ones.
 
-## 0.3.5.1 (28 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.5.1 (28 Sep 2026)
 
 - Qwen3.8-27B loads on M1 and M2 Macs again. Kernels there fit Metal's per-kernel thread limit, with the same sums in
   the same order, so drafted output still equals serial output.
 - M3, M4 and M5 run 0.3.5's machine code unchanged.
 - Thanks to @hichaiuse, @simonmd, @gcarusso, @tonydehnke, @Cyb3r-Monk and @tinyapps for the reports and the repro.
 
-## 0.3.5 (27 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.5 (27 Sep 2026)
 
 - **Concurrent requests share each verification round.** `--parallel auto` is on by default, and every stream's reply
   equals the same request served alone, on Metal and on CUDA.
@@ -342,40 +353,40 @@ release; `tensorfold update` looks for them on the-shop/TensorFold. It builds on
 - **API:** raw `/v1/completions` prompts, `ignore_eos` and `stop`, request `reasoning_effort` and typed tool arguments
   (@chris247474, #28), `developer` messages, `parallel_tool_calls: false`, and cancellation when a client disconnects.
 
-## 0.3.4.1 (27 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.4.1 (27 Sep 2026)
 
 - Prompt processing is back to MLX's speed on every model. Prompts prefill through MLX's own forward on a fixed
   2,048-token grid, so a resumed conversation still equals a fresh one byte for byte.
 - Flash Next's peak memory stays within 20 GB of its weights up to a 196k-token prompt.
 
-## 0.3.4 (26 Sep 2026, pre-release)
+## Upstream ashhart/TensorFold 0.3.4 (26 Sep 2026, pre-release)
 
 - Every model runs on the lane engine, and the serial engine is gone. Nemotron drafts on M1 to M4 with row-exact
   kernels.
 - Qwen3.8-27B on M1 to M4 decodes at 1.9 to 4x serial, through a new 4-bit matmul on the simdgroup matrix units.
 - CUDA: every default path verifies at least two rows a round.
 
-## 0.3.3 (26 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.3 (26 Sep 2026)
 
 - Qwen3.8-27B verifies drafted tokens together on every M1 to M5 GPU, with output byte-identical to serial decoding.
 - Streamed `/v1/completions` send plain text.
 
-## 0.3.2 (26 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.2 (26 Sep 2026)
 
 - `tensorfold update` installs the newest release.
 - GLM-5.3-Flash reads Mia-AiLab's EXL3 weights on two DGX Sparks (experimental).
 
-## 0.3.1 (26 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.1 (26 Sep 2026)
 
 - `tensorfold info` shows how a checkpoint stores its weights and which backends read them. `serve` and `pull` refuse
   checkpoints no engine reads yet, before anything downloads.
 
-## 0.3.0 (26 Sep 2026)
+## Upstream ashhart/TensorFold 0.3.0 (26 Sep 2026)
 
 - NVIDIA GPUs: `tensorfold serve` picks CUDA on Linux and runs on one GPU or two (one rank per DGX Spark).
 - A new family, GLM-5.3-Flash, on two Sparks.
 
-## 0.2.0 (25 Sep 2026)
+## Upstream ashhart/TensorFold 0.2.0 (25 Sep 2026)
 
 - A rewrite: `tensorfold serve`, `pull`, `models` and `info` for Nemotron 3.5 Lightning, Qwen3.8-27B and Qwen3.8
   Flash Next on Apple Silicon, with drafts that never change the output.

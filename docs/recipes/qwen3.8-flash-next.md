@@ -74,7 +74,9 @@ same tokens, and drafted replies equal `"draft": false` ones.
 You need:
 - an M5 Mac with 128 GB of RAM;
 - Xcode Command Line Tools (`xcode-select --install`);
-- about 560 GB of free SSD: the 360 GB BF16 download plus the 194 GB 8-bit output.
+- about 560 GB of free SSD to convert (the 360 GB BF16 download plus the 194 GB 8-bit output), or about 220 GB
+  free to download the published 8-bit checkpoint instead (194 GB, plus prompt snapshot and session files, which
+  grow with `--persist-turns`).
 
 SSD expert streaming (`--ssd-experts`) comes from upstream TensorFold 0.3.6
 ([ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)). The 8-bit Flash Next kernels and converter, the
@@ -86,7 +88,8 @@ speed-ups [below](#030-prompt-path-and-diagnostics) (or use `main` for the lates
 git clone -b v0.3.0 https://github.com/the-shop/TensorFold.git && cd TensorFold
 ```
 
-Run everything below from that directory, in a Python 3.11+ virtual environment. The SSD extras build the expert
+Run everything below from that directory, in a Python 3.11+ virtual environment (`python3 -m venv .venv`; tested
+with Python 3.13, and 3.14 installs and builds the extension too). The SSD extras build the expert
 pool's host side, a small MLX extension, with cmake and nanobind the first time it is used. The `hf` command comes
 from `huggingface_hub` 0.34 or later.
 
@@ -114,6 +117,16 @@ TENSORFOLD_MEMORY_LIMIT_GB=76 tensorfold serve flashnext-q8 --name bench \
 ```
 
 The lighter option is `--ssd-experts 40` with `TENSORFOLD_MEMORY_LIMIT_GB=56`, which leaves about 75 GiB free.
+
+The first start builds the expert pool's host extension and, for Flash Next, runs a short numerics canary, so it
+takes longer than later ones. Once `/health` answers, send a first request:
+
+```bash
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{"model":"bench",
+  "messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":64,"temperature":0}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
 
 The pool and the context window share the memory budget (measured before 0.3.0, on 2026-10-10):
 
@@ -256,7 +269,8 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
 Measured on 2026-10-12 on an M5 Max MacBook Pro (128 GB, internal SSD) serving the published 8-bit checkpoint with
 `TENSORFOLD_MEMORY_LIMIT_GB=84 TF_PREFILL_LAYER_MAJOR=1 --ssd-experts 60 --ple-on-ssd --context 77824 --parallel 1
 --persist-turns --checkpoint-last-user`: 0.2.0 and 0.3.0 back to back, two runs each (0.2.0, 0.3.0, 0.3.0, 0.2.0),
-a fresh server and snapshot directory per run and the page cache evicted before every start. Each server took a
+a fresh server and snapshot directory per run and the page cache evicted before every start. Every 0.3.0 number in
+this section was measured with `TF_PREFILL_LAYER_MAJOR=1`, which is opt-in (off by default). Each server took a
 cold ~24K-token agent prompt (A), a second cold one sharing no prefix (V), then follow-up turns on the same server
 that resume a saved prompt (B, C, C2, T1-T3). First-token time in seconds (server-side), min-max over the two runs,
 and expert bytes read from SSD (GB):
@@ -272,8 +286,8 @@ and expert bytes read from SSD (GB):
 | T2 | 25,403 / 24,755 | 15.8-16.6 | 4.84-5.01 | 158-159 | 40.2-41.1 |
 | T3 | 25,467 / 25,222 | 7.41-8.77 | 2.76-2.91 | 78.5-78.7 | 31.0-31.3 |
 
-- **Token hashes:** every reply's token hash was equal across both builds and all runs, and equal to the reference
-  hashes for these requests.
+- **Token hashes:** every request with a reference hash (A, B, C, C2, T1-T3) matched it on both builds and all
+  runs. V has no reference hash; it gave the same hash on every run of both builds.
 - **Cold prompts need the flag:** the 33-39 s cold figure is with `TF_PREFILL_LAYER_MAJOR=1`. One 0.3.0 run with
   layer-major groups and window reuse both off took 152.8 s for A (1,450 GB read); 0.3.0's default settings
   (window reuse on, layer-major off) were not measured cold.
@@ -283,9 +297,10 @@ and expert bytes read from SSD (GB):
   +19%. Shorter replies are dominated by draft acceptance and pool warmth and are not quoted.
 - **Page cache:** after A, ~18 GB of the expert files stayed cached on 0.2.0 and 25 MB on 0.3.0 (other model files,
   such as n-gram reads, still leave 8.1 GB cached).
-- **Memory:** peak process footprint 87.9 GB (81.8 GiB) on 0.3.0 against 87.1 GB on 0.2.0, 2.3 GB under the
-  84 GiB (90.19 GB) budget; MLX peak 84.2 GB against 85.7 GB. Swap did not grow on 0.3.0 (0.2.0: +0.2 to
-  +0.9 GB).
+- **Memory:** peak process footprint 87.7 GB on 0.3.0 sampled every 5 s (87.1 GB on 0.2.0); the kernel's
+  lifetime peak, which also catches spikes between samples, was 87.9 GB (81.8 GiB). That is 2.3-2.5 GB under the
+  84 GiB (90.19 GB) budget, and above the 60-80 GB we aimed for: at these settings TensorFold uses about 88 GB of
+  a 128 GB Mac. MLX peak 84.2 GB against 85.7 GB. Swap did not grow on 0.3.0 (0.2.0: +0.2 to +0.9 GB).
 
 ## CUDA
 
