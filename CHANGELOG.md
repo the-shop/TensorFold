@@ -138,6 +138,9 @@ conversation). The first start compiles the expert pool's host extension again.
 - The Flash Next recipe lists every new variable (`TF_PREFILL_LAYER_MAJOR`, `TF_PREFILL_GROUP_GIB`,
   `TENSORFOLD_POOL_ALIGNED_READS`, `TENSORFOLD_POOL_WINDOW_REUSE`, `TENSORFOLD_DECODE_PROFILE*`, `TF_POOL_JOBLOG`)
   and the 0.3.0 measurements; older tables are marked as measured before 0.3.0.
+- **Licensing.** THIRD_PARTY_NOTICES.md now also lists the refused-checkpoint handling that 0.2.0 ported from
+  upstream ashhart/TensorFold commit e2a9ab01 (Apache-2.0), beside 0.3.0's 17e6390f port. The package metadata says
+  `MIT AND Apache-2.0`; the fork's own code stays MIT.
 
 The out-of-bounds, token-id and snapshot-key changes are own work, with no third-party code; all of 0.3.0 builds on
 TensorFold by ashhart.
