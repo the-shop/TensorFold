@@ -109,6 +109,7 @@ def test_the_spill_directory_keeps_the_newest_within_its_byte_limit(tmp_path):
     assert not files[0].exists() and not files[1].exists()
 
 
+# Adapted from TensorFold upstream e2a9ab01 tests/test_issue155_spill.py (Apache-2.0); modified: fork fixtures, names
 def test_a_prefix_the_budget_refuses_is_spilled_and_reads_back(tmp_path):
     mx = pytest.importorskip("mlx.core")
     from tensorfold.engine.prefix_snapshots import DiskBlocks, load_snapshot

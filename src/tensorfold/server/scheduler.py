@@ -122,6 +122,7 @@ class Scheduler(PromptFill):
             from tensorfold.engine.prefix_snapshots import DiskBlocks, clean_partials
             from tensorfold.server.checkpoints import _size
 
+            # Adapted from TensorFold upstream 05b25ea5 (Apache-2.0); modified: counts files, logs via _size
             for directory in (snapshot_dir, session_dir):
                 removed, freed = (0, 0) if directory is None else clean_partials(Path(directory))
                 if removed:

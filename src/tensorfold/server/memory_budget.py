@@ -160,6 +160,7 @@ class CacheMemory:
             spare = _array_bytes(getattr(item, "spare_keys", None))
             spare += _array_bytes(getattr(item, "spare_values", None))
             extra = max(0, held - main - spare)
+            # Adapted from TensorFold upstream 17e6390f (Apache-2.0); modified: line offsets only
             auxiliary = -(-extra // positions)    # index keys and pooled blocks fill whole capacity steps
             capacity = int(getattr(item, "max_size", 0) or 0)
             if capacity:

@@ -295,6 +295,7 @@ class CheckpointStore:
             best = self._best(prompt, usable)
             return len(best.tokens) if best is not None else 0
 
+    # Adapted from TensorFold upstream e2a9ab01 (Apache-2.0); modified: docstring/comment shortened, issue no. dropped
     def refuse(self, tokens: list[int], cache: list[Any], nbytes: int, reason: str) -> None:
         """A refused prefix: spilled to disk where a later turn can re-read it, else counted and logged."""
 

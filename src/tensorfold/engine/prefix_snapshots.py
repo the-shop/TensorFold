@@ -19,6 +19,7 @@ import numpy as np
 
 FORMAT = 1
 DEFAULT_DIR = Path.home() / ".cache" / "tensorfold" / "prefix-snapshots"
+# Adapted from TensorFold upstream 05b25ea5 (Apache-2.0); modified: 24 h override, pid-thread suffix, clean_partials
 PARTIAL = ".partial.safetensors"
 # a partial without its writer's pid (0.1.0 and earlier) may be another server's write in progress until it is this old
 UNNAMED_PARTIAL_SECONDS = 3600
@@ -167,6 +168,7 @@ def save_snapshot(directory: Path, model_id: str, tokens: Sequence[int], cache: 
     if _touch(target):
         return None
     arrays, meta = snapshot_arrays(model_id, tokens, cache)
+    # Adapted from TensorFold upstream 05b25ea5 (Apache-2.0); modified: pid-thread suffix, seal and sync before rename
     # this process's own (startup knows whether its writer ended), and this write's own (threads never share one)
     partial = target.with_name(f"{key}.{os.getpid()}-{next(_WRITES)}{PARTIAL}")
     try:

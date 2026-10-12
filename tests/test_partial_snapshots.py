@@ -1,3 +1,4 @@
+# Adapted from TensorFold upstream 05b25ea5 (Apache-2.0); modified: 0.6.0->0.1.0 comments, pid-thread names, fork tests
 """A failed or cut-short snapshot write leaves no ``.partial.safetensors``: errors and startup both remove them."""
 
 from __future__ import annotations

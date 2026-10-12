@@ -207,6 +207,7 @@ def test_attention_index_arrays_grow_with_context_and_state_views_do_not_hide_ca
     assert cache_nbytes(cache) > sum(array.nbytes for array in cache[0].state)
 
 
+# Adapted from TensorFold upstream 17e6390f (Apache-2.0); modified: line offsets only
 def test_sparse_indexer_price_is_steady_not_inflated_by_a_short_request():
     # Flash Next's sparse-attention indexer keys and pooled blocks are allocated in 256-position
     # capacity steps (AttentionCache.update), so their per-token cost is a steady layer property.

@@ -35,6 +35,17 @@ were shortened and the issue number dropped. The tests
 `::test_a_refused_prefix_with_no_disk_is_counted_and_logged` are adapted from upstream's
 `tests/test_issue155_spill.py` at that commit.
 
+The partial-write cleanup in `src/tensorfold/engine/prefix_snapshots.py` (`PARTIAL`, `UNNAMED_PARTIAL_SECONDS`,
+`remove_stale_partials`, `_abandoned`, `_running`, and the removal of a failed write's partial in `save_snapshot`),
+the startup loop over the snapshot and session directories in `src/tensorfold/server/scheduler.py`, and the tests in
+`tests/test_partial_snapshots.py` are from [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 05b25ea5
+(by Isham Rashik, after 0.6.0), Copyright 2026 TensorFold contributors, Apache License 2.0, in this fork since 0.2.0.
+Modified: partial names carry the writer's pid plus a per-write counter (`<pid>-<n>`) so threads never share one;
+`STALE_PARTIAL_SECONDS` (24 h) removes a partial that old even when its pid is running; `clean_partials` wraps the
+cleanup to return the files removed as well as the bytes, and the startup line logs both; "0.6.0" in comments reads
+"0.1.0" (this fork's first release). The tests are adapted from upstream's `tests/test_partial_snapshots.py` at that
+commit to these names and log lines, and the fork added further tests to the same file.
+
 Upstream's NOTICE file reads:
 
 ```
