@@ -263,5 +263,6 @@ every release. The first time a new version serves, it prints one line linking t
 
 Family interfaces, kernel layout and verification requirements are in the [recipe book](docs/recipes/README.md),
 [family map](src/tensorfold/families/README.md) and [kernel map](src/tensorfold/kernels/README.md).
-MIT; see [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
+MIT, with some files or parts under other licenses, including Apache-2.0 code ported from upstream TensorFold
+after its 0.6.0; see [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
 Model weights keep their own licenses.

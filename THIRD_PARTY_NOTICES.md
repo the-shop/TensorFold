@@ -24,7 +24,18 @@ pooled blocks priced per allocated position, not per valid token) and the test
 `tests/test_memory_budget.py::test_sparse_indexer_price_is_steady_not_inflated_by_a_short_request` are from
 [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (after 0.6.0), Copyright 2026
 TensorFold contributors, Apache License 2.0. See [the license text](LICENSES/Apache-2.0.txt). Modified: line
-offsets only. Upstream's NOTICE file reads:
+offsets only.
+
+The refused-checkpoint handling in `src/tensorfold/server/checkpoints.py` (`CheckpointStore.refuse`, the
+`refused` counter and the call to it from `CheckpointStore.insert` when a prefix's copy passes the budget) is from
+[ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit e2a9ab01 (issue #155, after 0.6.0), Copyright
+2026 TensorFold contributors, Apache License 2.0, in this fork since 0.2.0. Modified: the docstring and comment
+were shortened and the issue number dropped. The tests
+`tests/test_checkpoint_spill.py::test_a_prefix_the_budget_refuses_is_spilled_and_reads_back` and
+`::test_a_refused_prefix_with_no_disk_is_counted_and_logged` are adapted from upstream's
+`tests/test_issue155_spill.py` at that commit.
+
+Upstream's NOTICE file reads:
 
 ```
 TensorFold
