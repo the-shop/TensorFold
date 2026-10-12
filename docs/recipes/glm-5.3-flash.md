@@ -139,7 +139,9 @@ tensorfold serve Vontra/GLM-5.3-Flash-MLX-4bit-MTP --ssd-experts 64
 - The expert kernels are the resident ones with only the weight address changed, so replies are the
   resident model's tokens.
 - A prompt chunk loads each layer's picked experts in turn.
-- The pool keeps the most recently used experts, and reads bypass the page cache.
+- The pool keeps the most recently used experts. Reads use `F_NOCACHE`, but on macOS an unaligned one still
+  leaves all but its first MiB in the page cache; since 0.3.0 the pool reads parts over about 1 MiB page-aligned
+  (`TENSORFOLD_POOL_ALIGNED_READS`, on by default), which leaves them uncached. Measured on Flash Next, not on GLM.
 - The extension builds against the installed MLX with the Xcode command line tools.
 
 On an M3 Ultra held to a 128 GB Mac's budget (TENSORFOLD_MEMORY_LIMIT_GB=89.6) with `--ssd-experts 64`, the

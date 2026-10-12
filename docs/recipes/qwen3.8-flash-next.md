@@ -79,10 +79,11 @@ You need:
 SSD expert streaming (`--ssd-experts`) comes from upstream TensorFold 0.3.6
 ([ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)). The 8-bit Flash Next kernels and converter, the
 native expert-pool server, the opt-in prefetch, prompt seeding and expert pack, the short-prompt admission fix and
-failing a request on a pool error are in the-shop's fork, released as `v0.1.0` (or use `main` for the latest):
+failing a request on a pool error are in the-shop's fork, first released as `v0.1.0`; `v0.3.0` adds the prompt
+speed-ups [below](#030-prompt-path-and-diagnostics) (or use `main` for the latest):
 
 ```bash
-git clone -b v0.1.0 https://github.com/the-shop/TensorFold.git && cd TensorFold
+git clone -b v0.3.0 https://github.com/the-shop/TensorFold.git && cd TensorFold
 ```
 
 Run everything below from that directory, in a Python 3.11+ virtual environment. The SSD extras build the expert
@@ -114,7 +115,7 @@ TENSORFOLD_MEMORY_LIMIT_GB=76 tensorfold serve flashnext-q8 --name bench \
 
 The lighter option is `--ssd-experts 40` with `TENSORFOLD_MEMORY_LIMIT_GB=56`, which leaves about 75 GiB free.
 
-The pool and the context window share the memory budget:
+The pool and the context window share the memory budget (measured before 0.3.0, on 2026-10-10):
 
 | `--ssd-experts` | `TENSORFOLD_MEMORY_LIMIT_GB` | `--context` | Longest prompt that keeps its cache between turns | Peak MLX (`/health`) | Peak process (`top`, native loop) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -143,11 +144,11 @@ for d in true false; do
 done   # the two lines must match
 ```
 
-The numbers below come from two independent private harnesses, not `tools/bench_openai.py`. That tool uses
-64-token replies, two prompts and client-side timing, so its numbers aren't comparable to these. They were measured
-on 2026-10-10 on an M5 Max MacBook Pro (128 GB, internal SSD) serving the published 8-bit checkpoint above. The
-machine's other model servers and background jobs were paused during the runs, and swap stayed flat through every
-60 and 70 GiB run.
+The numbers below come from two independent private harnesses, not `tools/bench_openai.py`. That tool uses 64-token
+replies, two prompts and client-side timing, so its numbers aren't comparable to these. They predate 0.3.0 (for
+0.3.0's prompt numbers see [below](#030-prompt-path-and-diagnostics)) and were measured on 2026-10-10 on an M5 Max
+MacBook Pro (128 GB, internal SSD) serving the published 8-bit checkpoint above. The machine's other model servers
+and background jobs were paused during the runs, and swap stayed flat through every 60 and 70 GiB run.
 
 Every run used `--context 16384 --ple-on-ssd --no-thinking`, temperature 0, replies of up to 128 tokens and
 `--snapshot-dir none`, so every prefill was cold; the page cache was displaced before each measurement window. Each value is a
@@ -157,7 +158,7 @@ median of server-side tok/s.
 - **Harness B:** 7 short prompts with drafts (first visit), then the same 7 with `"draft": false` (second visit,
   7 other prompts in between). Prefill on a 2,475-token prompt.
 
-Decode and prefill in tok/s; load time in seconds (harness A / harness B):
+Decode and prefill in tok/s; load time in seconds (harness A / harness B), before 0.3.0:
 
 | Pool | Loop | A: first run | A: repeats | A: serial | A: prefill | B: drafts | B: serial | B: prefill | Pool hits | Load |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -228,6 +229,64 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
 - `python tools/bench_pool_io.py MODEL_DIR --cold` times miss reads for the Python loop, the native server and
   the pack at 4, 8, 16 and 32 threads, on experts none of whose bytes are in the page cache.
 
+#### 0.3.0 prompt path and diagnostics
+
+- **`TF_PREFILL_LAYER_MAJOR=1`** (off by default) runs a prompt's chunks in layer-major groups: every chunk of a
+  group passes a layer before the next layer, so with `--ssd-experts` each layer's expert window is filled once a
+  group instead of once a chunk. The chunk cuts and per-call shapes are those of chunk-by-chunk prefill, so replies,
+  caches and saved prompt states are the same bits. It applies to Flash Next on the fast prefill path (not with
+  `TF_FLASH_PREFILL=0`); other families ignore it. A prompt cancelled while a group runs loses that group's
+  progress, so its retry recomputes the group.
+- **`TF_PREFILL_GROUP_GIB`** (default 1) caps the activations a group carries between layers (25,608 bytes a prompt
+  token on the 8-bit checkpoint, so about 41,900 tokens at 1 GiB); the cap is counted in admission.
+- **`TENSORFOLD_POOL_ALIGNED_READS`** and **`TENSORFOLD_POOL_WINDOW_REUSE`** (both on by default) are described
+  with the expert pool above; `=0` restores the 0.2.0 reads.
+- **`TENSORFOLD_DECODE_PROFILE=PATH.jsonl`** (off by default) records each decode round's host stamps, expert-pool
+  calls (GPU signal seen, SSD reads, release, misses, bytes) and the GPU start and end of the command buffers that
+  carry the expert marks, adding no MLX op or eval (the replies are the same tokens).
+  **`TENSORFOLD_DECODE_PROFILE_SYNC=1`** adds eval barriers for exact per-part GPU times (slower).
+  **`TENSORFOLD_DECODE_PROFILE_MAX_MB`** (default 1024) caps the file, rotating it to `PATH.1`. A write error turns
+  the profiler off with one log line. `python tools/decode_profile_report.py PATH.jsonl` prints a per-round
+  breakdown (dense GPU, routed-expert GPU, SSD stall, host answer, Python-bound idle, head tail, MTP, gaps) and each
+  request's TTFT phases; `tools/decode_health_delta.py` reads `/health` counters around requests and
+  `tools/bench_flash_decode_parts.py` times the parts on random weights of the checkpoint's shapes.
+- **`TF_POOL_JOBLOG=PATH`** (off by default) appends one line per expert-pool call, written once a second: kind,
+  layer, rows, the host clock (ns) when the call was seen and when it was answered, bytes and `pread` calls.
+
+Measured on 2026-10-12 on an M5 Max MacBook Pro (128 GB, internal SSD) serving the published 8-bit checkpoint with
+`TENSORFOLD_MEMORY_LIMIT_GB=84 TF_PREFILL_LAYER_MAJOR=1 --ssd-experts 60 --ple-on-ssd --context 77824 --parallel 1
+--persist-turns --checkpoint-last-user`: 0.2.0 and 0.3.0 back to back, two runs each (0.2.0, 0.3.0, 0.3.0, 0.2.0),
+a fresh server and snapshot directory per run and the page cache evicted before every start. Each server took a
+cold ~24K-token agent prompt (A), a second cold one sharing no prefix (V), then follow-up turns on the same server
+that resume a saved prompt (B, C, C2, T1-T3). First-token time in seconds (server-side), min-max over the two runs,
+and expert bytes read from SSD (GB):
+
+| Request | Prompt / cached tokens | 0.2.0 first token | 0.3.0 first token | 0.2.0 expert reads | 0.3.0 expert reads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A (cold) | 24,015 / 0 | 292.0-323.3 | 33.3-38.8 | 1,452 | 136 |
+| V (cold) | 24,046 / 0 | 314.0-323.5 | 31.8-37.8 | 1,424 | 84 |
+| B | 21,889 / 21,766 | 5.25-5.43 | 2.85-2.90 | 59.0 | 26.1 |
+| C | 24,011 / 23,814 | 6.12-6.88 | 3.27-3.44 | 67.5 | 27.0 |
+| C2 | 24,006 / 23,814 | 5.80-6.57 | 2.86-3.06 | 66.6 | 23.3 |
+| T1 | 25,281 / 23,814 | 27.2-29.9 | 7.26-8.07 | 278-281 | 68.7 |
+| T2 | 25,403 / 24,755 | 15.8-16.6 | 4.84-5.01 | 158-159 | 40.2-41.1 |
+| T3 | 25,467 / 25,222 | 7.41-8.77 | 2.76-2.91 | 78.5-78.7 | 31.0-31.3 |
+
+- **Token hashes:** every reply's token hash was equal across both builds and all runs, and equal to the reference
+  hashes for these requests.
+- **Cold prompts need the flag:** the 33-39 s cold figure is with `TF_PREFILL_LAYER_MAJOR=1`. One 0.3.0 run with
+  layer-major groups and window reuse both off took 152.8 s for A (1,450 GB read); 0.3.0's default settings
+  (window reuse on, layer-major off) were not measured cold.
+- **Resuming from disk:** B, C and C2 above follow two cold prompts on the same server. A fresh 0.3.0 server
+  resuming B's saved system block from disk took 4.85 s.
+- **Decode** on 256-token replies (T1-T3, median tok/s): 15.00 to 14.95, 19.70 to 23.35, 21.55 to 22.85: flat to
+  +19%. Shorter replies are dominated by draft acceptance and pool warmth and are not quoted.
+- **Page cache:** after A, ~18 GB of the expert files stayed cached on 0.2.0 and 25 MB on 0.3.0 (other model files,
+  such as n-gram reads, still leave 8.1 GB cached).
+- **Memory:** peak process footprint 87.9 GB (81.8 GiB) on 0.3.0 against 87.1 GB on 0.2.0, 2.3 GB under the
+  84 GiB (90.19 GB) budget; MLX peak 84.2 GB against 85.7 GB. Swap did not grow on 0.3.0 (0.2.0: +0.2 to
+  +0.9 GB).
+
 ## CUDA
 
 Use the [container setup](../../RUNBOOK.md#nvidia-gpus). For two ranks, pull the checkpoint on both and
@@ -251,14 +310,17 @@ the reported capacity rather than assuming an older fixed token limit.
 
 Saved prompt states survive restarts. System blocks go to `--snapshot-dir` and conversations to `--session-dir`
 (default `session-snapshots` beside it). Each file carries a checksum and the weights' fingerprint and is refused
-and removed when either does not match. A graceful stop saves the open conversations; `--persist-turns` also
-writes each turn's conversation behind the reply (streamed in pieces when RAM is tight), so a crash keeps it.
-`--checkpoint-last-user` keeps one more state where the last user message starts, for clients such as agent
-harnesses that replace a trailing reminder message on every turn. On the 8-bit checkpoint (`--ssd-experts 60
---ple-on-ssd`, 84 GiB budget) with ~25K-token agent prompts, two independent harnesses measured: after a graceful
-restart the next turn's first token came in 6.0-7.0 s against 284-332 s cold; with `--checkpoint-last-user` a
-follow-up whose reminder message changed came in 14-23 s against 54-64 s; replies were the same tokens in every
-case, including after a kill -9 with `--persist-turns`.
+and removed when either does not match. On MLX, Flash Next keys the files on its declared numerics version, the
+pinned environment and a short canary prompt prefilled at start-up, not on the source or the release, so an update
+that computes the same bits keeps them; one that moves the canary's bits or bumps the version does not read them.
+Files written by 0.2.0 are not loaded by 0.3.0 (one re-prefill). A graceful stop saves the open conversations;
+`--persist-turns` also writes each turn's conversation behind the reply (streamed in pieces when RAM is tight), so
+a crash keeps it. `--checkpoint-last-user` keeps one more state where the last user message starts, for clients
+such as agent harnesses that replace a trailing reminder message on every turn. On the 8-bit checkpoint
+(`--ssd-experts 60 --ple-on-ssd`, 84 GiB budget) with ~25K-token agent prompts, two independent harnesses measured
+on 0.2.0: after a graceful restart the next turn's first token came in 6.0-7.0 s against 284-332 s cold; with
+`--checkpoint-last-user` a follow-up whose reminder message changed came in 14-23 s against 54-64 s; replies were
+the same tokens in every case, including after a kill -9 with `--persist-turns`.
 
 N-gram tables are file-backed host data. On unified-memory GPUs they compete with weights and cache
 allocations for RAM, so a checkpoint's GPU allocation alone does not describe its memory requirement.
