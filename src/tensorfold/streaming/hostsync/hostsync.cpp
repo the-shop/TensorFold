@@ -122,6 +122,16 @@ void write_into(mx::array& a, size_t byte_offset, nb::bytes data) {
   std::memcpy(a.data<uint8_t>() + byte_offset, data.c_str(), data.size());
 }
 
+// Copies nbytes inside an evaluated array's buffer from src_offset to dst_offset (one slot to another).
+void copy_within(mx::array& a, size_t dst_offset, size_t src_offset, size_t nbytes) {
+  if (!a.is_available() || dst_offset + nbytes > a.nbytes() || src_offset + nbytes > a.nbytes()) {
+    throw std::out_of_range("copy_within: the array is not evaluated or a range passes its end");
+  }
+  auto* base = a.data<uint8_t>();
+  nb::gil_scoped_release release;
+  std::memmove(base + dst_offset, base + src_offset, nbytes);
+}
+
 // Reads nbytes of an evaluated array's buffer at byte_offset without waiting on MLX (after a GPU signal).
 nb::bytes peek(mx::array& a, size_t byte_offset, size_t nbytes) {
   if (!a.is_available() || byte_offset + nbytes > a.nbytes()) {
@@ -290,10 +300,10 @@ class PoolServer {
  public:
   PoolServer(std::shared_ptr<Channel> channel, mx::array box, mx::array slot_of, std::vector<mx::array> dsts,
              std::vector<size_t> part_nbytes, nb::bytes fds, nb::bytes offsets, int layers, int experts, int top_k,
-             int slots, int workers, uint64_t timeout_ms, bool aligned)
+             int slots, int workers, uint64_t timeout_ms, bool aligned, bool window_reuse)
       : channel_(std::move(channel)), box_(std::move(box)), slot_of_(std::move(slot_of)), dsts_(std::move(dsts)),
         part_nbytes_(std::move(part_nbytes)), layers_(layers), experts_(experts), top_k_(top_k), slots_(slots),
-        timeout_ms_(timeout_ms), aligned_(aligned) {
+        timeout_ms_(timeout_ms), aligned_(aligned), window_reuse_(window_reuse) {
     size_t parts = dsts_.size();
     if (parts == 0 || part_nbytes_.size() != parts || layers <= 0 || experts <= 0 || slots <= experts || workers <= 0) {
       throw std::invalid_argument("PoolServer: bad geometry");
@@ -415,6 +425,13 @@ class PoolServer {
   std::tuple<uint64_t, uint64_t, uint64_t, uint64_t> counters() const {
     return {hits_.load(), misses_.load(), bytes_read_.load(), preads_.load()};
   }
+
+  // Window experts read from the checkpoint, copied from the decode LRU, and the bytes those copies moved.
+  std::tuple<uint64_t, uint64_t, uint64_t> window_counters() const {
+    return {window_reads_.load(), window_copies_.load(), copy_bytes_.load()};
+  }
+
+  bool window_reuse() const { return window_reuse_; }
 
   std::vector<std::tuple<int, int, int>> lru_items() {
     std::lock_guard<std::mutex> lk(state_mu_);
@@ -677,14 +694,52 @@ class PoolServer {
     for (auto [e, slot] : table) slot_of[static_cast<size_t>(layer) * experts_ + e] = slot;
   }
 
+  // The slot holding (layer, expert) key k in the decode LRU, if any. No recency change: an eviction policy that
+  // replaces the LRU reimplements only this lookup.
+  std::optional<int> resident(int64_t k) const {
+    auto it = where_.find(k);
+    if (it == where_.end()) return std::nullopt;
+    return it->second->second;
+  }
+
+  bool failed() {
+    std::lock_guard<std::mutex> lk(error_mu_);
+    return error_.has_value();
+  }
+
+  // A window expert already in the decode LRU is copied from its slot (the same bytes a read would land);
+  // the rest are read. After any recorded error an LRU slot may be partly read, so everything is read then.
   void fill_window(int layer, const std::vector<int64_t>& ids) {
     check_layer(layer);
-    std::vector<std::pair<int, int>> need;
+    bool reuse = window_reuse_ && !failed();
+    std::vector<std::pair<int, int>> need, copy;
     for (int64_t e : ids) {
-      if (window_[e] != layer) need.emplace_back(static_cast<int>(e), static_cast<int>(e));
+      if (window_[e] == layer) continue;
+      auto src = reuse ? resident(key(layer, e)) : std::nullopt;
+      if (src) {
+        copy.emplace_back(static_cast<int>(e), *src);
+      } else {
+        need.emplace_back(static_cast<int>(e), static_cast<int>(e));
+      }
     }
     read_all(layer, need);
+    copy_all(copy);
+    window_reads_.fetch_add(need.size());
+    window_copies_.fetch_add(copy.size());
+    copy_bytes_.fetch_add(copy.size() * expert_nbytes_);
     for (auto [e, slot] : need) window_[e] = layer;
+    for (auto [e, src] : copy) window_[e] = layer;
+  }
+
+  // (dst slot, src slot) pairs, every part; src in the LRU [E, S) and dst in the window [0, E) never overlap.
+  void copy_all(const std::vector<std::pair<int, int>>& copy) {
+    if (copy.empty()) return;
+    size_t parts = dsts_.size();
+    readers_->run(copy.size() * parts, [&](size_t i, int) {
+      auto [dst, src] = copy[i / parts];
+      size_t p = i % parts, n = part_nbytes_[p];
+      std::memcpy(dst_ptrs_[p] + static_cast<size_t>(dst) * n, dst_ptrs_[p] + static_cast<size_t>(src) * n, n);
+    });
   }
 
   void read_all(int layer, const std::vector<std::pair<int, int>>& need) {
@@ -747,6 +802,7 @@ class PoolServer {
   uint64_t timeout_ms_;
   bool aligned_;                           // unpacked reads through aligned_pread's stage (no page-cache residue)
   std::vector<Stage> stages_;              // one aligned_pread stage per reader thread
+  bool window_reuse_;
 
   int pack_fd_ = -1;
   std::vector<int64_t> pack_offsets_;
@@ -760,6 +816,7 @@ class PoolServer {
   std::vector<int> free_, window_;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, bytes_read_{0}, preads_{0};
+  std::atomic<uint64_t> window_reads_{0}, window_copies_{0}, copy_bytes_{0};
   size_t regions_ = 0;                     // words a region (two alternate), 0: one region, the whole box
   std::atomic<bool> log_on_{false};
   std::mutex log_mu_;
@@ -822,18 +879,22 @@ NB_MODULE(_hostsync, m) {
   m.def("gpu_handlers", [] { return g_gpu.handlers.load(); });
   m.def("write_into", &write_into);
   m.def("peek", &peek);
+  m.def("copy_within", &copy_within);
   nb::class_<PoolServer>(m, "PoolServer")
       .def(nb::init<std::shared_ptr<Channel>, mx::array, mx::array, std::vector<mx::array>, std::vector<size_t>,
-                    nb::bytes, nb::bytes, int, int, int, int, int, uint64_t, bool>(),
+                    nb::bytes, nb::bytes, int, int, int, int, int, uint64_t, bool, bool>(),
            nb::arg("channel"), nb::arg("box"), nb::arg("slot_of"), nb::arg("dsts"), nb::arg("part_nbytes"),
            nb::arg("fds"), nb::arg("offsets"), nb::arg("layers"), nb::arg("experts"), nb::arg("top_k"),
-           nb::arg("slots"), nb::arg("workers"), nb::arg("timeout_ms"), nb::arg("aligned") = false)
+           nb::arg("slots"), nb::arg("workers"), nb::arg("timeout_ms"), nb::arg("aligned") = false,
+           nb::arg("window_reuse") = true)
       .def("set_pack", &PoolServer::set_pack, nb::arg("fd"), nb::arg("offsets"), nb::arg("read_nbytes"),
            nb::arg("part_offsets"), nb::arg("alignment"))
       .def("submit", &PoolServer::submit, nb::arg("kind"), nb::arg("layer"), nb::arg("rows"), nb::arg("signal"),
            nb::arg("ready"))
       .def("error", &PoolServer::error)
       .def("counters", &PoolServer::counters)
+      .def("window_counters", &PoolServer::window_counters)
+      .def("window_reuse", &PoolServer::window_reuse)
       .def("lru_items", &PoolServer::lru_items)
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)

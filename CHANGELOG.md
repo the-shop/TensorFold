@@ -99,6 +99,12 @@ GitHub has the full notes and the measurements behind them.
   treat any diff to `tests/fixtures/numerics_reviewed.json` or `tests/fixtures/numerics_golden.json` as a
   `NUMERICS_VERSION` decision. `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0 are
   not loaded (one re-prefill). Own work, building on TensorFold by ashhart.
+- **Prompt chunks reuse experts already in the decode pool.** With `--ssd-experts`, a prompt chunk's layer window
+  now copies each routed expert that the decode LRU already holds from its pool slot (memcpy) and reads only the
+  rest from SSD. The same bytes land in the same slots and the kernels are unchanged, so replies are the same
+  tokens; the decode LRU is not changed by a window. `/health` `experts` gains `window_reads`, `window_copies` and
+  `copy_bytes`. `TENSORFOLD_POOL_WINDOW_REUSE=0` restores the 0.2.0 reads. Idea credit: resident-first expert
+  routing in oMLX's MoE expert offload (https://github.com/jundot/omlx, Apache-2.0); no oMLX code is used.
 
 ## 0.2.0 (10 Oct 2026)
 
