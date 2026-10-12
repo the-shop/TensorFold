@@ -3,43 +3,44 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
-## Unreleased
+## 0.3.0 (MLXFW, the-shop fork) — unreleased draft
+
+Faster prompts for Qwen3.8 Flash Next with SSD experts, the same tokens. Install with
+`pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"`.
+
+Measured on an M5 Max (128 GB) serving the 8-bit Flash Next checkpoint (`--ssd-experts 60 --ple-on-ssd --context
+77824 --parallel 1 --persist-turns --checkpoint-last-user`, 84 GiB budget), 0.2.0 and 0.3.0 back to back, two runs
+each, page cache evicted before every start, `TF_PREFILL_LAYER_MAJOR=1` on both (0.2.0 ignores it):
+- **Cold 24K-token prompt:** first token in 292-323 s on 0.2.0, 33-39 s on 0.3.0; expert bytes read 1,452 GB to
+  136 GB. This needs `TF_PREFILL_LAYER_MAJOR=1` (off by default). A separate 0.3.0 run with layer-major prompt
+  groups and window reuse both off took 152.8 s; the default settings' cold time was not measured.
+- **Resumed turns on the same server** (21.8-23.8K tokens cached): 5.3-6.9 s to 2.9-3.4 s. A fresh 0.3.0 server
+  resuming a 21.8K-token system block from disk took 4.85 s. A turn adding 1.5K tokens: 27.2-29.9 s to 7.3-8.1 s.
+- **Decode** (256-token replies): flat to +19% (15.00 to 14.95, 19.70 to 23.35, 21.55 to 22.85 tok/s).
+- **Page cache:** after a cold prompt the expert files keep ~18 GB cached on 0.2.0, 25 MB on 0.3.0.
+- **Memory:** peak process footprint 87.9 GB (81.8 GiB) against 87.1 GB on 0.2.0, 2.3 GB under the 84 GiB
+  (90.19 GB) budget; swap did not grow (0.2.0: +0.2 to +0.9 GB).
+- **Bits:** every reply's token hash equal across both builds and every configuration (45 of 45).
+
+Upgrading: prompt snapshots written by 0.2.0 are not loaded (one re-prefill per saved system block or
+conversation). The first start compiles the expert pool's host extension again.
+
+### Performance
 
 - **Page-cache-safe expert reads** (on by default; `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old reads). On
   macOS, an `F_NOCACHE` read at an unaligned file offset leaves all but its first MiB in the page cache, so about a
   third of every expert's bytes stayed there. Unaligned expert parts over about 1 MiB are now read as the
   page-aligned range around them into an aligned buffer and copied out: the same bytes, counters and output tokens,
-  and nothing cached. Each expert pool reads the variable once, when it is created (server start).
-- **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
-  (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
-  cold benchmarks.
-- **Credits:** [strata-mlx](https://github.com/yibie/strata-mlx) (MIT License, Copyright (c) 2026 yibie) for two
-  ideas: the finding that macOS `F_NOCACHE` reads still fill the page cache (`paged.py`, `ExpertStore.whole`), and
-  the no-sudo eviction technique (`msync(MS_INVALIDATE)` over a shared mapping, `bench/drop_cache.py`) that
-  `tools/page_cache.py evict` uses. No strata-mlx code was copied. The alignment cause (file offset and buffer) and
-  the aligned-superset read are TensorFold's own.
-- **Decode profiler (opt-in).** `TENSORFOLD_DECODE_PROFILE=<path.jsonl>` records, per decode round, host stamps at
-  points the round already passes, each expert-pool call (GPU signal seen, SSD reads, release, misses, bytes) and
-  the GPU start and end of the command buffers that carry the expert marks, with no added MLX op or eval (replies
-  are the same tokens). `TENSORFOLD_DECODE_PROFILE_SYNC=1` adds eval barriers for exact per-part GPU times.
-  `tools/decode_profile_report.py` turns the file into a per-round breakdown (dense GPU, routed-expert GPU, SSD
-  stall, host answer, Python-bound idle, head tail, MTP, gaps) and the TTFT phases of each request;
-  `tools/decode_health_delta.py` reads `/health` counters around requests; `tools/bench_flash_decode_parts.py`
-  measures the parts on random weights of the checkpoint's shapes. The `done` line's `draft=` and `post=` now report
-  settle and after-read time for single-stream rounds. The profiler never fails a reply or a model load: a write
-  error (missing directory, full disk, permission) or a C++ clock off Python's logs one line and turns it off.
-  `TENSORFOLD_DECODE_PROFILE_MAX_MB` (default 1024) caps the file, rotating it to `<path>.1`. Prompt chunks of 16
-  rows or fewer take the decode rows path and count in `/health` misses; the report attributes them to the prompt.
-  Idea credits (no code copied): the dense-versus-expert bytes-per-token analysis of
-  [strata-mlx](https://github.com/yibie/strata-mlx) (MIT) motivated the breakdown, and
-  [oMLX](https://github.com/jundot/omlx) (Apache-2.0) GPU keep-warm and overlap observations were consulted while
-  scoping it (no idle probe ships here).
-- **Steady KV pricing for Flash Next's sparse indexer.** Index keys and pooled blocks are priced per allocated
-  position, not per valid token, so one short request no longer inflates the admission profile and evicts or
-  refuses later long prompts (measured on the 8-bit model: after one 15-token request, the old pricing projected a
-  69,967-token prompt 4.03 GiB higher, 2.06 GB over the MLX budget, so it was refused; now it is served). Ported from upstream
-  [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (Apache-2.0; see
-  THIRD_PARTY_NOTICES.md). At 84 GiB the startup still picks 2,048-token prompt chunks.
+  and nothing cached. Credits: [strata-mlx](https://github.com/yibie/strata-mlx) (MIT License, Copyright (c) 2026
+  yibie) for the finding that macOS `F_NOCACHE` reads still fill the page cache (`paged.py`, `ExpertStore.whole`).
+  No strata-mlx code was copied; the alignment cause (file offset and buffer) and the aligned-superset read are
+  TensorFold's own.
+- **Prompt chunks reuse experts already in the decode pool** (on by default; `TENSORFOLD_POOL_WINDOW_REUSE=0`
+  restores the 0.2.0 reads). With `--ssd-experts`, a prompt chunk's layer window copies each routed expert that the
+  decode LRU already holds from its pool slot (memcpy) and reads only the rest from SSD. The same bytes land in the
+  same slots and the kernels are unchanged, so replies are the same tokens; the decode LRU is not changed by a
+  window. `/health` `experts` gains `window_reads`, `window_copies` and `copy_bytes`. Idea credit: resident-first
+  expert routing in [oMLX](https://github.com/jundot/omlx)'s MoE expert offload (Apache-2.0); no oMLX code is used.
 - **Layer-major prompt groups (`TF_PREFILL_LAYER_MAJOR=1`, off by default).** Flash Next's prompt chunks can run in
   groups, every chunk through a layer before the next layer, over the same chunk cuts and with the same per-call
   shapes, so replies, caches and saved prompt states are bit for bit those of chunk-by-chunk prefill while the SSD
@@ -47,33 +48,66 @@ GitHub has the full notes and the measurements behind them.
   assembled per layer as each layer passes the cut, and kept only once every expert-pool call of the group is
   answered without an error (a group whose SSD read failed keeps and saves none of them, as chunk-by-chunk prefill
   keeps nothing past a failed chunk). A group's carried activations are capped (`TF_PREFILL_GROUP_GIB`, default 1)
-  and counted in admission; a cancelled group keeps no half-filled state.
-  Known limit: a prompt cancelled while a group runs loses that whole group's progress (chunk by chunk keeps the
-  last finished chunk), so its retry recomputes the group; bits are unaffected, only the retry is slower.
-  Ideas credited: staggered segments and per-chunk state marks of the upstream TensorFold native engine
-  (ashhart/TensorFold, `zig/src/core/segments.zig`, `zig/src/flashnext/marks.zig`), expert-major prefill with
-  offloaded experts in oMLX, and strata-mlx's planned overlap of next-layer reads with compute. No code copied.
-- **Expert pool tripwire and call log.** Expert-pool calls alternate between two regions of the routing box; the
-  host clears a call's region once read and checks the next call's region is still clear before releasing it, so
-  a call whose routing arrives before the previous call was answered fails the request ("calls ran out of order").
-  A call two ahead shares a region and is not caught by this check; by analysis it ends in a pool timeout error
-  (slow, the request still fails). The engine orders its calls so neither happens; this is a backstop. The Python
-  serve loop now keeps the first pool error (as the native server does) and clears a failed call's region, so the
-  real cause is reported instead of "calls ran out of order".
-  `TF_POOL_JOBLOG=path` logs every pool call's host time, GPU gap and bytes (diagnostics, off by default).
-- **Out-of-bounds reads fixed (det).** The Flash-Next expert down kernels (`expert_down_y`, the streamed pool's
-  `down`) read past the activation row for expert widths below 512 and past both buffers above 1,024: test models
-  (width 64 or 128) gave different bits run to run. Narrower rows now take a variant whose idle lanes read nothing;
-  widths above 1,024 or not a whole number of quantization groups (32 inputs at 4 bits, 64 at 8) are refused.
-  Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640) compile from the unchanged source, so their replies are the
-  same tokens. Own work, no third-party code (builds on TensorFold by ashhart).
+  and counted in admission; a cancelled group keeps no half-filled state. Known limit: a prompt cancelled while a
+  group runs loses that whole group's progress (chunk by chunk keeps the last finished chunk), so its retry
+  recomputes the group; bits are unaffected, only the retry is slower. Ideas credited, no code copied: staggered
+  segments and per-chunk state marks of the upstream TensorFold native engine
+  ([ashhart/TensorFold](https://github.com/ashhart/TensorFold), `zig/src/core/segments.zig`,
+  `zig/src/flashnext/marks.zig`), expert-major prefill with offloaded experts in oMLX, and strata-mlx's planned
+  overlap of next-layer reads with compute.
+
+### Correctness
+
+- **Steady KV pricing for Flash Next's sparse indexer.** Index keys and pooled blocks are priced per allocated
+  position, not per valid token, so one short request no longer inflates the admission profile and evicts or
+  refuses later long prompts (measured on the 8-bit model: after one 15-token request, the old pricing projected a
+  69,967-token prompt 4.03 GiB higher, 2.06 GB over the MLX budget, so it was refused; now it is served). At 84 GiB
+  the startup still picks 2,048-token prompt chunks. Ported from upstream
+  [ashhart/TensorFold](https://github.com/ashhart/TensorFold) commit 17e6390f (Apache-2.0; see
+  THIRD_PARTY_NOTICES.md).
+- **Out-of-bounds reads fixed in the expert down kernels.** The Flash Next expert down kernels (`expert_down_y`, the
+  streamed pool's `down`) read past the activation row for expert widths below 512 and past both buffers above
+  1,024: test models (width 64 or 128) gave different bits run to run. Narrower rows now take a variant whose idle
+  lanes read nothing; widths above 1,024 or not a whole number of quantization groups (32 inputs at 4 bits, 64 at
+  8) are refused. Widths 512 to 1,024 (the 8-bit Qwen checkpoint's 640) compile from the unchanged source, so their
+  replies are the same tokens.
 - **Token ids past the embedding are refused.** A rendered prompt holding an id the model's embedding lacks (a
   tokenizer larger than the checkpoint's vocabulary, e.g. a tiny test model) gets HTTP 400 (in a stream, an
   `invalid_request_error` event) instead of reading memory past the table; the server warns at load when the
   tokenizer has more ids than the embedding, and the Qwen4Exp prompt forward checks ids itself. The start-up memory
   probes (real text or their synthetic fallback), copied drafts (also negative ids) and MTP drafts leave such ids
-  out, so a mismatched pair still starts and drafts. Own work, no third-party code (builds on TensorFold by
-  ashhart).
+  out, so a mismatched pair still starts and drafts.
+- **Expert pool tripwire.** Expert-pool calls alternate between two regions of the routing box; the host clears a
+  call's region once read and checks the next call's region is still clear before releasing it, so a call whose
+  routing arrives before the previous call was answered fails the request ("calls ran out of order"). A call two
+  ahead shares a region and is not caught by this check; by analysis it ends in a pool timeout error (slow, the
+  request still fails). The engine orders its calls so neither happens; this is a backstop. The Python serve loop
+  now keeps the first pool error (as the native server does) and clears a failed call's region, so the real cause
+  is reported instead of "calls ran out of order".
+
+### Diagnostics
+
+- **Decode profiler (opt-in).** `TENSORFOLD_DECODE_PROFILE=<path.jsonl>` records, per decode round, host stamps at
+  points the round already passes, each expert-pool call (GPU signal seen, SSD reads, release, misses, bytes) and
+  the GPU start and end of the command buffers that carry the expert marks, with no added MLX op or eval (replies
+  are the same tokens). `TENSORFOLD_DECODE_PROFILE_SYNC=1` adds eval barriers for exact per-part GPU times;
+  `TENSORFOLD_DECODE_PROFILE_MAX_MB` (default 1024) caps the file, rotating it to `<path>.1`. The profiler never
+  fails a reply or a model load: a write error or a C++ clock off Python's logs one line and turns it off. Prompt
+  chunks of 16 rows or fewer take the decode rows path and count in `/health` misses; the report attributes them
+  to the prompt. The `done` line's `draft=` and `post=` now report settle and after-read time for single-stream
+  rounds. Tools: `tools/decode_profile_report.py` (per-round breakdown and each request's TTFT phases),
+  `tools/decode_health_delta.py` and `tools/bench_flash_decode_parts.py`; see the Flash Next recipe. Idea credits
+  (no code copied): the dense-versus-expert bytes-per-token analysis of strata-mlx (MIT) motivated the breakdown,
+  and oMLX (Apache-2.0) GPU keep-warm and overlap observations were consulted while scoping it (no idle probe
+  ships here).
+- **Pool call log.** `TF_POOL_JOBLOG=path` logs every expert-pool call's host time, GPU gap and bytes (off by
+  default).
+- **`tools/page_cache.py`.** `evict MODEL_DIR` drops a model's files from the page cache without sudo
+  (`msync(MS_INVALIDATE)`), and `resident MODEL_DIR [--experts]` reports how much of them is cached. Use it before
+  cold benchmarks. Credits: the no-sudo eviction technique (`msync(MS_INVALIDATE)` over a shared mapping,
+  `bench/drop_cache.py`) is strata-mlx's (MIT); no strata-mlx code was copied.
+
+### Snapshots
 
 - **Prompt snapshots survive bit-identical updates (Flash Next).** The snapshot key no longer hashes the family's
   source or names the release: it holds a declared `NUMERICS_VERSION`, the pinned environment (model path and
@@ -84,27 +118,29 @@ GitHub has the full notes and the measurements behind them.
   version bump, never reads them. The canary reruns when the installed code, OS, GPU, `TF_*`/`TENSORFOLD_*`/
   `MLX_*`/`QWEN_*`/`GLM_*` variables (a test checks the package reads no others) or load options
   (`--ssd-experts`, `--ple-on-ssd`, `--ple-cache-mib`, drafts, `--lane-kernels`, `--parallel`, `--context`,
-  memory) change, cached beside the snapshots otherwise; a malformed cache file is rewritten, and a canary
-  measured while the code changed on disk is not recorded.
-
-  Scope: the canary does not reach every path (long chunks, 1-4 row tails, sparse attention past 4096 keys, MTP,
-  SSD expert reads), so two tests catch *accidental* numerics edits at commit time.
+  memory) change, and is cached beside the snapshots otherwise; a malformed cache file is rewritten, and a canary
+  measured while the code changed on disk is not recorded. `TF_SNAPSHOT_KEY=strict` also pins the exact code.
+  Snapshots written by 0.2.0 are not loaded (one re-prefill).
+- **Numerics guards for contributors.** The canary does not reach every path (long chunks, 1-4 row tails, sparse
+  attention past 4096 keys, MTP, SSD expert reads), so two tests catch *accidental* numerics edits at commit time.
   `tests/test_numerics_golden.py` pins a tiny model's prompt-cache bits on cases across those sizes, per declared
-  version and environment (GPU, macOS, MLX, mlx-lm). It never re-records an existing entry, and it records a new
+  version and environment (GPU, macOS, MLX, mlx-lm); it never re-records an existing entry, and it records a new
   environment only for the code recorded as reviewed. `tests/test_numerics_reviewed.py` hashes, comments and
   docstrings aside, every file of the package except an allow-list of HTTP/admission code, argument parsing, the
   updater and docs, plus the golden's own generator; the allow-list and file list are in its fixture. It fails on
   any such edit until `NUMERICS_VERSION` is bumped or, with the golden passing unchanged, the edit is recorded
   with `TF_RECORD_NUMERICS_REVIEWED=1`. A deliberate re-record still takes only that command, so reviewers must
   treat any diff to `tests/fixtures/numerics_reviewed.json` or `tests/fixtures/numerics_golden.json` as a
-  `NUMERICS_VERSION` decision. `TF_SNAPSHOT_KEY=strict` also pins the exact code. Snapshots written by 0.2.0 are
-  not loaded (one re-prefill). Own work, building on TensorFold by ashhart.
-- **Prompt chunks reuse experts already in the decode pool.** With `--ssd-experts`, a prompt chunk's layer window
-  now copies each routed expert that the decode LRU already holds from its pool slot (memcpy) and reads only the
-  rest from SSD. The same bytes land in the same slots and the kernels are unchanged, so replies are the same
-  tokens; the decode LRU is not changed by a window. `/health` `experts` gains `window_reads`, `window_copies` and
-  `copy_bytes`. `TENSORFOLD_POOL_WINDOW_REUSE=0` restores the 0.2.0 reads. Idea credit: resident-first expert
-  routing in oMLX's MoE expert offload (https://github.com/jundot/omlx, Apache-2.0); no oMLX code is used.
+  `NUMERICS_VERSION` decision.
+
+### Docs
+
+- The Flash Next recipe lists every new variable (`TF_PREFILL_LAYER_MAJOR`, `TF_PREFILL_GROUP_GIB`,
+  `TENSORFOLD_POOL_ALIGNED_READS`, `TENSORFOLD_POOL_WINDOW_REUSE`, `TENSORFOLD_DECODE_PROFILE*`, `TF_POOL_JOBLOG`)
+  and the 0.3.0 measurements; older tables are marked as measured before 0.3.0.
+
+The out-of-bounds, token-id and snapshot-key changes are own work, with no third-party code; all of 0.3.0 builds on
+TensorFold by ashhart.
 
 ## 0.2.0 (10 Oct 2026)
 
