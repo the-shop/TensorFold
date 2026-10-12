@@ -6,7 +6,8 @@
 > seeding and an expert pack, a fix for short prompts on a tight memory budget, and request failure on pool errors;
 > see [docs/recipes/qwen3.8-flash-next.md](docs/recipes/qwen3.8-flash-next.md). v0.3.0 makes SSD-expert prompts
 > faster with the same tokens (page-cache-safe expert reads, expert reuse in prompt windows, opt-in layer-major
-> prompt groups) and keeps prompt snapshots across bit-identical updates; see [CHANGELOG.md](CHANGELOG.md).
+> prompt groups) and keeps Flash Next's prompt snapshots across bit-identical updates; see
+> [CHANGELOG.md](CHANGELOG.md).
 > Upstream's current engine is Zig (Apache-2.0); this fork is the Python engine.
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
