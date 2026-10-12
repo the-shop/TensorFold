@@ -216,6 +216,12 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
   `pread` a part, with nothing left in the page cache. `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old unaligned
   reads, which leave the tails cached (they also serve some repeat reads). The expert pool reads the variable once,
   when it is created at server start.
+- **Window reuse** (on by default): a prompt chunk's layer window copies each routed expert that the decode LRU
+  already holds from its pool slot and reads only the rest from SSD: the same bytes land in the same slots, so the
+  replies are the same tokens, and the decode LRU is not changed. `/health` reports `window_reads`,
+  `window_copies` and `copy_bytes` with the pool's hits and misses. `TENSORFOLD_POOL_WINDOW_REUSE=0` restores the
+  0.2.0 reads (every window expert from SSD). The expert pool reads the variable once, when it is created at server
+  start.
 - `python tools/page_cache.py evict MODEL_DIR` drops the checkpoint files from the page cache (no sudo; run it with
   no server holding the model), and `python tools/page_cache.py resident MODEL_DIR [--experts]` prints how many of
   their bytes (or of the routed experts' bytes) are cached. Evict before every cold benchmark.
