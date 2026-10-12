@@ -11,7 +11,7 @@ Create an environment and install the package:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.2.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"
 tensorfold --version
 tensorfold models
 ```
@@ -57,7 +57,7 @@ Start NVIDIA's container, then install and serve inside it:
 ```bash
 nvidia-smi
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.2.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"
 tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --name local-model --host 0.0.0.0 --port 8080
 ```
