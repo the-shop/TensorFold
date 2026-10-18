@@ -1,4 +1,4 @@
-"""The extension's pool server against the Python serve loop, and the contiguous expert pack, on real hostsync."""
+"""The extension's pool server against the Python serve loop, on real hostsync."""
 
 from __future__ import annotations
 
@@ -15,18 +15,17 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from tensorfold.streaming import pack as packs
 from tensorfold.streaming import pool
 
 LAYERS, EXPERTS, TOPK, BOX_ROWS = 3, 8, 2, 4
-# odd part sizes, unlike one another and far from the 16 KiB record alignment
+# odd part sizes, unlike one another
 SPECS = {"weight": ([5, 12], "U32", 4), "scales": ([5, 3], "BF16", 2), "biases": ([5, 3], "F16", 2)}
 PROJS = ("gate", "up", "down")
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in ("TENSORFOLD_EXPERT_PACK", "TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS",
+    for name in ("TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS",
                  "TENSORFOLD_POOL_WINDOW_REUSE"):
         monkeypatch.delenv(name, raising=False)
 
@@ -94,10 +93,10 @@ def names(per_expert: bool) -> dict:
     return out
 
 
-def make(hs, folder, slots, native, pack=False, per_expert=False, workers=4, reuse=None):
+def make(hs, folder, slots, native, per_expert=False, workers=4, reuse=None):
     found, shapes = pool.sources(folder, names(per_expert))
     s = pool.Streamer(found, shapes, layers=LAYERS, experts=EXPERTS, top_k=TOPK, slots=slots, box_rows=BOX_ROWS,
-                      hostsync=hs, workers=workers, native=native, pack=pack, window_reuse=reuse)
+                      hostsync=hs, workers=workers, native=native, window_reuse=reuse)
     assert s.native == native
     return s
 
@@ -186,7 +185,7 @@ def test_native_serves_exactly_as_python(hs, tmp_path, per_expert, slots, sequen
     for key in a:
         assert a[key] == b[key], key
     check_resident(hs, nat, truth)
-    assert nat.stats()["native"] == 1 and nat.stats()["packed"] == 0
+    assert nat.stats()["native"] == 1
     shared = ("hits", "misses", "bytes_read", "window_reads", "window_copies", "copy_bytes")
     assert {k: nat.stats()[k] for k in shared} == py.stats()
     assert (nat.window_copies > 0) == reuse
@@ -196,17 +195,14 @@ def test_native_serves_exactly_as_python(hs, tmp_path, per_expert, slots, sequen
     nat.close()
 
 
-@pytest.mark.parametrize("pack", [False, True])
 @pytest.mark.parametrize("slots,sequence", [(2 * EXPERTS + 3, SEQUENCE), (2 * EXPERTS, random_sequence(1, 150)),
                                             (3 * EXPERTS, random_sequence(4, 150))])
-def test_window_reuse_lands_the_same_bytes_and_leaves_the_lru_alone(hs, tmp_path, slots, sequence, pack):
+def test_window_reuse_lands_the_same_bytes_and_leaves_the_lru_alone(hs, tmp_path, slots, sequence):
     """Reuse on vs off, native and Python: every pool byte, the slot table, LRU, free list, window, hits and misses
     are the same; only window experts move from reads to copies, and bytes_read drops by exactly the bytes copied."""
 
     truth = write_checkpoint(tmp_path, seed=11)
-    if pack:
-        packs.build(pool.sources(tmp_path, names(False))[0], EXPERTS, tmp_path / packs.PACK_NAME)
-    runs = {(native, reuse): make(hs, tmp_path, slots, native=native, pack=pack and native, reuse=reuse)
+    runs = {(native, reuse): make(hs, tmp_path, slots, native=native, reuse=reuse)
             for native in (False, True) for reuse in (False, True)}
     for kind, layer, ids in sequence:
         for s in runs.values():
@@ -226,9 +222,8 @@ def test_window_reuse_lands_the_same_bytes_and_leaves_the_lru_alone(hs, tmp_path
         assert on.window_reads + on.window_copies == off.window_reads
         assert on.bytes_read == off.bytes_read - on.copy_bytes
         check_resident(hs, on, truth)
-    if not pack:
-        nat_on = runs[(True, True)]
-        assert nat_on.stats()["preads"] * per == 9 * nat_on.bytes_read          # copies are not preads
+    nat_on = runs[(True, True)]
+    assert nat_on.stats()["preads"] * per == 9 * nat_on.bytes_read              # copies are not preads
     for s in runs.values():
         s.close()
 
@@ -291,27 +286,12 @@ def test_after_a_failed_read_the_window_reads_instead_of_copying(hs, tmp_path):
         s.close()
 
 
-def test_preads_are_nine_an_expert_unpacked_and_one_packed(hs, tmp_path):
-    write_checkpoint(tmp_path)
-    found, _ = pool.sources(tmp_path, names(False))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    plain = make(hs, tmp_path, 2 * EXPERTS + 2, native=True, pack=False)
-    packed = make(hs, tmp_path, 2 * EXPERTS + 2, native=True, pack=True)
-    for s in (plain, packed):
-        call(hs, s, "rows", 0, [1, 2, 3, 3])
-        call(hs, s, "window", 1, [4, 5])
-    assert plain.stats()["preads"] == 5 * 9 and packed.stats()["preads"] == 5
-    assert plain.stats()["bytes_read"] == packed.stats()["bytes_read"] == 5 * pool.expert_nbytes(found, 0)
-    plain.close()
-    packed.close()
-
-
 def test_threads_come_from_the_environment(hs, tmp_path, monkeypatch):
     write_checkpoint(tmp_path)
     monkeypatch.setenv("TENSORFOLD_POOL_THREADS", "3")
     found, shapes = pool.sources(tmp_path, names(False))
     s = pool.Streamer(found, shapes, layers=LAYERS, experts=EXPERTS, top_k=TOPK, slots=2 * EXPERTS, box_rows=4,
-                      hostsync=hs, pack=False)
+                      hostsync=hs)
     assert s.native and s.stats()["threads"] == 3
     s.close()
     monkeypatch.setenv("TENSORFOLD_POOL_NATIVE", "0")
@@ -345,7 +325,7 @@ def test_a_pool_without_room_for_a_call_raises_memory_error_in_both(hs, tmp_path
     py.free = py.free[-2:]                                      # two decode slots
     nat = make(hs, tmp_path, 2 * EXPERTS, native=True)
     nat._server.close()
-    nat._server = nat._native(EXPERTS + 2, 2, False)            # the server over a pool with two decode slots
+    nat._server = nat._native(EXPERTS + 2, 2)                   # the server over a pool with two decode slots
     for s in (py, nat):
         call(hs, s, "rows", 0, [1, 2, 3, 3], ok=False)
         assert isinstance(s.error, MemoryError)
@@ -498,189 +478,6 @@ def test_stats_show_a_failed_pool(hs, tmp_path, native):
     call(hs, s, "rows", 0, [1, 99, 3, 4], ok=False)
     assert s.stats()["error"] == "ValueError: routed expert 99 is outside the model"
     s.close()
-
-
-# -- the pack --------------------------------------------------------------------------------------------------
-
-@pytest.mark.parametrize("per_expert", [False, True])
-def test_the_pack_holds_each_experts_parts_in_one_record(tmp_path, per_expert):
-    truth = write_checkpoint(tmp_path, per_expert, seed=4)
-    found, _ = pool.sources(tmp_path, names(per_expert))
-    out = packs.build(found, EXPERTS, tmp_path / "experts.pack", buffer_bytes=3 * packs.ALIGNMENT)   # 3-expert groups
-    lay = packs.validate(out, found, EXPERTS)
-    data = out.read_bytes()
-    assert len(data) == LAYERS * EXPERTS * packs.ALIGNMENT and lay.stride == packs.ALIGNMENT
-    assert lay.order == [(proj, part) for proj in sorted(PROJS) for part in pool.PARTS]
-    for (layer, e), parts in truth.items():
-        at = lay.record(layer, e)
-        assert data[at:at + lay.payload] == b"".join(parts[o] for o in lay.order)
-        assert data[at + lay.payload:at + lay.stride] == bytes(lay.stride - lay.payload)
-
-
-def test_the_tool_builds_and_checks_a_pack(tmp_path, capsys):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-    try:
-        import pack_experts
-    finally:
-        sys.path.pop(0)
-    write_checkpoint(tmp_path, seed=5)
-    assert pack_experts.main([str(tmp_path)]) == 0
-    assert (tmp_path / "experts.pack").is_file() and (tmp_path / "experts.pack.json").is_file()
-    assert pack_experts.main([str(tmp_path), "--check"]) == 0
-    assert "valid" in capsys.readouterr().out
-
-
-def test_a_stale_pack_is_refused(hs, tmp_path, monkeypatch):
-    write_checkpoint(tmp_path, seed=6)
-    found, _ = pool.sources(tmp_path, names(False))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    write_checkpoint(tmp_path, per_expert=True, seed=6)            # the checkpoint rewritten under the pack
-    found, _ = pool.sources(tmp_path, names(True))
-    with pytest.raises(packs.PackError, match="stale|differs"):
-        packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
-    s = make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)   # opt-in: not used unasked
-    assert s.pack_path is None and not s.stats()["packed"]
-    s.close()
-    for asked in (True, tmp_path / packs.PACK_NAME):
-        with pytest.raises(packs.PackError):
-            make(hs, tmp_path, 2 * EXPERTS, native=True, pack=asked, per_expert=True)
-    for value in ("1", str(tmp_path / packs.PACK_NAME)):
-        monkeypatch.setenv(packs.ENV, value)
-        with pytest.raises(packs.PackError):
-            make(hs, tmp_path, 2 * EXPERTS, native=True, pack=None, per_expert=True)
-
-
-def test_same_layout_new_bytes_is_refused(hs, tmp_path):
-    """The checkpoint rewritten with other weights in the same tensor table (a re-download, a new fine-tune)."""
-
-    write_checkpoint(tmp_path, seed=41)
-    found, _ = pool.sources(tmp_path, names(False))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    truth = write_checkpoint(tmp_path, seed=42)
-    found, _ = pool.sources(tmp_path, names(False))
-    with pytest.raises(packs.PackError):
-        packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
-    with pytest.raises(packs.PackError):
-        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=True)
-    s = make(hs, tmp_path, 2 * EXPERTS, native=True)                 # unpacked serves the new bytes
-    call(hs, s, "rows", 0, [1, 2, 3, 4])
-    check_resident(hs, s, truth)
-    s.close()
-
-
-def test_new_bytes_behind_the_same_size_inode_and_mtime_are_caught_by_the_sample(tmp_path):
-    write_checkpoint(tmp_path, seed=43)
-    found, _ = pool.sources(tmp_path, names(False))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    shard = min(tmp_path.glob("model-*.safetensors"))
-    before = shard.stat()
-    src, offset = pool.Streamer.source(found, 0, "gate", "weight", 0)      # a sampled part of expert 0
-    assert Path(src.path) == shard
-    with open(shard, "r+b") as f:                                          # in place: same inode and size
-        f.seek(offset)
-        f.write(bytes(255 - b for b in shard.read_bytes()[offset:offset + 16]))
-    os.utime(shard, ns=(before.st_atime_ns, before.st_mtime_ns))
-    after = shard.stat()
-    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
-    assert packs.source_hash(found) == json.loads(packs.index_path(tmp_path / packs.PACK_NAME).read_text())[
-        "source_hash"]
-    with pytest.raises(packs.PackError, match="differ"):
-        packs.validate(tmp_path / packs.PACK_NAME, found, EXPERTS)
-
-
-def test_a_checkpoint_changing_while_it_is_packed_leaves_no_pack(tmp_path):
-    write_checkpoint(tmp_path, seed=45)
-    found, _ = pool.sources(tmp_path, names(False))
-    shard = min(tmp_path.glob("model-*.safetensors"))
-
-    def touch(line):
-        if line.startswith("layer 0:"):                                  # mid-build: a file is replaced in place
-            st = shard.stat()
-            os.utime(shard, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
-
-    with pytest.raises(packs.PackError, match="changed while"):
-        packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME, progress=touch)
-    assert not list(tmp_path.glob("experts.pack*"))
-
-
-def test_a_corrupt_pack_record_is_refused(tmp_path):
-    write_checkpoint(tmp_path, seed=44)
-    found, _ = pool.sources(tmp_path, names(False))
-    out = packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    lay = packs.validate(out, found, EXPERTS)
-    with open(out, "r+b") as f:
-        f.seek(lay.record(2, EXPERTS - 1) + lay.part_offsets[4])
-        f.write(b"\xff" * 8)
-    with pytest.raises(packs.PackError, match="corrupt"):
-        packs.validate(out, found, EXPERTS)
-
-
-def test_a_truncated_pack_is_refused(tmp_path):
-    write_checkpoint(tmp_path)
-    found, _ = pool.sources(tmp_path, names(False))
-    out = packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    with open(out, "r+b") as f:
-        f.truncate(packs.ALIGNMENT)
-    with pytest.raises(packs.PackError, match="bytes"):
-        packs.validate(out, found, EXPERTS)
-
-
-@pytest.mark.parametrize("alignment", [1000, 2048, 3 * 4096])
-def test_an_odd_alignment_is_refused(hs, tmp_path, alignment, capsys):
-    write_checkpoint(tmp_path)
-    found, _ = pool.sources(tmp_path, names(False))
-    with pytest.raises(packs.PackError, match="power of two"):
-        packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME, alignment=alignment)
-    out = packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    index = json.loads(packs.index_path(out).read_text())
-    index["alignment"] = alignment                                        # an index edited or from another build
-    packs.index_path(out).write_text(json.dumps(index))
-    with pytest.raises(packs.PackError, match="power of two"):
-        packs.validate(out, found, EXPERTS)
-    with pytest.raises(packs.PackError):
-        make(hs, tmp_path, 2 * EXPERTS, native=True, pack=True)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-    try:
-        import pack_experts
-    finally:
-        sys.path.pop(0)
-    with pytest.raises(SystemExit):
-        pack_experts.main([str(tmp_path), "--alignment", str(alignment)])
-    assert "power of two" in capsys.readouterr().err
-
-
-def test_packs_are_opt_in(tmp_path):
-    write_checkpoint(tmp_path)
-    found, _ = pool.sources(tmp_path, names(False))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    assert packs.choose(tmp_path, {}) is None                              # a pack beside the checkpoint: unused
-    for off in ("0", "off", ""):
-        assert packs.choose(tmp_path, {packs.ENV: off}) is None
-    for on in ("1", "true"):
-        assert packs.choose(tmp_path, {packs.ENV: on}) == tmp_path / packs.PACK_NAME
-    assert packs.choose(tmp_path, {packs.ENV: "/x/y.pack"}) == Path("/x/y.pack")
-    assert packs.choose(tmp_path, {packs.ENV: "1"}, pack=False) is None
-    assert packs.choose(tmp_path, {}, pack=True) == tmp_path / packs.PACK_NAME
-
-
-@pytest.mark.parametrize("per_expert", [False, True])
-def test_packed_reads_land_the_same_bytes_as_unpacked_and_python(hs, tmp_path, per_expert):
-    truth = write_checkpoint(tmp_path, per_expert, seed=7)
-    found, _ = pool.sources(tmp_path, names(per_expert))
-    packs.build(found, EXPERTS, tmp_path / packs.PACK_NAME)
-    py = make(hs, tmp_path, 2 * EXPERTS + 1, native=False, per_expert=per_expert)
-    plain = make(hs, tmp_path, 2 * EXPERTS + 1, native=True, pack=False, per_expert=per_expert)
-    packed = make(hs, tmp_path, 2 * EXPERTS + 1, native=True, pack=True, per_expert=per_expert, workers=3)
-    assert packed.stats()["packed"] == 1 and packed.pack_path == tmp_path / packs.PACK_NAME
-    for kind, layer, ids in SEQUENCE + random_sequence(9, 120):
-        for s in (py, plain, packed):
-            call(hs, s, kind, layer, ids)
-    a, b, c = (snapshot(hs, s) for s in (py, plain, packed))
-    for key in a:
-        assert a[key] == b[key] == c[key], key
-    check_resident(hs, packed, truth)
-    for s in (py, plain, packed):
-        s.close()
 
 
 @pytest.mark.parametrize("native", [True, False])

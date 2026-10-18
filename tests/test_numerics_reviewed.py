@@ -329,7 +329,7 @@ def test_comments_docstrings_and_blank_space_keep_the_digest(tmp_path, edited):
     "src/tensorfold/engine/prefill_step.py", "src/tensorfold/engine/prefill_plan.py",
     "src/tensorfold/engine/prefix_snapshots.py", "src/tensorfold/engine/gpu_sampling.py",
     "src/tensorfold/kernels/qwen/dense/v1/lane_qmm.py", "src/tensorfold/families/qwen4_exp/mtp.py",
-    "src/tensorfold/streaming/pack.py", "src/tensorfold/server/scheduler.py", KERNEL,
+    "src/tensorfold/streaming/pool.py", "src/tensorfold/server/scheduler.py", KERNEL,
     "tests/numerics_tiny.py", "tests/test_numerics_golden.py", "tests/test_numerics_reviewed.py",
 ])
 def test_a_code_edit_anywhere_a_prefill_runs_moves_the_digest(tmp_path, rel):

@@ -4,7 +4,7 @@
     python tools/page_cache.py evict MODEL_DIR
 
 ``resident`` prints each file's bytes in the page cache; ``--experts`` counts only the routed experts' byte ranges.
-``evict`` drops every *.safetensors (and experts.pack) of MODEL_DIR from the page cache, then prints residency. Run it
+``evict`` drops every *.safetensors of MODEL_DIR from the page cache, then prints residency. Run it
 before every cold SSD benchmark, with no server holding the model open: F_NOCACHE reads skip caching new pages but
 still serve pages already resident, so a "cold" run otherwise reads whatever earlier runs left behind."""
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import mmap
 import os
 import sys
@@ -89,19 +90,35 @@ def evict(path: str | Path) -> None:
 
 
 def model_files(model_dir: Path) -> list[Path]:
-    """The checkpoint shards and expert pack of ``model_dir`` (regular files only: mmap refuses anything else)."""
+    """The checkpoint shards of ``model_dir`` (regular files only: mmap refuses anything else)."""
+
+    return sorted(p for p in Path(model_dir).glob("*.safetensors") if p.is_file())
+
+
+def model_experts(model_dir: Path) -> tuple[dict, int]:
+    """(routed expert tensor names by key, experts a layer) as the family serving ``model_dir`` streams them."""
 
     model_dir = Path(model_dir)
-    return sorted(p for p in [*model_dir.glob("*.safetensors"), *model_dir.glob("experts.pack")] if p.is_file())
+    config = json.loads((model_dir / "config.json").read_text())
+    text = config.get("text_config") or config
+    kind = str(config.get("model_type", ""))
+    if kind.startswith("glm5_next"):
+        from tensorfold.families.glm5_next.stream import expert_names as glm
+
+        return glm(model_dir, int(text["num_hidden_layers"])), int(text["n_routed_experts"])
+    if kind.startswith("qwen4_exp"):
+        from tensorfold.families.qwen4_exp.stream import expert_names as qwen
+
+        return qwen(int(text["num_hidden_layers"])), int(text["num_experts"])
+    raise ValueError(f"no SSD expert streaming for model_type {kind!r}")
 
 
 def expert_ranges(model_dir: Path) -> dict[Path, list[tuple[int, int]]]:
     """Each file's routed-expert byte ranges [(offset, nbytes)], as the expert pool reads them."""
 
-    from tensorfold.streaming import pack as packs
     from tensorfold.streaming.pool import sources
 
-    names, experts = packs.model_experts(model_dir)
+    names, experts = model_experts(model_dir)
     found, _ = sources(model_dir, names)
     out: dict[Path, list[tuple[int, int]]] = {}
     for key, src in found.items():               # (layer, proj, part) a stack of every expert, else one expert
@@ -118,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     model_dir = args.model_dir.expanduser().resolve()
     files = model_files(model_dir)
     if not files:
-        print(f"no *.safetensors or experts.pack in {model_dir}", file=sys.stderr)
+        print(f"no *.safetensors in {model_dir}", file=sys.stderr)
         return 1
     ranges = expert_ranges(model_dir) if args.experts else {}     # reads the headers: before an eviction
     if args.action == "evict":

@@ -124,7 +124,7 @@ def test_the_checkpoints_decoder_experts_are_named_and_counted(tmp_path):
 
 
 @needs_metal
-@pytest.mark.parametrize("native", ["1", "0", "packed"])
+@pytest.mark.parametrize("native", ["1", "0"])
 def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, native):
     from tensorfold.streaming import build
 
@@ -143,12 +143,6 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, nativ
         resident = weights.load_backbone(folder)
         streamed = weights.load_backbone(folder, stream=True)
         per = expert_nbytes(sources(folder, stream.expert_names(folder, 6))[0], 1)
-        if native == "packed":                                           # the pack beside the checkpoint
-            from tensorfold.streaming import pack
-
-            names, experts = pack.model_experts(folder)
-            pack.build(sources(folder, names)[0], experts, folder / pack.PACK_NAME)
-            monkeypatch.setenv(pack.ENV, "1")                            # packs are opt-in
         streamer = stream.attach(streamed, folder, (2 * 8 + 4) * per / 2**30)     # a layer's window, 12 LRU slots
         prompt = mx.array(np.random.default_rng(5).integers(0, glm5_fakes.VOCAB, 40), dtype=mx.uint32)
         caches = [resident.make_cache(), streamed.make_cache()]
@@ -159,7 +153,6 @@ def test_streamed_experts_give_the_resident_forward(tmp_path, monkeypatch, nativ
             outs = [m.hidden(step, c) for m, c in zip((resident, streamed), caches)]
             assert same(outs[1], outs[0]), rows
         assert streamer.misses > 0 and streamer.error is None and streamer.native == (native != "0")
-        assert streamer.stats().get("packed", 0) == (native == "packed")
         streamer.close()
     finally:
         mx.set_default_device(previous)

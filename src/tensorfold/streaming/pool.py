@@ -118,14 +118,14 @@ def _uncached(path: Path) -> int:
 class Streamer:
     """Slots [0, E): one layer's window (expert e in slot e) for prompt chunks; [E, S): an LRU for decode rows.
 
-    With an extension that has one, the extension's PoolServer serves the calls (no Python per call); otherwise the Python thread below does. Both keep the same LRU, slots and
-    counters for the same calls. A window expert already in the LRU is copied from its slot instead of read
-    (``window_reuse``; None follows TENSORFOLD_POOL_WINDOW_REUSE), which leaves the LRU as it was. ``pack`` (opt-in, native only): None follows TENSORFOLD_EXPERT_PACK, False is
-    off, True is MODEL_DIR/experts.pack, a path is that pack; a pack in use must validate or the pool refuses it."""
+    With an extension that has one, the extension's PoolServer serves the calls (no Python per call); otherwise the
+    Python thread below does. Both keep the same LRU, slots and counters for the same calls. A window expert already
+    in the LRU is copied from its slot instead of read (``window_reuse``; None follows TENSORFOLD_POOL_WINDOW_REUSE),
+    which leaves the LRU as it was."""
 
     def __init__(self, found: dict, shapes: dict, *, layers: int, experts: int, top_k: int, slots: int,
                  box_rows: int, hostsync: Any, workers: int | None = None, native: bool | None = None,
-                 pack: str | Path | bool | None = None, window_reuse: bool | None = None) -> None:
+                 window_reuse: bool | None = None) -> None:
         if slots < 2 * experts:
             raise ValueError(f"the expert pool needs a layer's {experts} window slots plus as many for decode, "
                              f"got {slots}")
@@ -155,7 +155,6 @@ class Streamer:
         self.free = list(range(slots - 1, experts - 1, -1))
         self._server = None
         self._close_lock = threading.Lock()
-        self.pack_path: Path | None = None                              # the expert pack the native server reads
         self._error: BaseException | None = None
         self.hits = self.misses = self.bytes_read = 0
         self.aligned = aligned_reads()
@@ -174,7 +173,7 @@ class Streamer:
         if native and hasattr(hostsync, "PoolServer"):
             self._readers.shutdown(wait=False)
             try:
-                self._server = self._native(slots, workers, pack)
+                self._server = self._native(slots, workers)
                 self._server.set_regions(self.box_words)
             except BaseException:
                 for fd in self.fds.values():
@@ -221,10 +220,8 @@ class Streamer:
             dropped, self._prof_dropped = self._prof_dropped, 0
         return got, dropped
 
-    def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
-        """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
-
-        from tensorfold.streaming import pack as packs
+    def _native(self, slots: int, workers: int) -> Any:
+        """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset."""
 
         order = [(proj, part) for proj in self.pool for part in PARTS]
         fds = np.full((self.layers, self.experts, len(order)), -1, dtype=np.int32)
@@ -235,30 +232,10 @@ class Streamer:
                 for e in range(self.experts):
                     src, offset = self.source(self.found, layer, proj, part, e)
                     fds[layer, e, p], offsets[layer, e, p], sizes[p] = self.fds[src.path], offset, src.nbytes
-        server = self.hs.PoolServer(self.channel, self.boxes, self.slot_of,
-                                    [getattr(self.pool[proj], part) for proj, part in order], sizes,
-                                    fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
-                                    workers, TIMEOUT_MS, aligned=self.aligned, window_reuse=self.window_reuse)
-        path = packs.choose(self._model_dir(), pack=pack)
-        if path is None:
-            return server
-        lay = packs.validate(path, self.found, self.experts)
-        if lay.order != order or lay.part_nbytes != sizes:
-            raise packs.PackError(f"expert pack {path}: its part order or sizes differ from the pool's")
-        records = np.full((self.layers, self.experts), -1, dtype=np.int64)
-        for li, layer in enumerate(lay.layers):
-            records[layer] = (li * self.experts + np.arange(self.experts, dtype=np.int64)) * lay.stride
-        fd = _uncached(path)
-        self.fds[path] = fd
-        try:
-            server.set_pack(fd, records.tobytes(), lay.stride, lay.part_offsets, lay.alignment)
-        except ValueError as error:
-            raise packs.PackError(f"expert pack {path}: {error}") from None
-        self.pack_path = path
-        return server
-
-    def _model_dir(self) -> Path:
-        return Path(os.path.commonpath([str(Path(s.path).parent) for s in self.found.values()]))
+        return self.hs.PoolServer(self.channel, self.boxes, self.slot_of,
+                                  [getattr(self.pool[proj], part) for proj, part in order], sizes,
+                                  fds.tobytes(), offsets.tobytes(), self.layers, self.experts, self.top_k, slots,
+                                  workers, TIMEOUT_MS, aligned=self.aligned, window_reuse=self.window_reuse)
 
     @property
     def native(self) -> bool:
@@ -353,8 +330,8 @@ class Streamer:
             hits, misses, read, preads = self._server.counters()
             reads, copies, copied = self._server.window_counters()
             out = {"hits": int(hits), "misses": int(misses), "bytes_read": int(read), "window_reads": int(reads),
-                   "window_copies": int(copies), "copy_bytes": int(copied), "native": 1,
-                   "packed": int(self._server.packed()), "preads": int(preads), "threads": int(self._server.workers())}
+                   "window_copies": int(copies), "copy_bytes": int(copied), "native": 1, "preads": int(preads),
+                   "threads": int(self._server.workers())}
             return self._with_error(out)
         out = {"hits": int(self.hits), "misses": int(self.misses), "bytes_read": int(self.bytes_read),
                "window_reads": int(self.window_reads), "window_copies": int(self.window_copies),

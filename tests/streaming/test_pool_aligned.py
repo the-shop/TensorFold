@@ -25,7 +25,7 @@ darwin = pytest.mark.skipif(sys.platform != "darwin", reason="the F_NOCACHE page
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in ("TENSORFOLD_EXPERT_PACK", "TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS",
+    for name in ("TENSORFOLD_POOL_NATIVE", "TENSORFOLD_POOL_THREADS",
                  "TENSORFOLD_POOL_ALIGNED_READS"):
         monkeypatch.delenv(name, raising=False)
 

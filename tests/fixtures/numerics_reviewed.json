@@ -22,7 +22,7 @@
   "tool_parameters.py": "tool-call schemas",
   "update.py": "release checks"
  },
- "digest": "e5b76e9825649f07",
+ "digest": "813fa28f0f7bba56",
  "files": [
   "src/tensorfold/__init__.py",
   "src/tensorfold/cuda/__init__.py",
@@ -353,7 +353,6 @@
   "src/tensorfold/streaming/hostsync/CMakeLists.txt",
   "src/tensorfold/streaming/hostsync/__init__.py",
   "src/tensorfold/streaming/hostsync/hostsync.cpp",
-  "src/tensorfold/streaming/pack.py",
   "src/tensorfold/streaming/page_cache.py",
   "src/tensorfold/streaming/pool.py",
   "src/tensorfold/streaming/profile.py",

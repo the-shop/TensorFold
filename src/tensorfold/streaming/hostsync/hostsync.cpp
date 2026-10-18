@@ -337,7 +337,6 @@ class PoolServer {
     window_.assign(experts, -1);
     for (int s = slots - 1; s >= experts; --s) free_.push_back(s);
     readers_ = std::make_unique<Readers>(workers);
-    staging_.resize(workers);
     stages_ = std::vector<Stage>(workers);
     thread_ = std::thread([this] { serve(); });
   }
@@ -348,29 +347,6 @@ class PoolServer {
       close();
     } else {
       close();
-    }
-  }
-
-  // Reads each missing expert with one pread of the pack's record, then copies its parts into their slots.
-  void set_pack(int fd, nb::bytes offsets, size_t read_nbytes, std::vector<size_t> part_offsets, size_t alignment) {
-    std::lock_guard<std::mutex> lk(state_mu_);
-    size_t records = static_cast<size_t>(layers_) * experts_;
-    if (offsets.size() != records * sizeof(int64_t) || part_offsets.size() != dsts_.size() || alignment < 4096 ||
-        (alignment & (alignment - 1)) != 0 || read_nbytes % alignment != 0) {
-      throw std::invalid_argument("set_pack: the pack index does not match the pool");
-    }
-    for (size_t p = 0; p < part_offsets.size(); ++p) {
-      if (part_offsets[p] + part_nbytes_[p] > read_nbytes) throw std::invalid_argument("set_pack: a part passes its record");
-    }
-    pack_offsets_.resize(records);
-    std::memcpy(pack_offsets_.data(), offsets.c_str(), offsets.size());
-    pack_fd_ = fd;
-    pack_read_ = read_nbytes;
-    pack_parts_ = std::move(part_offsets);
-    pack_align_ = alignment;
-    for (auto& buf : staging_) {
-      std::free(buf);
-      buf = nullptr;
     }
   }
 
@@ -463,7 +439,6 @@ class PoolServer {
     regions_ = words;
   }
 
-  bool packed() const { return pack_fd_ >= 0; }
   bool aligned() const { return aligned_; }
   int workers() const { return readers_ ? readers_->size() : 0; }
 
@@ -483,10 +458,6 @@ class PoolServer {
     if (thread_.joinable()) thread_.join();
     readers_.reset();
     stopped_ = true;
-    for (auto& buf : staging_) {
-      std::free(buf);
-      buf = nullptr;
-    }
     for (auto& stage : stages_) stage.release();
   }
 
@@ -734,13 +705,9 @@ class PoolServer {
 
   void read_all_(int layer, const std::vector<std::pair<int, int>>& need) {
     size_t parts = dsts_.size();
-    if (pack_fd_ >= 0) {
-      readers_->run(need.size(), [&](size_t i, int worker) { read_packed(layer, need[i].first, need[i].second, worker); });
-    } else {
-      readers_->run(need.size() * parts, [&](size_t i, int worker) {
-        read_part(layer, need[i / parts].first, i % parts, need[i / parts].second, worker);
-      });
-    }
+    readers_->run(need.size() * parts, [&](size_t i, int worker) {
+      read_part(layer, need[i / parts].first, i % parts, need[i / parts].second, worker);
+    });
   }
 
   void read_part(int layer, int e, size_t p, int slot, int worker) {
@@ -750,23 +717,6 @@ class PoolServer {
                   aligned_, stages_[worker]);
     bytes_read_.fetch_add(part_nbytes_[p]);
     preads_.fetch_add(1);
-  }
-
-  void read_packed(int layer, int e, int slot, int worker) {
-    int64_t offset = pack_offsets_[static_cast<size_t>(layer) * experts_ + e];
-    if (offset < 0) throw PoolError("KeyError", "no packed record for layer " + std::to_string(layer));
-    uint8_t*& buf = staging_[worker];
-    if (buf == nullptr) {
-      void* p = nullptr;
-      if (posix_memalign(&p, pack_align_, pack_read_) != 0) throw std::bad_alloc();
-      buf = static_cast<uint8_t*>(p);
-    }
-    pread_full(pack_fd_, buf, pack_read_, offset);
-    preads_.fetch_add(1);
-    for (size_t p = 0; p < dsts_.size(); ++p) {
-      std::memcpy(dst_ptrs_[p] + static_cast<size_t>(slot) * part_nbytes_[p], buf + pack_parts_[p], part_nbytes_[p]);
-    }
-    bytes_read_.fetch_add(expert_nbytes_);
   }
 
   std::shared_ptr<Channel> channel_;
@@ -779,15 +729,10 @@ class PoolServer {
   std::vector<int64_t> offsets_;
   int layers_, experts_, top_k_, slots_;
   uint64_t timeout_ms_;
-  bool aligned_;                           // unpacked reads through aligned_pread's stage (no page-cache residue)
+  bool aligned_;                           // reads through aligned_pread's stage (no page-cache residue)
   std::vector<Stage> stages_;              // one aligned_pread stage per reader thread
   bool window_reuse_;
 
-  int pack_fd_ = -1;
-  std::vector<int64_t> pack_offsets_;
-  size_t pack_read_ = 0, pack_align_ = 0;
-  std::vector<size_t> pack_parts_;
-  std::vector<uint8_t*> staging_;          // one aligned record buffer per reader thread
 
   std::mutex state_mu_;                    // the LRU, free list and window
   std::list<std::pair<int64_t, int>> order_;   // (layer * E + expert, slot), oldest first
@@ -863,8 +808,6 @@ NB_MODULE(_hostsync, m) {
            nb::arg("fds"), nb::arg("offsets"), nb::arg("layers"), nb::arg("experts"), nb::arg("top_k"),
            nb::arg("slots"), nb::arg("workers"), nb::arg("timeout_ms"), nb::arg("aligned") = false,
            nb::arg("window_reuse") = true)
-      .def("set_pack", &PoolServer::set_pack, nb::arg("fd"), nb::arg("offsets"), nb::arg("read_nbytes"),
-           nb::arg("part_offsets"), nb::arg("alignment"))
       .def("submit", &PoolServer::submit, nb::arg("kind"), nb::arg("layer"), nb::arg("rows"), nb::arg("signal"),
            nb::arg("ready"))
       .def("error", &PoolServer::error)
@@ -875,7 +818,6 @@ NB_MODULE(_hostsync, m) {
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
       .def("set_regions", &PoolServer::set_regions, nb::arg("words"))
-      .def("packed", &PoolServer::packed)
       .def("aligned", &PoolServer::aligned)
       .def("workers", &PoolServer::workers)
       .def("profile", &PoolServer::profile, nb::arg("on"))
