@@ -300,10 +300,7 @@ class FusedDecode:
         if "streamer" in moe.__dict__:            # routed experts from the slot pool (--ssd-experts)
             from tensorfold.families.qwen4_exp import stream
 
-            guess = None
-            if moe.__dict__["streamer"].decode_prefetch and index + 1 < len(self.layers) and rows <= step:
-                guess = experts.router(x, self.layers[index + 1]["moe"][1])     # llama.cpp's next-layer guess
-            return stream.moe_rows(moe, x, logits, (se.gate_proj, se.up_proj, se.down_proj), guess)
+            return stream.moe_rows(moe, x, logits, (se.gate_proj, se.up_proj, se.down_proj))
         act, picks, weights = experts.expert_gateup(x, logits, cfg.num_experts_per_tok, cfg.num_experts, sw.gate_proj,
                                                     sw.up_proj, shared=(se.gate_proj, se.up_proj))
         return "grouped", (experts.expert_down_y(act, picks, sw.down_proj, se.down_proj), weights, logits)

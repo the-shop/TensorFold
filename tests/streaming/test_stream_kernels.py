@@ -62,3 +62,17 @@ def test_slot_kernels_equal_the_resident_kernels_bit_for_bit():
     assert np.array_equal(np.array(box).reshape(rows, top), np.array(picks))
     for a, b in ((picks, picks2), (weights, weights2), (act, act2), (y, y2)):
         assert bool(mx.array_equal(a, b).item())
+
+
+def test_the_present_kernel_flags_each_routed_expert_once():
+    from tensorfold.families.qwen4_exp import stream
+    from tensorfold.kernels.qwen.flash_next.v1.base import kernel
+
+    ne = 16
+    ids = mx.array([3, 3, 5, 0, 3, 15, 5], dtype=mx.uint32)
+    box = mx.full((ne,), 7, dtype=mx.uint32)
+    mx.eval(box)
+    run = kernel("q4_stream_present", stream._PRESENT, ["IDS", "BOX"], ["OUT"])
+    mx.eval(run(inputs=[ids, box], template=[("NE", ne), ("N", int(ids.size))], grid=(1024, 1, 1),
+                threadgroup=(1024, 1, 1), output_shapes=[(1,)], output_dtypes=[mx.uint32])[0])
+    assert np.array(box).tolist() == [int(e in (0, 3, 5, 15)) for e in range(ne)]

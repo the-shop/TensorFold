@@ -33,8 +33,7 @@ def _write_failures(app: Any) -> dict[str, int]:
 
 
 def _expert_stats(app: Any) -> dict | None:
-    """The --ssd-experts pool's slot hits, misses and bytes read since start (with decode prefetch or prompt seeding
-    on, their counters too), or None without a pool."""
+    """The --ssd-experts pool's slot hits, misses and bytes read since start, or None without a pool."""
 
     model = getattr(app, "_model", None)
     inner = getattr(model, "model", model)

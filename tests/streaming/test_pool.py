@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import threading
+from collections import OrderedDict
 
 import numpy as np
 import pytest
@@ -177,4 +178,52 @@ def test_a_window_expert_in_the_lru_is_copied_from_its_slot(tmp_path):
             for part, size in (("weight", 32), ("scales", 8), ("biases", 8)):
                 got = fake.buf(getattr(s.pool[proj], part))[e * size:(e + 1) * size]
                 assert (got == 16 + e).all(), (e, proj, part)
+    s.close()
+
+
+class ReferenceLRU:
+    """The decode LRU as a plain reference: least recent evicted first, never an expert of the current call."""
+
+    def __init__(self, slots):
+        self.lru, self.free = OrderedDict(), list(range(slots - 1, EXPERTS - 1, -1))
+        self.hits = self.misses = 0
+        self.table = {}
+
+    def load(self, layer, ids):
+        for e in ids:
+            slot = self.lru.pop((layer, e), None)
+            if slot is None:
+                if self.free:
+                    slot = self.free.pop()
+                else:
+                    keep = {(layer, i) for i in ids}
+                    victim = next(k for k in self.lru if k not in keep)
+                    slot = self.lru.pop(victim)
+                self.misses += 1
+            else:
+                self.hits += 1
+            self.lru[(layer, e)] = slot
+            self.table[(layer, e)] = slot
+
+
+SEQUENCE = [("rows", 0, [1, 2, 3, 4]), ("window", 1, [0, 5]), ("rows", 1, [5, 6, 7, 0]), ("rows", 2, [1, 1, 3, 3]),
+            ("rows", 0, [2, 7, 4, 6]), ("rows", 2, [0, 4, 5, 6]), ("window", 0, [2]), ("rows", 1, [1, 2, 3, 4])]
+
+
+def test_the_lru_is_the_reference_lru_slot_for_slot(tmp_path):
+    s, fake = streamer(tmp_path, slots=2 * EXPERTS + 3)
+    ref = ReferenceLRU(2 * EXPERTS + 3)
+    for kind, layer, ids in SEQUENCE:
+        call(s, fake, kind, layer, ids)
+        if kind == "rows":
+            ref.load(layer, sorted(set(ids)))
+    assert list(s.lru.items()) == list(ref.lru.items())
+    assert s.free == ref.free and (s.hits, s.misses) == (ref.hits, ref.misses)
+    table = np.frombuffer(fake.buf(s.slot_of), dtype=np.int32).reshape(LAYERS, EXPERTS)
+    for (layer, e), slot in ref.table.items():
+        assert table[layer, e] == slot
+    assert s.stats() == {"hits": ref.hits, "misses": ref.misses, "bytes_read": s.bytes_read,
+                         "window_reads": s.window_reads, "window_copies": s.window_copies,
+                         "copy_bytes": s.copy_bytes}
+    assert (s.window_reads, s.window_copies) == (2, 1)                  # (0, 2) was resident: copied
     s.close()

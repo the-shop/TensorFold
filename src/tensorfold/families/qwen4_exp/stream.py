@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import os
 from pathlib import Path
 from typing import Any
 
@@ -26,30 +25,6 @@ _PRESENT = r"""
   if (t == 0) OUT[0] = 1u;
 """
 
-# _PRESENT with counts: the box's first E words become how many routed rows picked each expert (prompt seeding)
-_COUNT = r"""
-  const uint t = thread_position_in_threadgroup.x;
-  device uint32_t* box = (device uint32_t*)BOX;
-  for (uint e = t; e < uint(NE); e += 1024) box[e] = 0u;
-  threadgroup_barrier(mem_flags::mem_device);
-  for (uint i = t; i < uint(N); i += 1024)
-    atomic_fetch_add_explicit((device atomic_uint*)&box[IDS[i]], 1u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_device);
-  if (t == 0) OUT[0] = 1u;
-"""
-
-
-def pool_flags(env: dict | None = None) -> tuple[int, int]:
-    """(decode prefetch k, prompt seed experts a layer) from TENSORFOLD_POOL_DECODE_PREFETCH (0..16) and
-    TENSORFOLD_POOL_PROMPT_SEED=1 (TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER, default 32); both off by default."""
-
-    env = os.environ if env is None else env
-    prefetch = min(16, max(0, int(env.get("TENSORFOLD_POOL_DECODE_PREFETCH", "0") or 0)))
-    seed = 0
-    if int(env.get("TENSORFOLD_POOL_PROMPT_SEED", "0") or 0) > 0:
-        seed = max(1, int(env.get("TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER", "32") or 32))
-    return prefetch, seed
-
 
 def expert_names(layers: int) -> dict[tuple[int, str, str], str]:
     return {(i, proj, part): f"language_model.model.layers.{i}.mlp.switch_mlp.{proj}_proj.{part}"
@@ -70,10 +45,8 @@ def attach(model: Any, model_dir: Path, gib: float) -> Streamer:
     cfg = model.args
     found, shapes = sources(model_dir, expert_names(cfg.num_hidden_layers))
     slots = int(gib * 2**30) // expert_nbytes(found, 0)
-    prefetch, seed = pool_flags()
     streamer = Streamer(found, shapes, layers=cfg.num_hidden_layers, experts=cfg.num_experts,
-                        top_k=cfg.num_experts_per_tok, slots=slots, box_rows=PREFILL_ROWS, hostsync=hostsync(),
-                        decode_prefetch=prefetch, prompt_seed=seed)
+                        top_k=cfg.num_experts_per_tok, slots=slots, box_rows=PREFILL_ROWS, hostsync=hostsync())
     for index, layer in enumerate(model.layers):
         moe = layer.mlp
         moe.__dict__["streamer"] = streamer
@@ -86,23 +59,15 @@ def attach(model: Any, model_dir: Path, gib: float) -> Streamer:
     return streamer
 
 
-def moe_rows(moe: Any, x: mx.array, logits: mx.array, shared: tuple[Any, Any, Any],
-             guess_logits: mx.array | None = None) -> tuple[str, tuple[mx.array, ...]]:
-    """FusedDecode's MoE for streamed experts: the resident kernels' arithmetic, weights read through slots.
-
-    ``guess_logits``: the next layer's router on this layer's input; its top decode_prefetch ids go to the host
-    with this call's routing, for reads behind it (they change what is resident, never what is computed)."""
+def moe_rows(moe: Any, x: mx.array, logits: mx.array, shared: tuple[Any, Any, Any]) -> tuple[str, tuple[mx.array, ...]]:
+    """FusedDecode's MoE for streamed experts: the resident kernels' arithmetic, weights read through slots."""
 
     from tensorfold.kernels.qwen.flash_next.v1 import stream_experts
 
     streamer, layer = moe.__dict__["streamer"], moe.__dict__["stream_layer"]
     cfg_top = moe.top_k
     token = stream_experts.route(logits, cfg_top, streamer.box)
-    guess = 0
-    if guess_logits is not None and streamer.decode_prefetch:
-        guess = streamer.decode_prefetch
-        token = mx.depends([token], [stream_experts.route(guess_logits, guess, streamer.guess_box)])[0]
-    token = streamer.hold(token, "rows", layer, int(x.shape[0]), guess)
+    token = streamer.hold(token, "rows", layer, int(x.shape[0]))
     slot_of, layer_id = mx.depends([streamer.slot_of, streamer.layer_ids[layer]], [token])
     pool = _Pool(streamer.pool)
     gate, up, down = shared
@@ -121,8 +86,7 @@ def moe_chunk(moe: Any, x: mx.array) -> mx.array:
     streamer, layer = moe.__dict__["streamer"], moe.__dict__["stream_layer"]
     experts, weights = moe.route(x)
     ids = experts.reshape(-1).astype(mx.uint32)
-    present = (kernel("q4_stream_count", _COUNT, ["IDS", "BOX"], ["OUT"]) if streamer.prompt_seed else
-               kernel("q4_stream_present", _PRESENT, ["IDS", "BOX"], ["OUT"]))
+    present = kernel("q4_stream_present", _PRESENT, ["IDS", "BOX"], ["OUT"])
     token = present(inputs=[ids, streamer.box], template=[("NE", streamer.experts), ("N", int(ids.size))],
                     grid=(1024, 1, 1), threadgroup=(1024, 1, 1), output_shapes=[(1,)], output_dtypes=[mx.uint32])[0]
     token = streamer.hold(token, "window", layer, int(x.shape[1]))
@@ -146,4 +110,4 @@ class _Pool:
         self.gate, self.up, self.down = pool["gate"], pool["up"], pool["down"]
 
 
-__all__ = ["attach", "expert_names", "moe_chunk", "moe_rows", "pool_flags", "switch_keys"]
+__all__ = ["attach", "expert_names", "moe_chunk", "moe_rows", "switch_keys"]

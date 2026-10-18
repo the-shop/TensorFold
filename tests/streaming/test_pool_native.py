@@ -321,16 +321,6 @@ def test_threads_come_from_the_environment(hs, tmp_path, monkeypatch):
     s.close()
 
 
-def test_prefetch_or_seed_keeps_the_python_loop(hs, tmp_path):
-    write_checkpoint(tmp_path)
-    found, shapes = pool.sources(tmp_path, names(False))
-    for flags in ({"decode_prefetch": 2}, {"prompt_seed": 4}):
-        s = pool.Streamer(found, shapes, layers=LAYERS, experts=EXPERTS, top_k=TOPK, slots=3 * EXPERTS, box_rows=4,
-                          hostsync=hs, native=True, **flags)
-        assert not s.native
-        s.close()
-
-
 # -- errors ----------------------------------------------------------------------------------------------------
 
 def test_a_routed_id_outside_the_model_stops_both_alike(hs, tmp_path):
