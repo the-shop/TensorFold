@@ -383,7 +383,7 @@ def prefetch_ngrams(model: Qwen4Exp) -> None:
 
 
 def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
-         ssd_experts: float | None = None, ple_cache_mib: int = 0) -> tuple[Qwen4Exp, Any]:
+         ssd_experts: float | None = None) -> tuple[Qwen4Exp, Any]:
     from mlx_lm.utils import load_tokenizer
 
     on_host = ngrams_on_host(model_dir, ple_on_ssd)
@@ -402,26 +402,16 @@ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
 
         weights = {k: v for k, v in weights.items() if not stream.switch_keys(k)}    # read into the pool instead
     if on_host:
-        from tensorfold.families.qwen4_exp import host_table, ssd_table
+        from tensorfold.families.qwen4_exp import host_table
 
-        tables = [(p, m) for p, m in model.named_modules() if isinstance(m, NGramEmbedding)]
-        # --ple-cache-mib: the tables share it evenly, each in a row cache of its own
-        cache = ssd_table.cache_share(ple_cache_mib, len(tables)) if ple_on_ssd else 0
-        for path, emb in tables:
+        for path, emb in [(p, m) for p, m in model.named_modules() if isinstance(m, NGramEmbedding)]:
             emb.shards = []
             emb.host = host_table.ReadAhead(host_table.from_checkpoint(
-                model_dir, f"language_model.{path}.ngram_embedding", len(emb.shard_starts) - 1, ssd=ple_on_ssd,
-                cache_bytes=cache))
+                model_dir, f"language_model.{path}.ngram_embedding", len(emb.shard_starts) - 1, ssd=ple_on_ssd))
             emb.quant_bits = emb.host.wrow * 8 // emb.dims            # the tables' own width and group
             emb.quant_group = emb.dims * 2 // emb.host.grow
             if emb.host.rows != emb.shard_starts[-1]:
                 raise ValueError(f"{path}: n-gram tables hold {emb.host.rows} rows, expected {emb.shard_starts[-1]}")
-        held = {path: emb.host.table for path, emb in tables if getattr(emb.host.table, "cache", None) is not None}
-        if held:
-            model.__dict__["ple_caches"] = held                 # read by /health; absent without --ple-cache-mib
-            total = ssd_table.cache_stats(held)["total"]
-            print(f"[tensorfold] n-gram row cache: {len(held)} table(s), {total['bytes'] / 2**20:,.1f} MiB, "
-                  f"{total['slots']:,} rows", flush=True)
         weights = {k: v for k, v in weights.items() if ".ple_embedding.shards." not in k}
     if not lazy:
         mx.eval(list(weights.values()))

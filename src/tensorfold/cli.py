@@ -115,9 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "instead of holding them in memory. A trade: a few percent of decode speed for about "
                             "40 GiB less at peak (the tables are 29.8 GiB); a 128 GB Mac needs it")
     speed.add_argument("--ple-cache-mib", type=int, default=0, metavar="MIB",
-                       help="with --ple-on-ssd on a Mac: keep n-gram rows read recently in this many MiB of RAM "
-                            "(rows and their index, all counted in the memory budget; 0: off) and read only the "
-                            "others from SSD. The rows are the checkpoint's own bytes, so output is the same")
+                       help="ignored since 0.3.1 (the n-gram row cache is gone); removed in 0.4.0")
 
     speed.add_argument("--no-update-check", action="store_true",
                        help="don't ask GitHub whether a newer release exists (also TENSORFOLD_NO_UPDATE_CHECK=1)")
@@ -447,15 +445,6 @@ def _declared_model_id(family: Any, model: Any, tokenizer: Any, plan: Any, model
                              weights=weights, canary_value=value, strict=numerics.strict_requested())
 
 
-def _host_reserve(args: argparse.Namespace) -> int:
-    """The process's bytes outside MLX's buffers: PROCESS_BYTES, and the n-gram row cache's arena."""
-
-    from tensorfold.server.memory_budget import PROCESS_BYTES
-
-    held = getattr(args, "ple_cache_bytes", None)       # the caches' bytes on this checkpoint, set by cmd_serve
-    return PROCESS_BYTES + (int(held) if held is not None else int(getattr(args, "ple_cache_mib", 0) or 0) * 1024**2)
-
-
 def _parallel(value: Any) -> int:
     """``--parallel``: "auto" is up to 8 requests at once; a number caps it."""
 
@@ -487,11 +476,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                          f"{family.title} does not")
     if args.ple_on_ssd and not hasattr(family.package, "ple_bytes"):
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
-    if args.ple_cache_mib < 0 or (args.ple_cache_mib and not args.ple_on_ssd):
-        raise ValueError("--ple-cache-mib takes 0 or a positive MiB count, and caches rows only with --ple-on-ssd")
+    if args.ple_cache_mib > 0:
+        print("[tensorfold] --ple-cache-mib is ignored since 0.3.1 and will be removed in 0.4.0", flush=True)
     backend = _backend(args.backend, family)
-    if args.ple_cache_mib and backend == "cuda":
-        raise ValueError("--ple-cache-mib caches the n-gram rows of the Mac (MLX) loader only; drop it on CUDA")
     _check_serve_options(args, family, backend, config_dir)
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)
@@ -511,14 +498,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if needs_full_snapshot and check is not None:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
 
-    sizer = getattr(family.package, "ple_cache_bytes", None)
-    if args.ple_cache_mib and sizer is not None:           # refused or capped before any weights load
-        args.ple_cache_bytes = sizer(model_dir, args.ple_cache_mib)
-        if args.ple_cache_bytes < args.ple_cache_mib * 1024**2 - 1024:      # less than shares rounded down: capped
-            print(f"[tensorfold] --ple-cache-mib {args.ple_cache_mib:,}: the n-gram tables and their index take "
-                  f"{args.ple_cache_bytes / 1024**2:,.1f} MiB, so the cache holds them whole and reserves only that",
-                  flush=True)
-
     stacks.start()          # `kill -USR1 <pid>` prints every thread's Python stack: where a silent server waits
     if backend == "cuda":
         return _serve_cuda(args, family, model_dir, context)
@@ -529,17 +508,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from tensorfold.server.memory_budget import PROCESS_BYTES, budget_ceiling, configure_mlx, model_fraction, raise_hint
 
     fraction = model_fraction(family.package)
-    reserve = _host_reserve(args)
+    reserve = PROCESS_BYTES
     memory_limit = configure_mlx(mx, int(float(args.mlx_cache_gib) * 1024**3), fraction=fraction,
                                  reserve_bytes=reserve)
     gib = 1024**3
-    rows = f" and {(reserve - PROCESS_BYTES) / 1024**2:,.1f} MiB of cached n-gram rows" if args.ple_cache_mib else ""
     note = f" ({fraction:.0%} of RAM, this model's allowance)" if fraction > MEMORY_FRACTION else ""
     ceiling = budget_ceiling(mx)
     more = f"; TENSORFOLD_MEMORY_LIMIT_GB can raise it to {ceiling / gib:.1f}" if ceiling > memory_limit + gib else ""
     print(f"[tensorfold] memory budget {memory_limit / gib:.1f} GiB{note}: MLX's buffers up to "
           f"{(memory_limit - reserve) / gib:.1f} GiB, {PROCESS_BYTES / gib:.0f} GiB for the rest of the process"
-          f"{rows}{more}", flush=True)
+          f"{more}", flush=True)
     checkpoint = sum(path.stat().st_size for path in Path(model_dir).glob("*.safetensors"))
     estimate = getattr(family.package, "weight_bytes", None)
     weights = checkpoint if estimate is None else estimate(model_dir, ple_on_ssd=args.ple_on_ssd)
@@ -576,8 +554,6 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         options["mtp_drafts"] = int(args.mtp_drafts)
     if args.ple_on_ssd:
         options["ple_on_ssd"] = True
-    if args.ple_cache_mib:
-        options["ple_cache_mib"] = int(args.ple_cache_mib)
     if args.ssd_experts is not None:
         options["ssd_experts"] = float(args.ssd_experts)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
@@ -594,7 +570,9 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
     from tensorfold.server.residency import unwire, wire_resident
 
     getattr(model, "release_rounds", lambda: None)()       # load-time checks' rows go before the weights are wired
-    reserve = _host_reserve(args)
+    from tensorfold.server.memory_budget import PROCESS_BYTES
+
+    reserve = PROCESS_BYTES
     wired = wire_resident(mx, memory_limit - reserve)
     print(f"[tensorfold] {wired / 1024**3:.1f} GiB of weights kept resident", flush=True)
     # prompt chunks start where replies begin too, so a follow-up resumes where its latest reply began

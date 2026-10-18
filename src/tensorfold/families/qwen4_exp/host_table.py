@@ -402,10 +402,8 @@ def read_header(path: Path) -> dict:
     return header
 
 
-def from_checkpoint(model_dir: Path, name: str, count: int, *, ssd: bool = False,
-                    cache_bytes: int = 0) -> HostTable | SSDTable:
-    """Shards ``{name}.shard_{i}``, i < count, each in one file: memory-mapped, or with ``ssd`` read at each lookup
-    (through a row cache of ``cache_bytes``, when positive)."""
+def from_checkpoint(model_dir: Path, name: str, count: int, *, ssd: bool = False) -> HostTable | SSDTable:
+    """Shards ``{name}.shard_{i}``, i < count, each in one file: memory-mapped, or with ``ssd`` read at each lookup."""
 
     headers = {path: read_header(path) for path in sorted(Path(model_dir).glob("model*.safetensors"))}
     files = []
@@ -416,4 +414,4 @@ def from_checkpoint(model_dir: Path, name: str, count: int, *, ssd: bool = False
             raise ValueError(f"{key}: expected its weight, scales and biases together in one checkpoint file")
         path, h = found[0]
         files.append((path, *(h[f"{key}.{part}"] for part in _PARTS)))
-    return SSDTable(files, cache_bytes=cache_bytes) if ssd else HostTable(files)
+    return SSDTable(files) if ssd else HostTable(files)

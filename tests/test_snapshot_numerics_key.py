@@ -195,12 +195,12 @@ def test_load_options_are_part_of_the_canary_lookup(served):
     resident = served.build(options={"lane_kernels": "auto", "parallel": 1})
     assert served.engine.calls == 1
     assert served.build(options={"parallel": 1, "lane_kernels": "auto"}) == resident and served.engine.calls == 1
-    for n, change in enumerate(({"ssd_experts": 60.0}, {"ple_on_ssd": True}, {"ple_cache_mib": 512},
-                                {"mtp_drafts": 2}, {"lane_kernels": "off"}, {"parallel": 2}), start=2):
+    for n, change in enumerate(({"ssd_experts": 60.0}, {"ple_on_ssd": True}, {"mtp_drafts": 2},
+                                {"lane_kernels": "off"}, {"parallel": 2}), start=2):
         options = {"lane_kernels": "auto", "parallel": 1, **change}
         assert served.build(options=options) == resident and served.engine.calls == n, change   # measured again
     assert served.build(options={"lane_kernels": "auto", "parallel": 1, "ssd_experts": 60.0}) == resident
-    assert served.engine.calls == 7                                           # and cached per options
+    assert served.engine.calls == 6                                           # and cached per options
 
 
 DEEP = b"[" * 200_000 + b"]" * 200_000                                      # past the JSON parser's recursion

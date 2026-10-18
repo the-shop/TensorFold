@@ -94,29 +94,6 @@ def ple_bytes(model_dir: Path) -> int:
                for name, entry in read_header(path).items() if re.fullmatch(_TABLE, name))
 
 
-def ple_cache_bytes(model_dir: Path, mib: int) -> int:
-    """Bytes --ple-cache-mib ``mib`` takes on this checkpoint: an even share a PLE layer's table, capped at the
-    table's rows and their index; refuses a share smaller than one row."""
-
-    import re
-
-    from tensorfold.families.qwen4_exp.host_table import read_header
-    from tensorfold.families.qwen4_exp.ssd_table import cache_bytes
-
-    layers: dict[str, list] = {}
-    for path in Path(model_dir).glob("model*.safetensors"):
-        for name, entry in read_header(path).items():
-            if re.fullmatch(_TABLE, name) and name.endswith((".weight", ".scales")):
-                layer = layers.setdefault(name.split(".ple.")[0], [0, 0, 0])
-                rows, cols = entry["shape"]
-                if name.endswith(".weight"):
-                    layer[0] += rows
-                    layer[1] = cols * 4
-                else:
-                    layer[2] = cols * 2
-    return cache_bytes(mib, [(rows, (w, g, g)) for rows, w, g in layers.values()])
-
-
 def expert_bytes(model_dir: Path) -> int:
     """Bytes of the decoder layers' routed expert stacks, which --ssd-experts leaves on disk."""
 
@@ -136,12 +113,11 @@ def weight_bytes(model_dir: Path, ple_on_ssd: bool = False) -> int:
 
 
 def load(model_dir: Path, *, mtp_drafts: int | None = None, ple_on_ssd: bool = False,
-         ssd_experts: float | None = None, ple_cache_mib: int = 0, **_: Any) -> tuple[Any, Any]:
+         ssd_experts: float | None = None, **_: Any) -> tuple[Any, Any]:
     from tensorfold.families.qwen4_exp.runtime import load as load_runtime
 
     drafts = mtp_drafts if has_mtp(Path(model_dir)) else 0
-    return load_runtime(Path(model_dir), drafts=drafts, ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts,
-                        ple_cache_mib=ple_cache_mib)
+    return load_runtime(Path(model_dir), drafts=drafts, ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts)
 
 
 def engine_settings(model: Any) -> dict[str, Any]:

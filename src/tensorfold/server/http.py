@@ -43,18 +43,6 @@ def _expert_stats(app: Any) -> dict | None:
     return streamer.stats()
 
 
-def _ple_cache_stats(app: Any) -> dict | None:
-    """The --ple-cache-mib row caches' hits, misses, evictions, re-indexes, rows and bytes, or None without them."""
-
-    model = getattr(app, "_model", None)
-    caches = getattr(getattr(model, "model", model), "__dict__", {}).get("ple_caches")
-    if not caches:
-        return None
-    from tensorfold.families.qwen4_exp.ssd_table import cache_stats
-
-    return cache_stats(caches)
-
-
 def _memory(reset_peak: bool, *, admission: Any = None) -> dict[str, int]:
     """MLX's memory in bytes: live buffers, its cache of freed ones, and the peak (since the last reset)."""
 
@@ -133,7 +121,6 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                         "snapshot_write_failures": _write_failures(app),
                         "memory": _memory("reset_peak=1" in self.path, admission=getattr(app, "prompt_memory", None)),
                         "experts": _expert_stats(app),
-                        **({"ple_cache": stats} if (stats := _ple_cache_stats(app)) is not None else {}),
                     }
                 )
                 return

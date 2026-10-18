@@ -344,12 +344,13 @@ def test_an_omitted_context_is_fitted_to_memory_and_the_banner_shows_the_window(
     assert "context: 131072" in out and "requests up to 61,440 tokens keep their prompt for the next turn" in out
 
 
-def test_the_ple_row_cache_is_held_outside_mlxs_share_of_the_budget(monkeypatch, tmp_path, capsys):
+def test_the_retired_ple_cache_flag_is_accepted_and_ignored(monkeypatch, tmp_path, capsys):
+    notice = "--ple-cache-mib is ignored since 0.3.1 and will be removed in 0.4.0"
     made, out = _serve_to_app(monkeypatch, tmp_path, ["--ple-on-ssd"], capsys)
-    assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES and "cached n-gram rows" not in out
-    made, out = _serve_to_app(monkeypatch, tmp_path, ["--ple-on-ssd", "--ple-cache-mib", "512"], capsys)
-    assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES + 512 * 2**20
-    assert "512.0 MiB of cached n-gram rows" in out
+    assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES and notice not in out
+    for argv in (["--ple-on-ssd", "--ple-cache-mib", "512"], ["--ple-cache-mib", "512"]):
+        made, out = _serve_to_app(monkeypatch, tmp_path, argv, capsys)
+        assert made["memory_overhead_bytes"] == memory_budget.PROCESS_BYTES and out.count(notice) == 1
 
 
 def test_weights_past_the_budget_are_refused_before_loading(monkeypatch, tmp_path):
