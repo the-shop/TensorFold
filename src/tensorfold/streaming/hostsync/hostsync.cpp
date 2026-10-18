@@ -732,7 +732,6 @@ class PoolServer {
   std::vector<Stage> stages_;              // one aligned_pread stage per reader thread
   bool window_reuse_;
 
-
   std::mutex state_mu_;                    // the LRU, free list and window
   std::list<std::pair<int64_t, int>> order_;   // (layer * E + expert, slot), oldest first
   std::unordered_map<int64_t, std::list<std::pair<int64_t, int>>::iterator> where_;

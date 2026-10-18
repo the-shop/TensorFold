@@ -11,7 +11,8 @@ unchanged with `TF_PREFILL_LAYER_MAJOR` unset and with it `=1`, and `NUMERICS_VE
 `pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"`.
 
 Upgrading: drop the removed variables from launch scripts (they are now ignored). The first start compiles the
-expert pool's host extension again.
+expert pool's host extension again and reruns the numerics canary once; 0.3.0 prompt snapshots stay valid, since the
+canary value is unchanged.
 
 ### Removed
 
@@ -32,7 +33,8 @@ expert pool's host extension again.
 
 - **`--ple-cache-mib`** is still accepted so existing commands start, but it does nothing: a value above 0 prints
   "--ple-cache-mib is ignored since 0.3.1 and will be removed in 0.4.0". It reserves no memory and is not part of
-  the load options or any snapshot key.
+  the load options or any snapshot key. Values 0.3.0 rejected (negative, without `--ple-on-ssd`, on CUDA) are no
+  longer errors.
 
 ### Internal
 
