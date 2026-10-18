@@ -2,19 +2,19 @@
 
 > Fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) at release [v0.3.6.3](https://github.com/ashhart/TensorFold/tree/v0.3.6.3)
 > (commit 1911880, 29 Sep 2026, MIT). On top of upstream's SSD expert streaming (`--ssd-experts`), it adds Qwen3.8
-> Flash Next MLX 8-bit kernels and a converter for M5, a native expert-pool server, opt-in expert prefetch, prompt
-> seeding and an expert pack, a fix for short prompts on a tight memory budget, and request failure on pool errors;
-> see [docs/recipes/qwen3.8-flash-next.md](docs/recipes/qwen3.8-flash-next.md). v0.3.0 makes SSD-expert prompts
+> Flash Next MLX 8-bit kernels and a converter for M5, a native expert-pool server, a fix for short prompts on a
+> tight memory budget, and request failure on pool errors; see
+> [docs/recipes/qwen3.8-flash-next.md](docs/recipes/qwen3.8-flash-next.md). v0.3.0 makes SSD-expert prompts
 > faster with the same tokens (page-cache-safe expert reads, expert reuse in prompt windows, opt-in layer-major
-> prompt groups) and keeps Flash Next's prompt snapshots across bit-identical updates; see
-> [CHANGELOG.md](CHANGELOG.md).
+> prompt groups) and keeps Flash Next's prompt snapshots across bit-identical updates; v0.3.1 removes opt-in
+> features that measured no gain, with the same tokens; see [CHANGELOG.md](CHANGELOG.md).
 > Upstream's current engine is Zig (Apache-2.0); this fork is the Python engine.
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 
 ```bash
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"
 tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
 ```
 
@@ -233,7 +233,7 @@ Use NVIDIA's PyTorch container for CUDA, PyTorch, Triton and the extension compi
 
 ```bash
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.0"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"
 tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
 ```

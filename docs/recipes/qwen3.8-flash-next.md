@@ -80,12 +80,12 @@ You need:
 
 SSD expert streaming (`--ssd-experts`) comes from upstream TensorFold 0.3.6
 ([ashhart/TensorFold#17](https://github.com/ashhart/TensorFold/pull/17)). The 8-bit Flash Next kernels and converter, the
-native expert-pool server, the opt-in prefetch, prompt seeding and expert pack, the short-prompt admission fix and
-failing a request on a pool error are in the-shop's fork, first released as `v0.1.0`; `v0.3.0` adds the prompt
-speed-ups [below](#030-prompt-path-and-diagnostics) (or use `main` for the latest):
+native expert-pool server, the short-prompt admission fix and failing a request on a pool error are in the-shop's
+fork, first released as `v0.1.0`; `v0.3.0` adds the prompt speed-ups [below](#030-prompt-path-and-diagnostics), and
+`v0.3.1` removes opt-in features that measured no gain (or use `main` for the latest):
 
 ```bash
-git clone -b v0.3.0 https://github.com/the-shop/TensorFold.git && cd TensorFold
+git clone -b v0.3.1 https://github.com/the-shop/TensorFold.git && cd TensorFold
 ```
 
 Run everything below from that directory, in a Python 3.11+ virtual environment (`python3 -m venv .venv`; tested
@@ -195,36 +195,15 @@ Decode and prefill in tok/s; load time in seconds (harness A / harness B), befor
   The numbers above were measured with those unaligned reads; aligned expert reads (below, on by default) leave
   nothing cached.
 - **Output:** output tokens were identical across all 12 measured configurations (the six above, 16 reader threads
-  and the expert pack at each pool size), with drafts on and off.
+  and the expert pack, removed in 0.3.1, at each pool size), with drafts on and off.
 
-Two opt-in flags stream experts ahead of time. Both default to off, and either one runs the Python loop instead of
-the native server. Their numbers are older (2026-10-09, Python loop).
-- **`TENSORFOLD_POOL_DECODE_PREFETCH=K`** (0 to 16): runs the next layer's router on this layer's MoE input and
-  reads its top-K experts while the GPU works.
-  - **Prefetches used:** 76% at K=4, 61% at K=8.
-  - **Drafted decode:** -3% in one harness, +8% to +16% in the other.
-  - **Prefill:** fell from 168 to 127 tok/s in the first harness, and from 198-241 to 160-192 in the second.
-- **`TENSORFOLD_POOL_PROMPT_SEED=1`**: loads each layer's most-used prompt experts at the first decode step. The
-  number per layer is `TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER`, default 32. Together with K=4 prefetch, it was about
-  14% slower than prefetch alone.
-
-Both flags change only which experts are resident, never the tokens.
-
-With both flags off (the default), a native server in the host-sync extension answers each layer's routing: its
-own thread waits for the GPU, keeps the LRU and reads misses on native threads, with no Python per layer call.
+A native server in the host-sync extension answers each layer's routing: its own thread waits for the GPU, keeps
+the LRU and reads misses on native threads, with no Python per layer call. `/health` reports `preads` and `threads`
+with the pool's hits and misses.
 - **`TENSORFOLD_POOL_NATIVE=0`** keeps the Python serve loop. Both loops keep the same experts in the same slots.
 - **`TENSORFOLD_POOL_THREADS=N`** (default 8) sets the reader threads of either loop. 16 threads raised prefill
   4-9% at 40 and 60 GiB but not at 70, and kept decode within ±3% at 40 and 60 GiB and ±4% at 70, except harness B serial at 40 GiB (-10%), so
   the default stays 8.
-- **Expert pack (opt-in, experimental, off by default):** `python tools/pack_experts.py MODEL_DIR` writes
-  `MODEL_DIR/experts.pack` and its index: each expert's parts back to back in one 16 KiB-aligned record, so the
-  native server reads a miss with one `pread` instead of nine. It takes as much disk as the experts. It is used only
-  with `TENSORFOLD_EXPERT_PACK=1` (`MODEL_DIR/experts.pack`) or `TENSORFOLD_EXPERT_PACK=PATH`, and a pack that does
-  not match the checkpoint (layout, each file's size, inode and modification time, a sample of the expert bytes) is
-  an error: rebuild it after any change to the checkpoint files, a copy included. It was slower at 40 and 60 GiB
-  (decode 16-23% lower, prefill about 16-21% lower; the 40 GiB harness-A pack values come from an earlier
-  window the same day) and within 0-6% at 70 GiB. `/health` reports `packed`, `preads`
-  and `threads` with the pool's hits and misses.
 - **Aligned expert reads** (on by default): each unaligned expert part over about 1 MiB is read as the
   page-aligned range around it into an aligned buffer, then the part is copied out: the same bytes and the same one
   `pread` a part, with nothing left in the page cache. `TENSORFOLD_POOL_ALIGNED_READS=0` restores the old unaligned
@@ -239,8 +218,8 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
 - `python tools/page_cache.py evict MODEL_DIR` drops the checkpoint files from the page cache (no sudo; run it with
   no server holding the model), and `python tools/page_cache.py resident MODEL_DIR [--experts]` prints how many of
   their bytes (or of the routed experts' bytes) are cached. Evict before every cold benchmark.
-- `python tools/bench_pool_io.py MODEL_DIR --cold` times miss reads for the Python loop, the native server and
-  the pack at 4, 8, 16 and 32 threads, on experts none of whose bytes are in the page cache.
+- `python tools/bench_pool_io.py MODEL_DIR --cold` times miss reads for the Python loop and the native server at
+  4, 8, 16 and 32 threads, on experts none of whose bytes are in the page cache.
 
 #### 0.3.0 prompt path and diagnostics
 
@@ -263,8 +242,6 @@ own thread waits for the GPU, keeps the LRU and reads misses on native threads, 
   breakdown (dense GPU, routed-expert GPU, SSD stall, host answer, Python-bound idle, head tail, MTP, gaps) and each
   request's TTFT phases; `tools/decode_health_delta.py` reads `/health` counters around requests and
   `tools/bench_flash_decode_parts.py` times the parts on random weights of the checkpoint's shapes.
-- **`TF_POOL_JOBLOG=PATH`** (off by default) appends one line per expert-pool call, written once a second: kind,
-  layer, rows, the host clock (ns) when the call was seen and when it was answered, bytes and `pread` calls.
 
 Measured on 2026-10-12 on an M5 Max MacBook Pro (128 GB, internal SSD) serving the published 8-bit checkpoint with
 `TENSORFOLD_MEMORY_LIMIT_GB=84 TF_PREFILL_LAYER_MAJOR=1 --ssd-experts 60 --ple-on-ssd --context 77824 --parallel 1
@@ -345,17 +322,9 @@ so a 128 GB Mac can hold Flash Next. It is an opt-in trade. On an M3 Ultra, repl
 decode was 3.5-8% slower across the four cells, prefill was unchanged, the peak footprint fell by 40 GiB
 (135.1 to 95.4 GiB) and start-up halved (35.7 s to 17.8 s).
 
-`--ple-cache-mib MIB` (with `--ple-on-ssd`, Metal only; default 0, off) keeps n-gram rows read recently, from
-prompts and replies, in that many MiB of RAM and reads only the other rows of a lookup from SSD; a lookup whose
-rows are all cached reads nothing. Rows are evicted in CLOCK order. The cached bytes are the checkpoint's own, so
-replies are the same tokens. The rows (about 82% of the MiB) and their index are fixed arrays allocated at load,
-all counted in the memory budget beside the 3 GiB process reserve. Each PLE layer's table gets an even share,
-capped at the whole table and its index; a share too small for one row is refused at start-up. A full re-index of
-the cache (when evictions have left too many tombstones) holds its lock for about 0.37 s at 512 MiB.
-`tools/bench_ple_cache.py` times lookups with and without it on a synthetic table. On the 8-bit checkpoint with
-`--ssd-experts 60` at an 84 GiB budget, 512 MiB of cache served about 99% of decode lookups and the replies were the
-same tokens, but decode was not faster in either of two independent harnesses (one measured no difference, the
-other 17.1 vs 15.4 tok/s over three runs), so leave it off unless the SSD is the bottleneck.
+`--ple-cache-mib` (0.2.0's n-gram row cache) is ignored since 0.3.1 and will be removed in 0.4.0: on the 8-bit
+checkpoint with `--ssd-experts 60` at an 84 GiB budget, 512 MiB of cache served about 99% of decode lookups, but
+decode was not faster in either of two independent harnesses.
 
 `--ssd-experts GIB` also leaves the routed experts (70.3 GiB) in the checkpoint and streams them into a GPU pool
 of that many GiB; with `--ple-on-ssd` as well, a 64 GB Mac can hold Flash Next (`python -m pip install

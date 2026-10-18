@@ -3,6 +3,42 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.3.1 (18 Oct 2026, MLXFW, the-shop fork)
+
+A simplification release: opt-in features that measured no gain are removed. Each was off by default, so the
+default path is the one 0.3.0 runs and replies are the same tokens, bit for bit: the numerics golden test passes
+unchanged with `TF_PREFILL_LAYER_MAJOR` unset and with it `=1`, and `NUMERICS_VERSION` stays 1. Install with
+`pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"`.
+
+Upgrading: drop the removed variables from launch scripts (they are now ignored). The first start compiles the
+expert pool's host extension again.
+
+### Removed
+
+- **Decode prefetch and prompt seeding** (`TENSORFOLD_POOL_DECODE_PREFETCH`, `TENSORFOLD_POOL_PROMPT_SEED`,
+  `TENSORFOLD_POOL_PROMPT_SEED_PER_LAYER`). Either one also kept the pool on the Python serve loop. Measured on
+  2026-10-09: prefetch lowered prefill (168 to 127 tok/s in one harness, 198-241 to 160-192 in the other) and
+  moved drafted decode between -3% and +16%; seeding with prefetch was about 14% slower than prefetch alone.
+- **The expert pack** (`TENSORFOLD_EXPERT_PACK`, `tools/pack_experts.py`, the packed mode of
+  `tools/bench_pool_io.py`, `packed` in `/health` `experts`). It was slower at 40 and 60 GiB pools (decode 16-23%
+  lower, prefill about 16-21% lower) and within 0-6% at 70 GiB, and took as much disk as the experts.
+- **The n-gram row cache** (`--ple-cache-mib`, `ple_cache` in `/health`, `tools/bench_ple_cache.py`). It served
+  about 99% of decode lookups with 512 MiB but did not make decode faster in either of two harnesses.
+- **`TF_POOL_JOBLOG`**, the per-call expert-pool log. The decode profiler (`TENSORFOLD_DECODE_PROFILE`) records the
+  same calls with more detail.
+- Accessors only the tests used (`Streamer.window_layers`, the extension's `PoolServer.aligned`).
+
+### Deprecated
+
+- **`--ple-cache-mib`** is still accepted so existing commands start, but it does nothing: a value above 0 prints
+  "--ple-cache-mib is ignored since 0.3.1 and will be removed in 0.4.0". It reserves no memory and is not part of
+  the load options or any snapshot key.
+
+### Internal
+
+- The saved-conversation and prompt-snapshot pruning share one loop (older keys first, then oldest first), with the
+  same order as before.
+
 ## 0.3.0 (12 Oct 2026, MLXFW, the-shop fork)
 
 Faster prompts for Qwen3.8 Flash Next with SSD experts, the same tokens. Install with
