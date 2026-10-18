@@ -463,16 +463,6 @@ class PoolServer {
     regions_ = words;
   }
 
-  // Per-call timing (diagnostics): (kind, layer, rows, signal seen ns, ready ns, bytes read, preads), uptime clock.
-  void set_log(bool on) { log_on_.store(on); }
-
-  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> take_log() {
-    std::lock_guard<std::mutex> lk(log_mu_);
-    std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> out;
-    out.swap(log_);
-    return out;
-  }
-
   bool packed() const { return pack_fd_ >= 0; }
   bool aligned() const { return aligned_; }
   int workers() const { return readers_ ? readers_->size() : 0; }
@@ -526,7 +516,6 @@ class PoolServer {
       bool prof = job.t_submit != 0 && prof_.load(std::memory_order_relaxed);
       Rec rec{job.kind, job.layer, job.rows, 0, 0, 0, job.signal, job.t_submit, 0, 0, 0, 0};
       cur_ = prof ? &rec : nullptr;
-      uint64_t seen = 0, bytes0 = 0, preads0 = 0;
       try {
         if (!wait_signal(job)) {     // closing and the GPU never signalled: release it, load nothing, fail it
           record("RuntimeError", "expert streaming closed before the GPU reached layer " + std::to_string(job.layer));
@@ -534,11 +523,6 @@ class PoolServer {
           continue;
         }
         if (prof) rec.t_sig = now_ns();
-        if (log_on_.load()) {
-          seen = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-          bytes0 = bytes_read_.load();
-          preads0 = preads_.load();
-        }
         std::lock_guard<std::mutex> lk(state_mu_);
         const uint32_t* box = region(job);
         if (job.kind == 0) {
@@ -576,11 +560,6 @@ class PoolServer {
         } else {
           ++prof_dropped_;
         }
-      }
-      if (seen) {
-        uint64_t done = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        std::lock_guard<std::mutex> lk(log_mu_);
-        log_.emplace_back(job.kind, job.layer, job.rows, seen, done, bytes_read_.load() - bytes0, preads_.load() - preads0);
       }
       channel_->signal(job.ready);   // the GPU always gets its release; the next Python call raises
     }
@@ -818,9 +797,6 @@ class PoolServer {
   std::atomic<uint64_t> hits_{0}, misses_{0}, bytes_read_{0}, preads_{0};
   std::atomic<uint64_t> window_reads_{0}, window_copies_{0}, copy_bytes_{0};
   size_t regions_ = 0;                     // words a region (two alternate), 0: one region, the whole box
-  std::atomic<bool> log_on_{false};
-  std::mutex log_mu_;
-  std::vector<std::tuple<int, int, int, uint64_t, uint64_t, uint64_t, uint64_t>> log_;
   std::mutex error_mu_;
   std::optional<std::pair<std::string, std::string>> error_;
 
@@ -899,8 +875,6 @@ NB_MODULE(_hostsync, m) {
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
       .def("set_regions", &PoolServer::set_regions, nb::arg("words"))
-      .def("set_log", &PoolServer::set_log, nb::arg("on"))
-      .def("take_log", &PoolServer::take_log)
       .def("packed", &PoolServer::packed)
       .def("aligned", &PoolServer::aligned)
       .def("workers", &PoolServer::workers)

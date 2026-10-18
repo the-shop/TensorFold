@@ -23,16 +23,6 @@ def check_expert_stream(model: Any) -> None:
                            "the forward read stale expert weights") from error
 
 
-def stream_note(model: Any, text: str) -> None:
-    """A marker in the SSD expert pool's call log (TF_POOL_JOBLOG), when the model streams its experts."""
-
-    inner = getattr(model, "model", model)
-    streamer = getattr(inner, "__dict__", {}).get("streamer")
-    note = getattr(streamer, "note", None)
-    if note is not None:
-        note(text)
-
-
 def drop_spares(cache: list[Any]) -> list[Any]:
     """``alternating_kv.drop_spares`` (imported when used: this module loads without MLX)."""
 

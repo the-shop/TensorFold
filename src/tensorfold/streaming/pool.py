@@ -7,7 +7,6 @@ import queue
 import struct
 import sys
 import threading
-import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -33,17 +32,6 @@ def pool_threads(env: dict | None = None) -> int:
 
     env = os.environ if env is None else env
     return min(256, max(1, int(env.get("TENSORFOLD_POOL_THREADS", "8") or 8)))
-
-
-def job_log_path(env: dict | None = None) -> str:
-    """TF_POOL_JOBLOG=path appends one line per pool call (diagnostics): kind layer rows seen_ns ready_ns bytes preads."""
-
-    env = os.environ if env is None else env
-    return (env.get("TF_POOL_JOBLOG", "") or "").strip()
-
-
-def _now_ns() -> int:
-    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) if hasattr(time, "CLOCK_UPTIME_RAW") else time.monotonic_ns()
 
 
 def native_wanted(env: dict | None = None) -> bool:
@@ -181,10 +169,6 @@ class Streamer:
         self._prof_cur: dict | None = None
         self._prof_mu = threading.Lock()
         self._prof_dropped = 0
-        self._log_path = job_log_path()
-        self._log: list[tuple] = []
-        self._notes: list[str] = []
-        self._log_lock = threading.Lock()
         if native is None:
             native = native_wanted()
         if native and hasattr(hostsync, "PoolServer"):
@@ -197,13 +181,11 @@ class Streamer:
                     os.close(fd)
                 raise
             self._thread = None
-            self._start_log()
             if _profile.ACTIVE is not None:
                 _profile.ACTIVE.attach(self)
             return
         self._thread = threading.Thread(target=self._serve, name="expert-stream", daemon=True)
         self._thread.start()
-        self._start_log()
         if _profile.ACTIVE is not None:
             _profile.ACTIVE.attach(self)
 
@@ -238,45 +220,6 @@ class Streamer:
             got, self._prof = (self._prof or []), ([] if self._prof is not None else None)
             dropped, self._prof_dropped = self._prof_dropped, 0
         return got, dropped
-
-    def _start_log(self) -> None:
-        if not self._log_path:
-            return
-        if self._server is not None:
-            self._server.set_log(True)
-        threading.Thread(target=self._write_log, name="expert-joblog", daemon=True).start()
-
-    def take_log(self) -> list[tuple]:
-        """Pool calls logged since the last take: (kind, layer, rows, seen_ns, ready_ns, bytes, preads)."""
-
-        if self._server is not None:
-            return [tuple(int(v) for v in row) for row in self._server.take_log()]
-        with self._log_lock:
-            out, self._log = self._log, []
-        return out
-
-    def note(self, text: str) -> None:
-        """A marker line in the call log (when TF_POOL_JOBLOG is set), at the uptime clock's now."""
-
-        if self._log_path:
-            with self._log_lock:
-                self._notes.append(f"# {_now_ns()} {text}")
-
-    def _write_log(self) -> None:
-        while True:
-            time.sleep(1.0)
-            rows = self.take_log()
-            with self._log_lock:
-                notes, self._notes = self._notes, []
-            lines = [" ".join(str(v) for v in row) for row in rows]
-            # notes and calls interleaved by time; a note is "# ns text", a call "kind layer rows seen ready ..."
-            merged = sorted([(int(n.split()[1]), n) for n in notes] + [(int(r[3]), line) for r, line in zip(rows, lines)])
-            if merged:
-                try:
-                    with open(self._log_path, "a") as f:
-                        f.write("".join(line + "\n" for _, line in merged))
-                except OSError:
-                    pass
 
     def _native(self, slots: int, workers: int, pack: str | Path | bool | None) -> Any:
         """The extension's PoolServer over this pool: every (layer, expert, part)'s fd and offset, maybe a pack."""
@@ -435,14 +378,11 @@ class Streamer:
                 rec = dict.fromkeys(self._PROF_KEYS, 0)
                 rec.update(kind=_KINDS[kind], layer=layer, rows=rows, signal=signal, t_submit=submitted)
             self._prof_cur = rec
-            seen = 0
             try:
                 if not self.channel.wait(signal, TIMEOUT_MS):
                     raise TimeoutError(f"no routing from the GPU for layer {layer}")
                 if rec is not None:
                     rec["t_sig"] = _profile.now()
-                if self._log_path:
-                    seen, bytes0 = _now_ns(), self.bytes_read
                 if kind == "rows":
                     if rows * self.top_k > self.box_words:
                         raise IndexError("peek: the array is not evaluated or the range passes its end")
@@ -477,9 +417,6 @@ class Streamer:
                         self._prof.append(rec)
                     else:
                         self._prof_dropped += 1
-            if seen:
-                with self._log_lock:
-                    self._log.append((_KINDS[kind], layer, rows, seen, _now_ns(), self.bytes_read - bytes0, 0))
             self.channel.signal(ready)
 
     def _record(self, error: BaseException) -> None:

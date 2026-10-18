@@ -721,27 +721,3 @@ def test_a_failed_call_keeps_its_error_and_clears_its_region(hs, tmp_path, nativ
     with pytest.raises(RuntimeError, match="expert streaming stopped"):
         s.marks("rows", 0, 1)
     s.close()
-
-
-@pytest.mark.parametrize("native", [True, False])
-def test_the_call_log_times_every_call_and_its_reads(hs, tmp_path, monkeypatch, native):
-    write_checkpoint(tmp_path)
-    log = tmp_path / "calls.log"
-    monkeypatch.setenv("TF_POOL_JOBLOG", str(log))
-    s = make(hs, tmp_path, 2 * EXPERTS + 2, native=native)
-    call(hs, s, "rows", 0, [1, 2, 3, 3])
-    call(hs, s, "window", 1, [4, 5])
-    s.note("chunk 0")
-    rows = s.take_log()
-    per = pool.expert_nbytes(s.found, 0)
-    assert [(r[0], r[1], r[5]) for r in rows] == [(0, 0, 3 * per), (1, 1, 2 * per)]
-    assert all(r[3] <= r[4] for r in rows)
-    call(hs, s, "window", 2, [4])
-    deadline = time.time() + 5
-    while time.time() < deadline and not (log.exists() and "chunk 0" in log.read_text() and
-                                           len(log.read_text().splitlines()) >= 2):
-        time.sleep(0.1)
-    lines = log.read_text().splitlines()
-    assert any(line.startswith("# ") and line.endswith("chunk 0") for line in lines)
-    assert any(line.split()[:2] == ["1", "2"] for line in lines)
-    s.close()

@@ -7,7 +7,7 @@ import time
 from functools import partial
 from typing import Any, Iterator, Sequence
 
-from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares, stream_note
+from tensorfold.engine.family_common import cache_arrays, check_expert_stream, drop_spares
 from tensorfold.engine.prefill_plan import PromptChunks
 
 
@@ -71,7 +71,6 @@ class FamilyPrefill:
             if self.prefill_guard is not None:
                 self.prefill_guard.before_chunk(cache, len(chunk))
             self._prefill_at = None                    # a chunk in flight: the cache holds no prompt prefix whole
-            stream_note(self.model, f"chunk {begin} {end}")
             inputs = mx.array([chunk], dtype=mx.uint32)
             hidden = (self.model.prefill_vision(inputs, cache, prompt_data, begin, end)
                       if prompt_data is not None else feed(inputs, cache))
@@ -88,7 +87,6 @@ class FamilyPrefill:
             reads_last = n + 1 == len(chunks) or (drafting and getattr(self.model, "draft_reads_hidden", True))
             mx.eval(*((last,) if reads_last else ()), *cache_arrays(cache))
             check_expert_stream(self.model)
-            stream_note(self.model, f"chunk-done {begin} {end}")
             self._prefill_at = end
             if self.prefill_guard is not None:
                 self.prefill_guard.after_chunk(cache, len(chunk))
@@ -239,7 +237,6 @@ class FamilyPrefill:
             if guard is not None:
                 guard.before_chunk(work, group[0][1] - group[0][0])
             self._prefill_at = None
-            stream_note(model, f"group {group[0][0]} {group[-1][1]} chunks={len(group)}")
             # inner checkpoints: each layer's state copied as the layer passes the cut, the draft head's after
             marks: dict[int, list[Any]] = {end: [None] * layers for _, end in group[:-1] if end in cuts}
             ahead = getattr(model, "prefetch_prompt", None)
@@ -283,7 +280,6 @@ class FamilyPrefill:
                         stream.history_checkpoints.append((list(prompt[:end]), drop_spares(taken)))
             mx.eval(*cache_arrays(work))
             check_expert_stream(model)
-            stream_note(model, f"group-done {group[0][0]} {group[-1][1]}")
             self._fed_rows = group[-1][1] - group[-1][0]
             self.prefill_chunks += len(group)
         finally:
