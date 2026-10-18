@@ -483,19 +483,27 @@ def keep_newest(directory: Path, model_id: str, keep: int) -> None:
         except Exception:  # noqa: BLE001 - an unreadable file is left alone
             continue
         if model.split("|")[0] == model_id.split("|")[0]:
-            ours.append((path, model == model_id))
-    over, stale = len(ours) - keep, 0
-    for older_key in (True, False):
-        for path, current in reversed(ours):
-            if over <= 0:
-                break
-            if current != older_key:
-                path.unlink(missing_ok=True)
-                over -= 1
-                stale += 1 if older_key else 0
+            ours.append((path, 1, model == model_id))
+    stale = prune_oldest(ours, keep)
     if stale:
         print(f"[tensorfold] removed {stale} snapshot(s) under an older key of this model (other weights or "
               f"kernels) from {directory}", flush=True)
+
+
+def prune_oldest(ours: list[tuple[Path, int, bool]], limit: int) -> int:
+    """Unlink (path, weight, current key) entries, given newest first, until their weights sum to at most ``limit``:
+    first those of an older key, oldest first, then the current key's oldest. Returns the older key's weight removed."""
+
+    total, stale = sum(weight for _, weight, _ in ours), 0
+    for older_key in (True, False):
+        for path, weight, current in reversed(ours):
+            if total <= limit:
+                break
+            if current != older_key:
+                path.unlink(missing_ok=True)
+                total -= weight
+                stale += weight if older_key else 0
+    return stale
 
 
 def load_snapshots(directory: Path, model_id: str, *, limit: int | None = None, allow: Any = None):
@@ -726,6 +734,6 @@ def blocks_to_warm(directory: Path, model_id: str) -> list[list[int]]:
 
 __all__ = ["CHECKSUM", "DEFAULT_DIR", "CorruptSnapshot", "DiskBlocks", "blocks_to_warm", "clean_partials",
            "discard_corrupt", "encode_snapshot", "finish_streamed", "full_sync", "keep_newest", "load_snapshot",
-           "load_snapshots", "newest_first", "read_metadata", "remove_stale_partials", "save_snapshot", "seal",
-           "snapshot_arrays", "snapshot_key", "stream_snapshot", "sync_dir", "sync_file", "verify_snapshot",
-           "weights_fingerprint", "write_encoded"]
+           "load_snapshots", "newest_first", "prune_oldest", "read_metadata", "remove_stale_partials",
+           "save_snapshot", "seal", "snapshot_arrays", "snapshot_key", "stream_snapshot", "sync_dir", "sync_file",
+           "verify_snapshot", "weights_fingerprint", "write_encoded"]

@@ -169,7 +169,7 @@ def prune_conversations(directory: Path, model_id: str, limit_bytes: int) -> Non
     """Delete this model's saved conversations until the rest fit ``limit_bytes``: first, oldest first, those of an
     older key of its path (other weights or kernels: never read again), then its oldest. Never another model's."""
 
-    from tensorfold.engine.prefix_snapshots import newest_first, read_metadata
+    from tensorfold.engine.prefix_snapshots import newest_first, prune_oldest, read_metadata
 
     ours = []
     for path in newest_first(directory):
@@ -180,15 +180,7 @@ def prune_conversations(directory: Path, model_id: str, limit_bytes: int) -> Non
             continue
         if model.split("|")[0] == model_id.split("|")[0]:
             ours.append((path, size, model == model_id))
-    total, stale = sum(size for _, size, _ in ours), 0
-    for older_key in (True, False):                  # an older key's files first, then this key's; oldest first
-        for path, size, current in reversed(ours):
-            if total <= limit_bytes:
-                break
-            if current != older_key:
-                path.unlink(missing_ok=True)
-                total -= size
-                stale += size if older_key else 0
+    stale = prune_oldest(ours, limit_bytes)
     if stale:
         print(f"[tensorfold] removed {_size(stale)} of saved conversations under an older key of this model "
               f"(other weights or kernels) from {directory}", flush=True)
