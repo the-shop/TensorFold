@@ -117,13 +117,19 @@ def call(hs, s, kind, layer, ids, ok=True):
     assert (s.error is None) == ok
 
 
+def window_of(s) -> list[int]:
+    """The layer whose expert sits in each window slot, from whichever loop serves ``s``."""
+
+    return list(s._server.window()) if s.native else list(s.window)
+
+
 def snapshot(hs, s) -> dict:
     out = {f"{proj}.{part}": hs.peek(getattr(s.pool[proj], part), 0, getattr(s.pool[proj], part).nbytes)
            for proj in s.pool for part in pool.PARTS}
     out["slot_of"] = hs.peek(s.slot_of, 0, s.slot_of.nbytes)
     out["lru"] = s.lru_items()
     out["free"] = s.free_slots()
-    out["window"] = s.window_layers()
+    out["window"] = window_of(s)
     out["counters"] = (s.hits, s.misses, s.bytes_read)
     out["window_counters"] = (s.window_reads, s.window_copies, s.copy_bytes)
     return out
@@ -143,7 +149,7 @@ def check_resident(hs, s, truth):
         assert table[layer, e] == slot
         for (proj, part), blob in truth[(layer, e)].items():
             assert slot_part(hs, s, proj, part, slot) == blob, (layer, e, proj, part)
-    for e, layer in enumerate(s.window_layers()):
+    for e, layer in enumerate(window_of(s)):
         if layer >= 0:
             for (proj, part), blob in truth[(layer, e)].items():
                 assert slot_part(hs, s, proj, part, e) == blob
@@ -280,7 +286,7 @@ def test_after_a_failed_read_the_window_reads_instead_of_copying(hs, tmp_path):
         s.channel.signal(window[0])
         assert s.channel.wait(window[1], 10_000)
         assert (s.window_reads, s.window_copies) == (1, 0)
-        assert s.window_layers()[1] == 2
+        assert window_of(s)[1] == 2
         for (proj, part), blob in truth[(2, 1)].items():
             assert slot_part(hs, s, proj, part, 1) == blob
         s.close()

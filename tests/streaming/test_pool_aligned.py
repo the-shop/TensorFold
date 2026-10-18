@@ -184,7 +184,8 @@ def test_switch_reads_the_same_slots_and_counts(hs, tmp_path, monkeypatch, nativ
                 for proj in PROJS:
                     for part in BIG:
                         assert part_bytes(hs, s, proj, part, slot) == truth[(layer, e)][(proj, part)]
-            snaps.append((s.stats(), s.lru_items(), s.free_slots(), s.window_layers(),
+            window = list(s._server.window()) if s.native else list(s.window)
+            snaps.append((s.stats(), s.lru_items(), s.free_slots(), window,
                           [part_bytes(hs, s, proj, part, slot) for proj in PROJS for part in BIG
                            for slot in range(2 * EXPERTS)]))
         finally:

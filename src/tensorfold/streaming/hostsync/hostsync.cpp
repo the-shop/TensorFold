@@ -439,7 +439,6 @@ class PoolServer {
     regions_ = words;
   }
 
-  bool aligned() const { return aligned_; }
   int workers() const { return readers_ ? readers_->size() : 0; }
 
   // Serves every queued job whose GPU signal arrives within kCloseGraceMs, releases (without loading) the ones whose
@@ -818,7 +817,6 @@ NB_MODULE(_hostsync, m) {
       .def("free_slots", &PoolServer::free_slots)
       .def("window", &PoolServer::window)
       .def("set_regions", &PoolServer::set_regions, nb::arg("words"))
-      .def("aligned", &PoolServer::aligned)
       .def("workers", &PoolServer::workers)
       .def("profile", &PoolServer::profile, nb::arg("on"))
       .def("drain_profile", &PoolServer::drain_profile)

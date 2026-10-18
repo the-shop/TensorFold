@@ -22,7 +22,7 @@
   "tool_parameters.py": "tool-call schemas",
   "update.py": "release checks"
  },
- "digest": "813fa28f0f7bba56",
+ "digest": "2bd0d9b28192d990",
  "files": [
   "src/tensorfold/__init__.py",
   "src/tensorfold/cuda/__init__.py",

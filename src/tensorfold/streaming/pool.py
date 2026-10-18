@@ -283,9 +283,6 @@ class Streamer:
     def free_slots(self) -> list[int]:
         return list(self._server.free_slots()) if self._server is not None else list(self.free)
 
-    def window_layers(self) -> list[int]:
-        return list(self._server.window()) if self._server is not None else list(self.window)
-
     @property
     def box(self) -> mx.array:
         """The routing box region the next call's kernel writes (calls alternate between two)."""
