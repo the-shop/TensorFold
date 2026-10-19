@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import traceback
 import uuid
@@ -21,6 +22,34 @@ from tensorfold.server.stacks import Rearming
 
 # TENSORFOLD_REQUEST_LOG=path appends every request body (one JSON a line), for exact replays of real traffic
 _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
+
+# sampling and output fields OpenAI-style clients send that this server does not apply, with the values that ask for
+# nothing (sent with one of these, or null, a field is not reported)
+UNSUPPORTED_PARAMS: dict[str, tuple[Any, ...]] = {
+    "presence_penalty": (0,), "frequency_penalty": (0,), "repetition_penalty": (1,), "min_p": (0,),
+    "typical_p": (1,), "top_a": (0,), "tfs_z": (1,), "mirostat": (0,), "logit_bias": ({},),
+    "logprobs": (False, 0), "top_logprobs": (0,), "n": (1,), "best_of": (1,), "min_tokens": (0,),
+}
+_WARNED: set[str] = set()
+_WARNED_LOCK = threading.Lock()
+
+
+def ignored_params(body: dict[str, Any]) -> list[str]:
+    """The unsupported fields ``body`` sets to a value that asks for something, sorted."""
+
+    return sorted(name for name, neutral in UNSUPPORTED_PARAMS.items()
+                  if body.get(name) is not None and not any(body[name] == n for n in neutral))
+
+
+def warn_ignored(names: list[str]) -> None:
+    """One warning per field name per process."""
+
+    with _WARNED_LOCK:
+        fresh = [name for name in names if name not in _WARNED]
+        _WARNED.update(fresh)
+    for name in fresh:
+        print(f"[tensorfold] warning: requests set {name}, which this server does not apply; replies are sampled "
+              "without it (reported in tensorfold.ignored_params; --strict-params refuses such requests)", flush=True)
 
 
 def _write_failures(app: Any) -> dict[str, int]:
@@ -185,6 +214,16 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     raise RequestError("request body exceeds the 32 MiB limit")
                 body = parse_numbers(json.loads(self.rfile.read(length) or b"{}"))
                 validate_modalities(body)
+                ignored = ignored_params(body)
+                if ignored and getattr(app, "strict_params", False):
+                    self._send_json({"error": {
+                        "message": (f"unsupported parameter{'s' if len(ignored) > 1 else ''}: {', '.join(ignored)}. "
+                                    "This server samples with temperature, top_p, top_k and seed only and was "
+                                    "started with --strict-params: drop them or send their neutral values"),
+                        "type": "invalid_request_error", "param": ignored[0], "code": "unsupported_parameter"}},
+                        status=400)
+                    return
+                warn_ignored(ignored)
                 if _REQUEST_LOG and body.get("priority") != "background":   # batch jobs are not client traffic
                     with open(_REQUEST_LOG, "a") as handle:
                         handle.write(json.dumps(redact_images(body)) + "\n")
@@ -263,6 +302,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     }
                 if reply.get("runtime"):
                     extras["tensorfold"] = reply["runtime"]
+                if ignored:
+                    extras["tensorfold"] = {**extras.get("tensorfold", {}), "ignored_params": ignored}
                 if reply.get("speculative"):
                     extras["speculative"] = reply["speculative"]
                 if reply.get("pass_economics"):

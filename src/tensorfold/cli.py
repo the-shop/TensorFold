@@ -39,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--vision", action="store_true", help="enable image input for Qwen3.5/3.8 dense vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")
+    endpoint.add_argument("--strict-params", action="store_true",
+                          help="Mac: refuse (HTTP 400) requests that set sampling fields this server does not apply, "
+                               "such as presence_penalty (default: serve them, warn once a field and list them in "
+                               "tensorfold.ignored_params)")
 
     generation = serve.add_argument_group("generation (requests can override each of these)")
     generation.add_argument("--context", type=int, default=None,
@@ -55,6 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="for chat templates that take one (Qwen3.8); medium adds no system-prompt text")
     generation.add_argument("--thinking-budget", type=int, default=0,
                             help="most thinking tokens before the server closes the think block (0: no limit)")
+    generation.add_argument("--unclosed-think-finish", choices=("stop", "length"), default="stop",
+                            help="Mac: finish_reason of a reply that ends inside its think block with no answer "
+                                 "(tensorfold.think_closed is false either way)")
 
     speed = serve.add_argument_group("drafting and caches")
     speed.add_argument("--no-drafts", action="store_true",
@@ -389,6 +396,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         return 0
     from tensorfold.cuda.server import App, serve
 
+    if getattr(args, "strict_params", False) or getattr(args, "unclosed_think_finish", "stop") != "stop":
+        print("[tensorfold] warning: --strict-params and --unclosed-think-finish do nothing on CUDA", flush=True)
     sampling = _generation_config(model_dir)
     for key, value in (("temperature", args.temperature), ("top_p", args.top_p), ("top_k", args.top_k)):
         if value is not None:
@@ -645,6 +654,8 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         background_warm=bool(args.background_warm),
         persist_turns=bool(args.persist_turns),
         checkpoint_last_user=bool(args.checkpoint_last_user),
+        unclosed_think_finish=args.unclosed_think_finish,
+        strict_params=bool(args.strict_params),
     )
     if app.context_fitted:
         print(f"[tensorfold] context window {app.context_window:,} tokens: the most one request can use in the "

@@ -27,10 +27,12 @@ from tensorfold.server.text import (
     is_title_request,
     parse_harmony_output,
     render_prompt_ids,
-    split_thinking, think_markers,
+    split_thinking, think_closed, think_markers,
     streaming_visible_text,
     template_late_system,
     strip_trailing_stops,
+    UNCLOSED_THINK_FINISHES,
+    unclosed_think_finish,
 )
 
 
@@ -120,6 +122,8 @@ class ChatApp(RequestOptions):
         background_warm: bool = False,
         persist_turns: bool = False,
         checkpoint_last_user: bool = False,
+        unclosed_think_finish: str = "stop",
+        strict_params: bool = False,
     ) -> None:
         # three candidate entries per conversation (history boundary, stable prefix, reply end)
         if checkpoint_slots is None:
@@ -138,6 +142,12 @@ class ChatApp(RequestOptions):
         self.reasoning_effort = reasoning_effort
         # the default thinking budget (0: none; a request's "thinking_budget" overrides it)
         self.thinking_budget = int(thinking_budget)
+        if unclosed_think_finish not in UNCLOSED_THINK_FINISHES:
+            raise ValueError(f"unclosed_think_finish must be one of {UNCLOSED_THINK_FINISHES}")
+        # the finish reason of a reply that ends inside its think block with no answer ("stop": the engine's)
+        self.unclosed_think_finish = unclosed_think_finish
+        # refuse requests with sampling fields this server does not apply (server.http), instead of ignoring them
+        self.strict_params = bool(strict_params)
         self._think_tokens: tuple[tuple[int, ...], int] | None = None
         self.think_markers = think_markers(tokenizer)
         # ``exact_sampling.Sampling`` fields used when a request names none (None: greedy)
@@ -480,7 +490,7 @@ class ChatApp(RequestOptions):
                 cancellation=cancellation, call_gate=self._call_gate(fields, prompt_ids, tools),
                 vision=rendered.vision,
             )
-            budget = int(fields.get("thinking_budget") or self.thinking_budget) if thinking else 0
+            budget = self._thinking_budget(fields) if thinking else 0
             if budget > 0:
                 job.think_close, job.think_end = self._think_close()
                 job.think_budget = budget if job.think_end >= 0 else 0
@@ -585,6 +595,7 @@ class ChatApp(RequestOptions):
             reasoning = reasoning_text.strip() or None
         else:
             content, reasoning = parse_harmony_output(text)
+        closed = think_closed(text, thinking=thinking, markers=self.think_markers)
         stops.flush(on_delta, content, reasoning, streamed, streamed_reasoning, calls_stream is not None)
         stream = job.stream
         seconds = max(0.0, job.finished_at - job.submitted_at)
@@ -594,7 +605,9 @@ class ChatApp(RequestOptions):
             "content": content,
             "reasoning": reasoning,
             "tool_calls_streamed": bool(calls_stream is not None and calls_stream.streamed),
-            "finish_reason": stream.finish_reason if stream is not None else "length",
+            "finish_reason": unclosed_think_finish(stream.finish_reason if stream is not None else "length",
+                                                   closed=closed, content=content,
+                                                   policy=self.unclosed_think_finish),
             "prompt_tokens": len(prompt_ids),
             "cached_tokens": int(job.cached_tokens),
             "completion_tokens": len(collected),
@@ -613,6 +626,8 @@ class ChatApp(RequestOptions):
                 "token_sha": _token_sha(collected),
                 # the narrowest verify window of the reply's rounds (drafted replies: 2 or more)
                 "min_rows": int(getattr(job.stream, "min_rows", 0) or 0),
+                # thinking replies: whether the think block closed (False: the reply ended inside it); None: no thinking
+                "think_closed": closed,
             },
         }
         if stream is not None:

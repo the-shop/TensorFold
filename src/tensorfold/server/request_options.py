@@ -52,6 +52,12 @@ class RequestOptions:
         return Sampling(seed=options.get("seed", seed_for(prompt_ids)), temperature=temp,
                         top_k=options.get("top_k", 0), top_p=options.get("top_p", 1.0))
 
+    def _thinking_budget(self, fields: dict[str, Any]) -> int:
+        """The request's ``thinking_budget`` when it sends one (0 included: no budget), else the server's default."""
+
+        value = fields.get("thinking_budget")
+        return int(self.thinking_budget if value is None else value)
+
     def _call_gate(self, fields: dict[str, Any], prompt_ids: list[int], tools: Any) -> Any:
         """The gate that opens a required tool call (``tool_choice`` "required" or a named function), else None."""
 

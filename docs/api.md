@@ -32,7 +32,7 @@ Unsupported image input, audio, video and non-text output requests receive HTTP 
 | `ignore_eos` | Disable model end-of-sequence stopping; the reply limit still applies | MLX, and GLM, Qwen3.8-27B and Qwen3.6 CUDA |
 | `stop` | Stop at a string or any string in a list; omit the matched text from the response | Both |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high` or `xhigh` | MLX |
-| `thinking_budget` | Token-count limit inside reasoning | MLX |
+| `thinking_budget` | Token-count limit inside reasoning; 0 turns off the server's `--thinking-budget` | MLX |
 | `priority` | `background` yields to foreground requests | MLX |
 
 CUDA does not enforce the MLX-only fields above. Its Flash Next and Nemotron engines stop at an end token
@@ -111,6 +111,12 @@ A call only mentioned while thinking, with the block closed after it, stays reas
 answer. The cut depends on token count, so serial and drafted decoding use the same cut. A model that
 closes the block earlier is left alone.
 
+A model can write its end token before it closes the think block. The reply then has `finish_reason: "stop"`, empty
+`content` and all its text in `reasoning_content`. On MLX, `tensorfold.think_closed` (in the reply, and in a stream's
+final chunk) is `false` for such a reply, `true` when the block closed and `null` when thinking was off. With
+`--unclosed-think-finish length`, a reply that stopped inside the block with no answer reports
+`finish_reason: "length"`; the tokens are the same.
+
 ## Context and errors
 
 The rendered prompt and reserved reply must fit the effective context. In 0.3.5, an explicit `max_tokens`
@@ -133,6 +139,13 @@ A startup capacity estimate is not a measured release capacity.
 `delta.reasoning_content` while streaming. Tools use `tool_calls` and `finish_reason: "tool_calls"`.
 The final usage includes token counts; cache and timing details depend on the backend.
 TensorFold also reports generation statistics such as decode rate, time to first token and draft acceptance.
+
+MLX does not apply `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `min_p`, `typical_p`, `top_a`,
+`tfs_z`, `mirostat`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `best_of` or `min_tokens`. A request that sets
+one to a value other than its neutral one (0, or 1 for `repetition_penalty`, `typical_p`, `tfs_z`, `n` and
+`best_of`, `{}` for `logit_bias`, `false` for `logprobs`, or null) is served without it: the server logs one warning
+per field name and lists the fields, sorted, in `tensorfold.ignored_params`. With `--strict-params` it gets HTTP 400
+instead, an `invalid_request_error` with code `unsupported_parameter`.
 
 For exactness comparisons, hold the checkpoint, template, runtime, prompt, seed and sampling settings
 constant, then compare the decoded reply with `draft` enabled and disabled. Repeat with fresh and reused

@@ -47,6 +47,30 @@ def split_thinking(text: str, *, finished: bool, markers: tuple[str, str] = THIN
     return text[: len(text) - held], ""
 
 
+def think_closed(text: str, *, thinking: bool, markers: tuple[str, str] = THINK_MARKERS) -> bool | None:
+    """Whether a finished thinking reply closed its think block (None: thinking off). A reply that never opened one
+    (Gemma 4's channel, which the reply opens) has no block left open: True."""
+
+    if not thinking:
+        return None
+    opener, closer = markers
+    if opener and not text.startswith(opener):
+        return True
+    return closer in text[len(opener):]
+
+
+UNCLOSED_THINK_FINISHES = ("stop", "length")
+
+
+def unclosed_think_finish(finish: str, *, closed: bool | None, content: str | None, policy: str) -> str:
+    """The finish reason to report: with ``policy`` "length", a reply that stopped inside its think block with no
+    answer reports "length", as a reply cut by its limit would (the default "stop" keeps the engine's)."""
+
+    if policy == "length" and closed is False and finish == "stop" and not (content or "").strip():
+        return "length"
+    return finish
+
+
 def think_markers(tokenizer: Any) -> tuple[str, str]:
     """Gemma 4's thought channel when the tokenizer has its ``<channel|>`` token, else Qwen's ``</think>``."""
 
