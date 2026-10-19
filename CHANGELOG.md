@@ -3,6 +3,35 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.3.2 (19 Oct 2026, MLXFW, the-shop fork)
+
+Reply metadata for thinking replies and sampling fields, and a `thinking_budget` fix, on the Mac server. Every
+reply is the same tokens as 0.3.1's: the numerics golden test passes unchanged with `TF_PREFILL_LAYER_MAJOR` unset
+and with it `=1`, and `NUMERICS_VERSION` stays 1. The CUDA server is unchanged.
+
+### Added
+
+- **`tensorfold.think_closed`** in every chat reply and in a stream's final chunk: `true` when a thinking reply
+  closed its think block, `false` when it ended inside it, `null` when thinking was off. A model can write its end
+  token inside the block (seen on Qwen3.8-27B 8-bit with temperature 0 and thinking on): the reply then has
+  `finish_reason: "stop"`, empty `content` and all its text in `reasoning_content`, and before 0.3.2 nothing in the
+  response said so.
+- **`--unclosed-think-finish {stop,length}`** (default `stop`, as before): with `length`, a thinking reply that
+  stopped inside its think block with no answer reports `finish_reason: "length"`, so clients that retry or
+  continue a cut reply treat it as one.
+- **`tensorfold.ignored_params`**: the sorted names of sampling fields a request set that this server does not
+  apply (`presence_penalty`, `frequency_penalty`, `repetition_penalty`, `min_p`, `typical_p`, `top_a`, `tfs_z`,
+  `mirostat`, `logit_bias`, `logprobs`, `top_logprobs`, `n`, `best_of`, `min_tokens`). They were and are dropped;
+  now the server also logs one warning per field name and says so in the reply. A field sent with its neutral
+  value (`presence_penalty: 0`, `n: 1`, `logit_bias: {}`, `logprobs: false`, null) is not reported.
+- **`--strict-params`** (off by default): such a request gets HTTP 400 (`invalid_request_error`, code
+  `unsupported_parameter`, `param` the first field) instead.
+
+### Fixed
+
+- A request's `thinking_budget: 0` now turns the budget off when the server has a default (`--thinking-budget`);
+  before, 0 fell back to the default. An absent or null `thinking_budget` still takes the default.
+
 ## 0.3.1 (18 Oct 2026, MLXFW, the-shop fork)
 
 A simplification release: opt-in features that measured no gain are removed. Each was off by default, so the
