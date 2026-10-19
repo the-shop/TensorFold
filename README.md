@@ -14,7 +14,7 @@ TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an Op
 Each model family supplies its own kernels and draft verification.
 
 ```bash
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.2"
 tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
 ```
 
@@ -233,7 +233,7 @@ Use NVIDIA's PyTorch container for CUDA, PyTorch, Triton and the extension compi
 
 ```bash
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
-python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.1"
+python -m pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.2"
 tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
 ```

@@ -85,7 +85,7 @@ fork, first released as `v0.1.0`; `v0.3.0` adds the prompt speed-ups [below](#03
 `v0.3.1` removes opt-in features that measured no gain (or use `main` for the latest):
 
 ```bash
-git clone -b v0.3.1 https://github.com/the-shop/TensorFold.git && cd TensorFold
+git clone -b v0.3.2 https://github.com/the-shop/TensorFold.git && cd TensorFold
 ```
 
 Run everything below from that directory, in a Python 3.11+ virtual environment (`python3 -m venv .venv`; tested

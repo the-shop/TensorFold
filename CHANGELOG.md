@@ -9,6 +9,10 @@ Reply metadata for thinking replies and sampling fields, and a `thinking_budget`
 reply is the same tokens as 0.3.1's: the numerics golden test passes unchanged with `TF_PREFILL_LAYER_MAJOR` unset
 and with it `=1`, and `NUMERICS_VERSION` stays 1. The CUDA server is unchanged.
 
+Upgrading: the first start reruns the numerics canary once per model (the code changed); 0.3.1 prompt snapshots
+stay valid, since the canary value is unchanged. Install with
+`pip install "tensorfold[ssd] @ git+https://github.com/the-shop/TensorFold.git@v0.3.2"`.
+
 ### Added
 
 - **`tensorfold.think_closed`** in every chat reply and in a stream's final chunk: `true` when a thinking reply
